@@ -25,6 +25,7 @@ dependencies = [
     "einops>=0.8.1",
     "accelerate>=1.12.0",
     "fastapi>=0.110.0",
+    "diskcache",
     "uvicorn[standard]>=0.27.0",
     "numba>=0.63.1",
     "vector-quantize-pytorch>=1.27.15",

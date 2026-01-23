@@ -1,9 +1,12 @@
 """FastAPI server for ACE-Step V1.5.
 
 Endpoints:
-- POST /v1/music/generate  Create an async music generation job (queued)
-    - Supports application/json and multipart/form-data (with file upload)
-- GET  /v1/jobs/{job_id}   Poll job status/result (+ queue position/eta when queued)
+- POST /release_task     Create music generation task
+- POST /query_result     Batch query task results
+- POST /v1/music/random  Create random sample task
+- GET  /v1/models        List available models
+- GET  /v1/audio         Download audio file
+- GET  /health           Health check
 
 NOTE:
 - In-memory queue and job store -> run uvicorn with workers=1.
@@ -25,7 +28,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 try:
@@ -52,6 +55,46 @@ from acestep.inference import (
     format_sample,
 )
 from acestep.gradio_ui.events.results_handlers import _build_generation_info
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+RESULT_KEY_PREFIX = "ace_step_v1.5_"
+RESULT_EXPIRE_SECONDS = 7 * 24 * 60 * 60  # 7 days
+TASK_TIMEOUT_SECONDS = 3600  # 1 hour
+STATUS_MAP = {"queued": 0, "running": 0, "succeeded": 1, "failed": 2}
+
+LM_DEFAULT_TEMPERATURE = 0.85
+LM_DEFAULT_CFG_SCALE = 2.5
+LM_DEFAULT_TOP_P = 0.9
+
+# Parameter aliases for request parsing
+PARAM_ALIASES = {
+    "prompt": ["prompt"],
+    "sample_mode": ["sample_mode", "sampleMode"],
+    "sample_query": ["sample_query", "sampleQuery", "description", "desc"],
+    "use_format": ["use_format", "useFormat", "format"],
+    "model": ["model", "dit_model", "ditModel"],
+    "key_scale": ["key_scale", "keyscale", "keyScale"],
+    "time_signature": ["time_signature", "timesignature", "timeSignature"],
+    "audio_duration": ["audio_duration", "duration", "audioDuration", "target_duration", "targetDuration"],
+    "vocal_language": ["vocal_language", "vocalLanguage"],
+    "inference_steps": ["inference_steps", "inferenceSteps"],
+    "guidance_scale": ["guidance_scale", "guidanceScale"],
+    "use_random_seed": ["use_random_seed", "useRandomSeed"],
+    "audio_code_string": ["audio_code_string", "audioCodeString"],
+    "audio_cover_strength": ["audio_cover_strength", "audioCoverStrength"],
+    "task_type": ["task_type", "taskType"],
+    "infer_method": ["infer_method", "inferMethod"],
+    "use_tiled_decode": ["use_tiled_decode", "useTiledDecode"],
+    "constrained_decoding": ["constrained_decoding", "constrainedDecoding", "constrained"],
+    "constrained_decoding_debug": ["constrained_decoding_debug", "constrainedDecodingDebug"],
+    "use_cot_caption": ["use_cot_caption", "cot_caption", "cot-caption"],
+    "use_cot_language": ["use_cot_language", "cot_language", "cot-language"],
+    "is_format_caption": ["is_format_caption", "isFormatCaption"],
+}
 
 
 def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
@@ -129,7 +172,7 @@ JobStatus = Literal["queued", "running", "succeeded", "failed"]
 
 
 class GenerateMusicRequest(BaseModel):
-    caption: str = Field(default="", description="Text caption describing the music")
+    prompt: str = Field(default="", description="Text prompt describing the music")
     lyrics: str = Field(default="", description="Lyric text")
 
     # New API semantics:
@@ -147,7 +190,7 @@ class GenerateMusicRequest(BaseModel):
     model: Optional[str] = Field(default=None, description="Model name to use (e.g., 'acestep-v15-turbo')")
 
     bpm: Optional[int] = None
-    # Accept common client keys via manual parsing (see _build_req_from_mapping).
+    # Accept common client keys via manual parsing (see RequestParser).
     key_scale: str = ""
     time_signature: str = ""
     vocal_language: str = "en"
@@ -208,15 +251,8 @@ class GenerateMusicRequest(BaseModel):
         allow_population_by_alias = True
 
 
-_LM_DEFAULT_TEMPERATURE = 0.85
-_LM_DEFAULT_CFG_SCALE = 2.5
-_LM_DEFAULT_TOP_P = 0.9
-_DEFAULT_DIT_INSTRUCTION = DEFAULT_DIT_INSTRUCTION
-_DEFAULT_LM_INSTRUCTION = DEFAULT_LM_INSTRUCTION
-
-
 class CreateJobResponse(BaseModel):
-    job_id: str
+    task_id: str
     status: JobStatus
     queue_position: int = 0  # 1-based best-effort position when queued
 
@@ -267,6 +303,7 @@ class _JobRecord:
     finished_at: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    env: str = "development"
 
 
 class _JobStore:
@@ -277,6 +314,18 @@ class _JobStore:
     def create(self) -> _JobRecord:
         job_id = str(uuid4())
         rec = _JobRecord(job_id=job_id, status="queued", created_at=time.time())
+        with self._lock:
+            self._jobs[job_id] = rec
+        return rec
+
+    def create_with_id(self, job_id: str, env: str = "development") -> _JobRecord:
+        """Create job record with specified ID"""
+        rec = _JobRecord(
+            job_id=job_id,
+            status="queued",
+            created_at=time.time(),
+            env=env
+        )
         with self._lock:
             self._jobs[job_id] = rec
         return rec
@@ -391,6 +440,70 @@ def _to_bool(v: Any, default: bool = False) -> bool:
     return s in {"1", "true", "yes", "y", "on"}
 
 
+def _map_status(status: str) -> int:
+    """Map job status string to integer code."""
+    return STATUS_MAP.get(status, 2)
+
+
+def _parse_timesteps(s: Optional[str]) -> Optional[List[float]]:
+    """Parse comma-separated timesteps string to list of floats."""
+    if not s or not s.strip():
+        return None
+    try:
+        return [float(t.strip()) for t in s.split(",") if t.strip()]
+    except (ValueError, Exception):
+        return None
+
+
+class RequestParser:
+    """Parse request parameters from multiple sources with alias support."""
+
+    def __init__(self, raw: dict):
+        self._raw = dict(raw) if raw else {}
+        self._param_obj = self._parse_json(self._raw.get("param_obj"))
+        self._metas = self._find_metas()
+
+    def _parse_json(self, v) -> dict:
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str) and v.strip():
+            try:
+                return json.loads(v)
+            except Exception:
+                pass
+        return {}
+
+    def _find_metas(self) -> dict:
+        for key in ("metas", "meta", "metadata", "user_metadata", "userMetadata"):
+            v = self._raw.get(key)
+            if v:
+                return self._parse_json(v)
+        return {}
+
+    def get(self, name: str, default=None):
+        """Get parameter by canonical name from all sources."""
+        aliases = PARAM_ALIASES.get(name, [name])
+        for source in (self._raw, self._param_obj, self._metas):
+            for alias in aliases:
+                v = source.get(alias)
+                if v is not None:
+                    return v
+        return default
+
+    def str(self, name: str, default: str = "") -> str:
+        v = self.get(name)
+        return str(v) if v is not None else default
+
+    def int(self, name: str, default: Optional[int] = None) -> Optional[int]:
+        return _to_int(self.get(name), default)
+
+    def float(self, name: str, default: Optional[float] = None) -> Optional[float]:
+        return _to_float(self.get(name), default)
+
+    def bool(self, name: str, default: bool = False) -> bool:
+        return _to_bool(self.get(name), default)
+
+
 async def _save_upload_to_temp(upload: StarletteUploadFile, *, prefix: str) -> str:
     suffix = Path(upload.filename or "").suffix
     fd, path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=suffix)
@@ -420,13 +533,13 @@ def create_app() -> FastAPI:
     store = _JobStore()
 
     QUEUE_MAXSIZE = int(os.getenv("ACESTEP_QUEUE_MAXSIZE", "200"))
-    WORKER_COUNT = int(os.getenv("ACESTEP_QUEUE_WORKERS", "1"))  # 单 GPU 建议 1
+    WORKER_COUNT = int(os.getenv("ACESTEP_QUEUE_WORKERS", "1"))  # Single GPU recommended
 
     INITIAL_AVG_JOB_SECONDS = float(os.getenv("ACESTEP_AVG_JOB_SECONDS", "5.0"))
     AVG_WINDOW = int(os.getenv("ACESTEP_AVG_WINDOW", "50"))
 
     def _path_to_audio_url(path: str) -> str:
-        """将本地文件路径转换为可下载的相对 URL"""
+        """Convert local file path to downloadable relative URL"""
         if not path:
             return path
         if path.startswith("http://") or path.startswith("https://"):
@@ -525,6 +638,14 @@ def create_app() -> FastAPI:
         app.state.temp_audio_dir = os.path.join(tmp_root, "api_audio")
         os.makedirs(app.state.temp_audio_dir, exist_ok=True)
 
+        # Initialize local cache
+        try:
+            from acestep.local_cache import get_local_cache
+            local_cache_dir = os.path.join(cache_root, "local_redis")
+            app.state.local_cache = get_local_cache(local_cache_dir)
+        except ImportError:
+            app.state.local_cache = None
+
         async def _ensure_initialized() -> None:
             h: AceStepHandler = app.state.handler
 
@@ -612,6 +733,33 @@ def create_app() -> FastAPI:
                     os.remove(p)
                 except Exception:
                     pass
+
+        def _update_local_cache(job_id: str, result: Optional[Dict], status: str) -> None:
+            """Update local cache with job result"""
+            local_cache = getattr(app.state, 'local_cache', None)
+            if not local_cache:
+                return
+
+            rec = store.get(job_id)
+            env = getattr(rec, 'env', 'development') if rec else 'development'
+            create_time = rec.created_at if rec else time.time()
+
+            status_int = _map_status(status)
+
+            if status == "succeeded" and result:
+                audio_paths = result.get("audio_paths", [])
+                if audio_paths:
+                    result_data = [
+                        {"file": p, "wave": "", "status": status_int, "create_time": int(create_time), "env": env}
+                        for p in audio_paths
+                    ]
+                else:
+                    result_data = [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env}]
+            else:
+                result_data = [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env}]
+
+            result_key = f"{RESULT_KEY_PREFIX}{job_id}"
+            local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
 
         async def _run_one_job(job_id: str, req: GenerateMusicRequest) -> None:
             job_store: _JobStore = app.state.job_store
@@ -728,10 +876,7 @@ def create_app() -> FastAPI:
                 # - use_format (LM enhances caption/lyrics)
                 # - use_cot_caption or use_cot_language (LM enhances metadata)
                 need_llm = thinking or sample_mode or has_sample_query or use_format or use_cot_caption or use_cot_language
-                
-                print(f"[api_server] Request params: req.thinking={req.thinking}, req.sample_mode={req.sample_mode}, req.use_cot_caption={req.use_cot_caption}, req.use_cot_language={req.use_cot_language}, req.use_format={req.use_format}")
-                print(f"[api_server] Determined: thinking={thinking}, sample_mode={sample_mode}, use_cot_caption={use_cot_caption}, use_cot_language={use_cot_language}, use_format={use_format}, need_llm={need_llm}")
-                
+
                 # Ensure LLM is ready if needed
                 if need_llm:
                     _ensure_llm_ready()
@@ -739,7 +884,7 @@ def create_app() -> FastAPI:
                         raise RuntimeError(f"5Hz LM init failed: {app.state._llm_init_error}")
 
                 # Handle sample mode or description: generate caption/lyrics/metas via LM
-                caption = req.caption
+                caption = req.prompt
                 lyrics = req.lyrics
                 bpm = req.bpm
                 key_scale = req.key_scale
@@ -749,26 +894,17 @@ def create_app() -> FastAPI:
                 if sample_mode or has_sample_query:
                     if has_sample_query:
                         # Use create_sample() with description query
-                        print(f"[api_server] Description mode: generating sample from query: {req.sample_query[:100]}")
-                        
-                        # Parse description for language and instrumental hints (aligned with feishu_bot)
                         parsed_language, parsed_instrumental = _parse_description_hints(req.sample_query)
-                        print(f"[api_server] Parsed from description: language={parsed_language}, instrumental={parsed_instrumental}")
-                        
+
                         # Determine vocal_language with priority:
-                        # 1. User-specified vocal_language (if not default "en") - highest priority
+                        # 1. User-specified vocal_language (if not default "en")
                         # 2. Language parsed from description
                         # 3. None (no constraint)
                         if req.vocal_language and req.vocal_language not in ("en", "unknown", ""):
-                            # User explicitly specified a non-default language, use it
                             sample_language = req.vocal_language
-                            print(f"[api_server] Using user-specified vocal_language: {sample_language}")
                         else:
-                            # Fall back to language parsed from description
                             sample_language = parsed_language
-                            if sample_language:
-                                print(f"[api_server] Using language from description: {sample_language}")
-                        
+
                         sample_result = create_sample(
                             llm_handler=llm,
                             query=req.sample_query,
@@ -790,11 +926,8 @@ def create_app() -> FastAPI:
                         key_scale = sample_result.keyscale
                         time_signature = sample_result.timesignature
                         audio_duration = sample_result.duration
-                        
-                        print(f"[api_server] Sample from description generated: caption_len={len(caption)}, lyrics_len={len(lyrics)}, bpm={bpm}")
                     else:
                         # Original sample_mode behavior: random generation
-                        print("[api_server] Sample mode: generating random caption/lyrics via LM")
                         sample_metadata, sample_status = llm.understand_audio_from_codes(
                             audio_codes="NO USER INPUT",
                             temperature=req.lm_temperature,
@@ -815,15 +948,11 @@ def create_app() -> FastAPI:
                         key_scale = sample_metadata.get("keyscale", "") or os.getenv("ACESTEP_SAMPLE_DEFAULT_KEY", "C Major")
                         time_signature = sample_metadata.get("timesignature", "") or os.getenv("ACESTEP_SAMPLE_DEFAULT_TIMESIGNATURE", "4/4")
                         audio_duration = _to_float(sample_metadata.get("duration"), None) or _to_float(os.getenv("ACESTEP_SAMPLE_DEFAULT_DURATION_SECONDS", "120"), 120.0)
-                        
-                        print(f"[api_server] Sample generated: caption_len={len(caption)}, lyrics_len={len(lyrics)}, bpm={bpm}, duration={audio_duration}")
-                
+
                 # Apply format_sample() if use_format is True and caption/lyrics are provided
-                # Track whether format_sample generated duration (to decide if Phase 1 is needed)
                 format_has_duration = False
-                
+
                 if req.use_format and (caption or lyrics):
-                    print(f"[api_server] Applying format_sample to enhance input...")
                     _ensure_llm_ready()
                     if getattr(app.state, "_llm_init_error", None):
                         raise RuntimeError(f"5Hz LM init failed (needed for format): {app.state._llm_init_error}")
@@ -865,33 +994,10 @@ def create_app() -> FastAPI:
                             key_scale = format_result.keyscale
                         if format_result.timesignature:
                             time_signature = format_result.timesignature
-                        
-                        print(f"[api_server] Format applied: new caption_len={len(caption)}, lyrics_len={len(lyrics)}, bpm={bpm}, duration={audio_duration}, has_duration={format_has_duration}")
-                    else:
-                        print(f"[api_server] Warning: format_sample failed: {format_result.error}, using original input")
-                
-                print(f"[api_server] Before GenerationParams: thinking={thinking}, sample_mode={sample_mode}")
+
                 # Parse timesteps string to list of floats if provided
-                parsed_timesteps = None
-                if req.timesteps and req.timesteps.strip():
-                    try:
-                        parsed_timesteps = [float(t.strip()) for t in req.timesteps.split(",") if t.strip()]
-                    except ValueError:
-                        print(f"[api_server] Warning: Failed to parse timesteps '{req.timesteps}', using default")
-                        parsed_timesteps = None
+                parsed_timesteps = _parse_timesteps(req.timesteps)
 
-                print(f"[api_server] Caption/Lyrics to use: caption_len={len(caption)}, lyrics_len={len(lyrics)}")
-
-                # Parse timesteps if provided
-                parsed_timesteps = None
-                if req.timesteps:
-                    try:
-                        parsed_timesteps = [float(t.strip()) for t in req.timesteps.split(",") if t.strip()]
-                        print(f"[api_server] Using custom timesteps: {parsed_timesteps}")
-                    except Exception as e:
-                        print(f"[api_server] Warning: Failed to parse timesteps '{req.timesteps}': {e}")
-                        parsed_timesteps = None
-                
                 # Determine actual inference steps (timesteps override inference_steps)
                 actual_inference_steps = len(parsed_timesteps) if parsed_timesteps else req.inference_steps
 
@@ -960,19 +1066,6 @@ def create_app() -> FastAPI:
                 # Check LLM initialization status
                 llm_is_initialized = getattr(app.state, "_llm_initialized", False)
                 llm_to_pass = llm if llm_is_initialized else None
-                
-                print(f"[api_server] Generating music with unified interface:")
-                print(f"  - thinking={params.thinking}")
-                print(f"  - use_cot_caption={params.use_cot_caption}")
-                print(f"  - use_cot_language={params.use_cot_language}")
-                print(f"  - use_cot_metas={params.use_cot_metas}")
-                print(f"  - batch_size={batch_size}")
-                print(f"  - llm_initialized={llm_is_initialized}")
-                print(f"  - llm_handler={'Available' if llm_to_pass else 'None'}")
-                if llm_to_pass:
-                    print(f"  - LLM will be used for: CoT caption={params.use_cot_caption}, CoT language={params.use_cot_language}, CoT metas={params.use_cot_metas}, thinking={params.thinking}")
-                else:
-                    print(f"  - WARNING: LLM features requested but LLM not initialized!")
 
                 # Generate music using unified interface
                 result = generate_music(
@@ -983,9 +1076,6 @@ def create_app() -> FastAPI:
                     save_dir=app.state.temp_audio_dir,
                     progress=None,
                 )
-                
-                print(f"[api_server] Generation completed. Success={result.success}, Audios={len(result.audios)}")
-                print(f"[api_server] Time costs keys: {list(result.extra_outputs.get('time_costs', {}).keys())}")
 
                 if not result.success:
                     raise RuntimeError(f"Music generation failed: {result.error or result.status_message}")
@@ -1080,8 +1170,14 @@ def create_app() -> FastAPI:
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(executor, _blocking_generate)
                 job_store.mark_succeeded(job_id, result)
+
+                # Update local cache
+                _update_local_cache(job_id, result, "succeeded")
             except Exception:
                 job_store.mark_failed(job_id, traceback.format_exc())
+
+                # Update local cache
+                _update_local_cache(job_id, None, "failed")
             finally:
                 dt = max(0.0, time.time() - t0)
                 async with app.state.stats_lock:
@@ -1131,122 +1227,71 @@ def create_app() -> FastAPI:
             avg = float(getattr(app.state, "avg_job_seconds", INITIAL_AVG_JOB_SECONDS))
         return pos * avg
 
-    @app.post("/v1/music/generate", response_model=CreateJobResponse)
+    @app.post("/release_task", response_model=CreateJobResponse)
     async def create_music_generate_job(request: Request) -> CreateJobResponse:
         content_type = (request.headers.get("content-type") or "").lower()
         temp_files: list[str] = []
 
-        def _build_req_from_mapping(mapping: Any, *, reference_audio_path: Optional[str], src_audio_path: Optional[str]) -> GenerateMusicRequest:
-            get = getattr(mapping, "get", None)
-            if not callable(get):
-                raise HTTPException(status_code=400, detail="Invalid request payload")
-
-            def _get_any(*keys: str, default: Any = None) -> Any:
-                # 1) Top-level keys
-                for k in keys:
-                    v = get(k, None)
-                    if v is not None:
-                        return v
-
-                # 2) Nested metas/metadata/user_metadata (dict or JSON string)
-                nested = (
-                    get("metas", None)
-                    or get("meta", None)
-                    or get("metadata", None)
-                    or get("user_metadata", None)
-                    or get("userMetadata", None)
-                )
-
-                if isinstance(nested, str):
-                    s = nested.strip()
-                    if s.startswith("{") and s.endswith("}"):
-                        try:
-                            nested = json.loads(s)
-                        except Exception:
-                            nested = None
-
-                if isinstance(nested, dict):
-                    g2 = nested.get
-                    for k in keys:
-                        v = g2(k, None)
-                        if v is not None:
-                            return v
-
-                return default
-
-            normalized_audio_duration = _to_float(_get_any("audio_duration", "duration", "audioDuration"), None)
-            normalized_bpm = _to_int(_get_any("bpm"), None)
-            normalized_keyscale = str(_get_any("key_scale", "keyscale", "keyScale", default="") or "")
-            normalized_timesig = str(_get_any("time_signature", "timesignature", "timeSignature", default="") or "")
-
-            # Accept it as an alias to avoid clients needing to special-case server.
-            if normalized_audio_duration is None:
-                normalized_audio_duration = _to_float(_get_any("target_duration", "targetDuration"), None)
-
+        def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
+            """Build GenerateMusicRequest from parsed parameters."""
             return GenerateMusicRequest(
-                caption=str(get("caption", "") or ""),
-                lyrics=str(get("lyrics", "") or ""),
-                thinking=_to_bool(get("thinking"), False),
-                sample_mode=_to_bool(_get_any("sample_mode", "sampleMode"), False),
-                sample_query=str(_get_any("sample_query", "sampleQuery", "description", "desc", default="") or ""),
-                use_format=_to_bool(_get_any("use_format", "useFormat", "format"), False),
-                model=str(_get_any("model", "dit_model", "ditModel", default="") or "").strip() or None,
-                bpm=normalized_bpm,
-                key_scale=normalized_keyscale,
-                time_signature=normalized_timesig,
-                vocal_language=str(_get_any("vocal_language", "vocalLanguage", default="en") or "en"),
-                inference_steps=_to_int(_get_any("inference_steps", "inferenceSteps"), 8) or 8,
-                guidance_scale=_to_float(_get_any("guidance_scale", "guidanceScale"), 7.0) or 7.0,
-                use_random_seed=_to_bool(_get_any("use_random_seed", "useRandomSeed"), True),
-                seed=_to_int(get("seed"), -1) or -1,
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-                audio_duration=normalized_audio_duration,
-                batch_size=_to_int(get("batch_size"), None),
-                audio_code_string=str(_get_any("audio_code_string", "audioCodeString", default="") or ""),
-                repainting_start=_to_float(get("repainting_start"), 0.0) or 0.0,
-                repainting_end=_to_float(get("repainting_end"), None),
-                instruction=str(get("instruction", _DEFAULT_DIT_INSTRUCTION) or ""),
-                audio_cover_strength=_to_float(_get_any("audio_cover_strength", "audioCoverStrength"), 1.0) or 1.0,
-                task_type=str(_get_any("task_type", "taskType", default="text2music") or "text2music"),
-                use_adg=_to_bool(get("use_adg"), False),
-                cfg_interval_start=_to_float(get("cfg_interval_start"), 0.0) or 0.0,
-                cfg_interval_end=_to_float(get("cfg_interval_end"), 1.0) or 1.0,
-                infer_method=str(_get_any("infer_method", "inferMethod", default="ode") or "ode"),
-                shift=_to_float(_get_any("shift"), 3.0) or 3.0,
-                audio_format=str(get("audio_format", "mp3") or "mp3"),
-                use_tiled_decode=_to_bool(_get_any("use_tiled_decode", "useTiledDecode"), True),
-                lm_model_path=str(get("lm_model_path") or "").strip() or None,
-                lm_backend=str(get("lm_backend", "vllm") or "vllm"),
-                lm_temperature=_to_float(get("lm_temperature"), _LM_DEFAULT_TEMPERATURE) or _LM_DEFAULT_TEMPERATURE,
-                lm_cfg_scale=_to_float(get("lm_cfg_scale"), _LM_DEFAULT_CFG_SCALE) or _LM_DEFAULT_CFG_SCALE,
-                lm_top_k=_to_int(get("lm_top_k"), None),
-                lm_top_p=_to_float(get("lm_top_p"), _LM_DEFAULT_TOP_P),
-                lm_repetition_penalty=_to_float(get("lm_repetition_penalty"), 1.0) or 1.0,
-                lm_negative_prompt=str(get("lm_negative_prompt", "NO USER INPUT") or "NO USER INPUT"),
-                constrained_decoding=_to_bool(_get_any("constrained_decoding", "constrainedDecoding", "constrained"), True),
-                constrained_decoding_debug=_to_bool(_get_any("constrained_decoding_debug", "constrainedDecodingDebug"), False),
-                use_cot_caption=_to_bool(_get_any("use_cot_caption", "cot_caption", "cot-caption"), True),
-                use_cot_language=_to_bool(_get_any("use_cot_language", "cot_language", "cot-language"), True),
-                is_format_caption=_to_bool(_get_any("is_format_caption", "isFormatCaption"), False),
+                prompt=p.str("prompt"),
+                lyrics=p.str("lyrics"),
+                thinking=p.bool("thinking"),
+                sample_mode=p.bool("sample_mode"),
+                sample_query=p.str("sample_query"),
+                use_format=p.bool("use_format"),
+                model=p.str("model") or None,
+                bpm=p.int("bpm"),
+                key_scale=p.str("key_scale"),
+                time_signature=p.str("time_signature"),
+                audio_duration=p.float("audio_duration"),
+                vocal_language=p.str("vocal_language", "en"),
+                inference_steps=p.int("inference_steps", 8),
+                guidance_scale=p.float("guidance_scale", 7.0),
+                use_random_seed=p.bool("use_random_seed", True),
+                seed=p.int("seed", -1),
+                batch_size=p.int("batch_size"),
+                audio_code_string=p.str("audio_code_string"),
+                repainting_start=p.float("repainting_start", 0.0),
+                repainting_end=p.float("repainting_end"),
+                instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
+                audio_cover_strength=p.float("audio_cover_strength", 1.0),
+                task_type=p.str("task_type", "text2music"),
+                use_adg=p.bool("use_adg"),
+                cfg_interval_start=p.float("cfg_interval_start", 0.0),
+                cfg_interval_end=p.float("cfg_interval_end", 1.0),
+                infer_method=p.str("infer_method", "ode"),
+                shift=p.float("shift", 3.0),
+                audio_format=p.str("audio_format", "mp3"),
+                use_tiled_decode=p.bool("use_tiled_decode", True),
+                lm_model_path=p.str("lm_model_path") or None,
+                lm_backend=p.str("lm_backend", "vllm"),
+                lm_temperature=p.float("lm_temperature", LM_DEFAULT_TEMPERATURE),
+                lm_cfg_scale=p.float("lm_cfg_scale", LM_DEFAULT_CFG_SCALE),
+                lm_top_k=p.int("lm_top_k"),
+                lm_top_p=p.float("lm_top_p", LM_DEFAULT_TOP_P),
+                lm_repetition_penalty=p.float("lm_repetition_penalty", 1.0),
+                lm_negative_prompt=p.str("lm_negative_prompt", "NO USER INPUT"),
+                constrained_decoding=p.bool("constrained_decoding", True),
+                constrained_decoding_debug=p.bool("constrained_decoding_debug"),
+                use_cot_caption=p.bool("use_cot_caption", True),
+                use_cot_language=p.bool("use_cot_language", True),
+                is_format_caption=p.bool("is_format_caption"),
+                **kwargs,
             )
-
-        def _first_value(v: Any) -> Any:
-            if isinstance(v, list) and v:
-                return v[0]
-            return v
 
         if content_type.startswith("application/json"):
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            req = _build_req_from_mapping(body, reference_audio_path=None, src_audio_path=None)
+            req = _build_request(RequestParser(body))
 
         elif content_type.endswith("+json"):
             body = await request.json()
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            req = _build_req_from_mapping(body, reference_audio_path=None, src_audio_path=None)
+            req = _build_request(RequestParser(body))
 
         elif content_type.startswith("multipart/form-data"):
             form = await request.form()
@@ -1269,13 +1314,21 @@ def create_app() -> FastAPI:
             else:
                 src_audio_path = str(form.get("src_audio_path") or "").strip() or None
 
-            req = _build_req_from_mapping(form, reference_audio_path=reference_audio_path, src_audio_path=src_audio_path)
+            req = _build_request(
+                RequestParser(dict(form)),
+                reference_audio_path=reference_audio_path,
+                src_audio_path=src_audio_path,
+            )
 
         elif content_type.startswith("application/x-www-form-urlencoded"):
             form = await request.form()
             reference_audio_path = str(form.get("reference_audio_path") or "").strip() or None
             src_audio_path = str(form.get("src_audio_path") or "").strip() or None
-            req = _build_req_from_mapping(form, reference_audio_path=reference_audio_path, src_audio_path=src_audio_path)
+            req = _build_request(
+                RequestParser(dict(form)),
+                reference_audio_path=reference_audio_path,
+                src_audio_path=src_audio_path,
+            )
 
         else:
             raw = await request.body()
@@ -1285,7 +1338,7 @@ def create_app() -> FastAPI:
                 try:
                     body = json.loads(raw.decode("utf-8"))
                     if isinstance(body, dict):
-                        req = _build_req_from_mapping(body, reference_audio_path=None, src_audio_path=None)
+                        req = _build_request(RequestParser(body))
                     else:
                         raise HTTPException(status_code=400, detail="JSON payload must be an object")
                 except HTTPException:
@@ -1298,10 +1351,14 @@ def create_app() -> FastAPI:
             # Best-effort: parse key=value bodies even if Content-Type is missing.
             elif raw_stripped and b"=" in raw:
                 parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-                flat = {k: _first_value(v) for k, v in parsed.items()}
+                flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
                 reference_audio_path = str(flat.get("reference_audio_path") or "").strip() or None
                 src_audio_path = str(flat.get("src_audio_path") or "").strip() or None
-                req = _build_req_from_mapping(flat, reference_audio_path=reference_audio_path, src_audio_path=src_audio_path)
+                req = _build_request(
+                    RequestParser(flat),
+                    reference_audio_path=reference_audio_path,
+                    src_audio_path=src_audio_path,
+                )
             else:
                 raise HTTPException(
                     status_code=415,
@@ -1331,7 +1388,7 @@ def create_app() -> FastAPI:
             position = len(app.state.pending_ids)
 
         await q.put((rec.job_id, req))
-        return CreateJobResponse(job_id=rec.job_id, status="queued", queue_position=position)
+        return CreateJobResponse(task_id=rec.job_id, status="queued", queue_position=position)
 
     @app.post("/v1/music/random", response_model=CreateJobResponse)
     async def create_random_sample_job(request: Request) -> CreateJobResponse:
@@ -1375,35 +1432,86 @@ def create_app() -> FastAPI:
             position = len(app.state.pending_ids)
 
         await q.put((rec.job_id, req))
-        return CreateJobResponse(job_id=rec.job_id, status="queued", queue_position=position)
+        return CreateJobResponse(task_id=rec.job_id, status="queued", queue_position=position)
 
-    @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
-    async def get_job(job_id: str) -> JobResponse:
-        rec = store.get(job_id)
-        if rec is None:
-            raise HTTPException(status_code=404, detail="Job not found")
+    @app.post("/query_result")
+    async def query_result(request: Request) -> List[Dict[str, Any]]:
+        """Batch query job results"""
+        content_type = (request.headers.get("content-type") or "").lower()
 
-        pos = 0
-        eta = None
-        async with app.state.stats_lock:
-            avg = float(getattr(app.state, "avg_job_seconds", INITIAL_AVG_JOB_SECONDS))
+        if "json" in content_type:
+            body = await request.json()
+        else:
+            form = await request.form()
+            body = {k: v for k, v in form.items()}
 
-        if rec.status == "queued":
-            pos = await _queue_position(job_id)
-            eta = await _eta_seconds_for_position(pos)
+        task_id_list_str = body.get("task_id_list", "[]")
 
-        return JobResponse(
-            job_id=rec.job_id,
-            status=rec.status,
-            created_at=rec.created_at,
-            started_at=rec.started_at,
-            finished_at=rec.finished_at,
-            queue_position=pos,
-            eta_seconds=eta,
-            avg_job_seconds=avg,
-            result=JobResult(**rec.result) if rec.result else None,
-            error=rec.error,
-        )
+        # Parse task ID list
+        if isinstance(task_id_list_str, list):
+            task_id_list = task_id_list_str
+        else:
+            try:
+                task_id_list = json.loads(task_id_list_str)
+            except Exception:
+                task_id_list = []
+
+        local_cache = getattr(app.state, 'local_cache', None)
+        data_list = []
+        current_time = time.time()
+
+        for task_id in task_id_list:
+            result_key = f"{RESULT_KEY_PREFIX}{task_id}"
+
+            # Read from local cache first
+            if local_cache:
+                data = local_cache.get(result_key)
+                if data:
+                    try:
+                        data_json = json.loads(data)
+                    except Exception:
+                        data_json = []
+
+                    if len(data_json) <= 0:
+                        data_list.append({"task_id": task_id, "result": data, "status": 2})
+                    else:
+                        status = data_json[0].get("status")
+                        create_time = data_json[0].get("create_time", 0)
+                        if status == 0 and (current_time - create_time) > TASK_TIMEOUT_SECONDS:
+                            data_list.append({"task_id": task_id, "result": data, "status": 2})
+                        else:
+                            data_list.append({
+                                "task_id": task_id,
+                                "result": data,
+                                "status": int(status) if status is not None else 1,
+                            })
+                    continue
+
+            # Fallback to job_store query
+            rec = store.get(task_id)
+            if rec:
+                env = getattr(rec, 'env', 'development')
+                create_time = rec.created_at
+                status_int = _map_status(rec.status)
+
+                if rec.result and rec.status == "succeeded":
+                    audio_paths = rec.result.get("audio_paths", [])
+                    result_data = [
+                        {"file": p, "wave": "", "status": status_int, "create_time": int(create_time), "env": env}
+                        for p in audio_paths
+                    ] if audio_paths else [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env}]
+                else:
+                    result_data = [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env}]
+
+                data_list.append({
+                    "task_id": task_id,
+                    "result": json.dumps(result_data, ensure_ascii=False),
+                    "status": status_int,
+                })
+            else:
+                data_list.append({"task_id": task_id, "result": "[]", "status": 0})
+
+        return data_list
 
     @app.get("/health")
     async def health_check():
