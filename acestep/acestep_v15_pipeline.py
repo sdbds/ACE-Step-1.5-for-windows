@@ -274,7 +274,8 @@ def main():
                         backend=args.backend,
                         device=args.device,
                         offload_to_cpu=args.offload_to_cpu,
-                        dtype=dit_handler.dtype
+                        dtype=dit_handler.dtype,
+                        disable_cuda_graphs=True,
                     )
                     
                     if lm_success:

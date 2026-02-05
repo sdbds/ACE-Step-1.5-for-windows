@@ -462,7 +462,8 @@ def init_service_wrapper(dit_handler, llm_handler, checkpoint, config_path, devi
             backend=backend,
             device=device,
             offload_to_cpu=offload_to_cpu,
-            dtype=dit_handler.dtype
+            dtype=dit_handler.dtype,
+            disable_cuda_graphs=True,
         )
         
         if lm_success:
