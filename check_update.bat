@@ -7,6 +7,7 @@ setlocal enabledelayedexpansion
 REM Configuration
 set TIMEOUT_SECONDS=10
 set GIT_PORTABLE_PATH=%~dp0PortableGit\bin\git.exe
+set GIT_PATH=
 set REPO_PATH=%~dp0
 set PROXY_CONFIG_FILE=%~dp0proxy_config.txt
 
@@ -15,21 +16,39 @@ echo ACE-Step Update Check
 echo ========================================
 echo.
 
-REM Check if PortableGit exists
-if not exist "%GIT_PORTABLE_PATH%" (
-    echo [Error] PortableGit not found at: %GIT_PORTABLE_PATH%
-    echo Please ensure PortableGit is installed in the PortableGit folder.
-    echo.
-    echo ========================================
-    echo Press any key to close...
-    echo ========================================
-    pause >nul
-    exit /b 1
+REM Check for Git: first try PortableGit, then system Git
+if exist "%GIT_PORTABLE_PATH%" (
+    set "GIT_PATH=%GIT_PORTABLE_PATH%"
+    echo [Git] Using PortableGit
+) else (
+    REM Try to find git in system PATH
+    where git >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        for /f "tokens=*" %%i in ('where git 2^>nul') do (
+            if not defined GIT_PATH set "GIT_PATH=%%i"
+        )
+        echo [Git] Using system Git: !GIT_PATH!
+    ) else (
+        echo [Error] Git not found.
+        echo   - PortableGit not found at: %GIT_PORTABLE_PATH%
+        echo   - System Git not found in PATH
+        echo.
+        echo Please either:
+        echo   1. Install PortableGit in the PortableGit folder, or
+        echo   2. Install Git and add it to your system PATH
+        echo.
+        echo ========================================
+        echo Press any key to close...
+        echo ========================================
+        pause >nul
+        exit /b 1
+    )
 )
+echo.
 
 REM Check if this is a git repository
 cd /d "%REPO_PATH%"
-"%GIT_PORTABLE_PATH%" rev-parse --git-dir >nul 2>&1
+"!GIT_PATH!" rev-parse --git-dir >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [Error] Not a git repository.
     echo This folder does not appear to be a git repository.
@@ -53,8 +72,8 @@ if exist "%PROXY_CONFIG_FILE%" (
     if "!PROXY_ENABLED!"=="1" (
         if not "!PROXY_URL!"=="" (
             echo [Proxy] Using proxy server: !PROXY_URL!
-            "%GIT_PORTABLE_PATH%" config --local http.proxy "!PROXY_URL!"
-            "%GIT_PORTABLE_PATH%" config --local https.proxy "!PROXY_URL!"
+            "!GIT_PATH!" config --local http.proxy "!PROXY_URL!"
+            "!GIT_PATH!" config --local https.proxy "!PROXY_URL!"
             echo.
         )
     )
@@ -62,11 +81,11 @@ if exist "%PROXY_CONFIG_FILE%" (
 
 echo [1/4] Checking current version...
 REM Get current branch
-for /f "tokens=*" %%i in ('"%GIT_PORTABLE_PATH%" rev-parse --abbrev-ref HEAD 2^>nul') do set CURRENT_BRANCH=%%i
+for /f "tokens=*" %%i in ('"!GIT_PATH!" rev-parse --abbrev-ref HEAD 2^>nul') do set CURRENT_BRANCH=%%i
 if "%CURRENT_BRANCH%"=="" set CURRENT_BRANCH=main
 
 REM Get current commit
-for /f "tokens=*" %%i in ('"%GIT_PORTABLE_PATH%" rev-parse --short HEAD 2^>nul') do set CURRENT_COMMIT=%%i
+for /f "tokens=*" %%i in ('"!GIT_PATH!" rev-parse --short HEAD 2^>nul') do set CURRENT_COMMIT=%%i
 
 echo   Branch: %CURRENT_BRANCH%
 echo   Commit: %CURRENT_COMMIT%
@@ -79,7 +98,7 @@ echo   Connecting to GitHub...
 REM Fetch remote with timeout
 REM Use START /B to run in background and check timeout
 set FETCH_SUCCESS=0
-"%GIT_PORTABLE_PATH%" fetch origin --quiet 2>nul
+"!GIT_PATH!" fetch origin --quiet 2>nul
 if %ERRORLEVEL% EQU 0 (
     set FETCH_SUCCESS=1
 ) else (
@@ -87,7 +106,8 @@ if %ERRORLEVEL% EQU 0 (
     set TEMP_MARKER=%TEMP%\acestep_git_fetch_%RANDOM%.tmp
 
     REM Start fetch in background
-    start /b "" cmd /c ""%GIT_PORTABLE_PATH%" fetch origin --quiet >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
+    set "FETCH_CMD=!GIT_PATH! fetch origin --quiet"
+    start /b "" cmd /c "!FETCH_CMD! >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
 
     REM Wait with timeout
     set /a COUNTER=0
@@ -137,7 +157,7 @@ echo.
 
 echo [3/4] Comparing versions...
 REM Get remote commit
-for /f "tokens=*" %%i in ('"%GIT_PORTABLE_PATH%" rev-parse --short origin/%CURRENT_BRANCH% 2^>nul') do set REMOTE_COMMIT=%%i
+for /f "tokens=*" %%i in ('"!GIT_PATH!" rev-parse --short origin/%CURRENT_BRANCH% 2^>nul') do set REMOTE_COMMIT=%%i
 
 if "%REMOTE_COMMIT%"=="" (
     echo   [Warning] Remote branch 'origin/%CURRENT_BRANCH%' not found.
@@ -149,7 +169,7 @@ if "%REMOTE_COMMIT%"=="" (
     REM Try to get main branch instead
     set FALLBACK_BRANCH=main
     echo   Checking main branch instead...
-    for /f "tokens=*" %%i in ('"%GIT_PORTABLE_PATH%" rev-parse --short origin/!FALLBACK_BRANCH! 2^>nul') do set REMOTE_COMMIT=%%i
+    for /f "tokens=*" %%i in ('"!GIT_PATH!" rev-parse --short origin/!FALLBACK_BRANCH! 2^>nul') do set REMOTE_COMMIT=%%i
 
     if "!REMOTE_COMMIT!"=="" (
         echo   [Error] Could not find remote main branch either.
@@ -172,7 +192,7 @@ if "%REMOTE_COMMIT%"=="" (
     if /i "!SWITCH_BRANCH!"=="Y" (
         echo.
         echo   Switching to main branch...
-        "%GIT_PORTABLE_PATH%" checkout main
+        "!GIT_PATH!" checkout main
 
         if !ERRORLEVEL! EQU 0 (
             echo   [Success] Switched to main branch.
@@ -220,14 +240,14 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
     echo [4/4] Result: Update available!
 
     REM Check if local is behind remote
-    "%GIT_PORTABLE_PATH%" merge-base --is-ancestor HEAD origin/%CURRENT_BRANCH% 2>nul
-    if %ERRORLEVEL% EQU 0 (
+    "!GIT_PATH!" merge-base --is-ancestor HEAD origin/%CURRENT_BRANCH% 2>nul
+    if !ERRORLEVEL! EQU 0 (
         echo   A new version is available on GitHub.
         echo.
 
         REM Show commits behind
         echo   New commits:
-        "%GIT_PORTABLE_PATH%" log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
+        "!GIT_PATH!" log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
         echo.
 
         REM Ask if user wants to update
@@ -237,23 +257,24 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
             echo Updating...
 
             REM Check for uncommitted changes
-            "%GIT_PORTABLE_PATH%" diff-index --quiet HEAD -- 2>nul
-            if %ERRORLEVEL% NEQ 0 (
+            "!GIT_PATH!" diff-index --quiet HEAD -- 2>nul
+            if !ERRORLEVEL! NEQ 0 (
                 echo.
                 echo [Info] Checking for potential conflicts...
 
                 REM Get list of locally modified files
                 set TEMP_LOCAL_CHANGES=%TEMP%\acestep_local_changes_%RANDOM%.txt
-                "%GIT_PORTABLE_PATH%" diff --name-only HEAD 2>nul > "!TEMP_LOCAL_CHANGES!"
+                "!GIT_PATH!" diff --name-only HEAD 2>nul > "!TEMP_LOCAL_CHANGES!"
 
                 REM Get list of files changed in remote
                 set TEMP_REMOTE_CHANGES=%TEMP%\acestep_remote_changes_%RANDOM%.txt
-                "%GIT_PORTABLE_PATH%" diff --name-only HEAD..origin/%CURRENT_BRANCH% 2>nul > "!TEMP_REMOTE_CHANGES!"
+                "!GIT_PATH!" diff --name-only HEAD..origin/%CURRENT_BRANCH% 2>nul > "!TEMP_REMOTE_CHANGES!"
 
                 REM Check for conflicts
                 set HAS_CONFLICTS=0
-                set BACKUP_DIR=%~dp0.update_backup_%date:~0,4%%date:~5,2%%date:~8,2%_%time:~0,2%%time:~3,2%%time:~6,2%
-                set BACKUP_DIR=!BACKUP_DIR: =0!
+                REM Use wmic to get locale-independent date/time format (YYYYMMDDHHMMSS)
+                for /f "tokens=2 delims==" %%a in ('wmic os get localdatetime /value 2^>nul') do set "DATETIME=%%a"
+                set "BACKUP_DIR=%~dp0.update_backup_!DATETIME:~0,8!_!DATETIME:~8,6!"
 
                 REM Find conflicting files
                 for /f "usebackq delims=" %%a in ("!TEMP_LOCAL_CHANGES!") do (
@@ -313,7 +334,7 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                         echo [Restore] Restoring conflicting files to remote version...
 
                         REM Restore files to HEAD (discard local changes)
-                        "%GIT_PORTABLE_PATH%" reset --hard HEAD >nul 2>&1
+                        "!GIT_PATH!" reset --hard HEAD >nul 2>&1
 
                         echo [Restore] Files restored. Proceeding with update...
                     ) else (
@@ -334,7 +355,7 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                     set /p STASH_CHOICE="Stash your changes and continue? (Y/N): "
                     if /i "!STASH_CHOICE!"=="Y" (
                         echo Stashing changes...
-                        "%GIT_PORTABLE_PATH%" stash push -m "Auto-stash before update - %date% %time%"
+                        "!GIT_PATH!" stash push -m "Auto-stash before update - %date% %time%"
                     ) else (
                         echo.
                         echo Update cancelled.
@@ -350,9 +371,9 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
             REM Pull changes
             echo Pulling latest changes...
-            "%GIT_PORTABLE_PATH%" pull origin %CURRENT_BRANCH%
+            "!GIT_PATH!" pull origin %CURRENT_BRANCH%
 
-            if %ERRORLEVEL% EQU 0 (
+            if !ERRORLEVEL! EQU 0 (
                 echo.
                 echo ========================================
                 echo Update completed successfully!
@@ -370,9 +391,11 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                         echo   2. Or manually compare backup with new version
                         echo.
                         echo Backed up files:
+                        set "BACKUP_DIR_DISPLAY=!BACKUP_DIR!"
                         for /f "delims=" %%f in ('dir /b /s "!BACKUP_DIR!\*.*" 2^>nul') do (
-                            set FILEPATH=%%f
-                            set FILEPATH=!FILEPATH:!BACKUP_DIR!\=!
+                            set "FILEPATH=%%f"
+                            REM Use call to safely handle the string replacement
+                            call set "FILEPATH=%%FILEPATH:!BACKUP_DIR_DISPLAY!\=%%"
                             echo   - !FILEPATH!
                         )
                         echo.
@@ -455,8 +478,8 @@ if "!NEW_PROXY_URL!"=="" (
     echo [Proxy] Disabling proxy...
 
     REM Remove proxy configuration
-    "%GIT_PORTABLE_PATH%" config --local --unset http.proxy 2>nul
-    "%GIT_PORTABLE_PATH%" config --local --unset https.proxy 2>nul
+    "!GIT_PATH!" config --local --unset http.proxy 2>nul
+    "!GIT_PATH!" config --local --unset https.proxy 2>nul
 
     REM Update config file
     (
@@ -471,8 +494,8 @@ if "!NEW_PROXY_URL!"=="" (
     echo [Proxy] Configuring proxy: !NEW_PROXY_URL!
 
     REM Apply proxy to git
-    "%GIT_PORTABLE_PATH%" config --local http.proxy "!NEW_PROXY_URL!"
-    "%GIT_PORTABLE_PATH%" config --local https.proxy "!NEW_PROXY_URL!"
+    "!GIT_PATH!" config --local http.proxy "!NEW_PROXY_URL!"
+    "!GIT_PATH!" config --local https.proxy "!NEW_PROXY_URL!"
 
     REM Save to config file
     (

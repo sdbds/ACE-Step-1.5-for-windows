@@ -11,7 +11,7 @@ echo.
 REM Test 1: Check PowerShell
 echo [Test 1] Checking PowerShell...
 powershell -Command "Write-Host 'PowerShell is available' -ForegroundColor Green; Write-Host 'Version:'; $PSVersionTable.PSVersion" 2>nul
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
     echo [PASS] PowerShell is working
 ) else (
     echo [FAIL] PowerShell not available
@@ -21,7 +21,7 @@ echo.
 REM Test 2: Check winget
 echo [Test 2] Checking winget...
 where winget >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
     echo [PASS] winget found
     winget --version
 ) else (
@@ -43,7 +43,7 @@ echo.
 REM Test 4: Check uv
 echo [Test 4] Checking uv...
 where uv >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
     echo [PASS] uv found in PATH
     uv --version
 ) else (

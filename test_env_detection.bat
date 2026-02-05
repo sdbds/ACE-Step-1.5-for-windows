@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM Test Environment Auto-Detection
 REM This script tests the environment detection logic
 
@@ -23,7 +24,7 @@ echo.
 REM Test 2: Check if uv is available
 echo [Test 2] Checking for uv command...
 where uv >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
     echo [PASS] uv detected
 
     REM Get uv version
@@ -51,11 +52,11 @@ echo.
 REM Test 4: Determine which environment will be used
 echo [Test 4] Environment selection logic...
 if exist "%~dp0python_embeded\python.exe" (
-    echo [RESULT] Will use: Embedded Python (python_embeded)
+    echo [RESULT] Will use: Embedded Python ^(python_embeded^)
     echo Command: python_embeded\python.exe acestep\acestep_v15_pipeline.py
 ) else (
     where uv >nul 2>&1
-    if %ERRORLEVEL% EQU 0 (
+    if !ERRORLEVEL! EQU 0 (
         echo [RESULT] Will use: uv package manager
         echo Command: uv run acestep
     ) else (

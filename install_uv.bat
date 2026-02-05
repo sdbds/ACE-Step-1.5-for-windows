@@ -1,21 +1,43 @@
 @echo off
+setlocal enabledelayedexpansion
 REM Install uv Package Manager
-REM This script installs uv using PowerShell
+REM This script installs uv using PowerShell or winget
+REM
+REM Usage:
+REM   install_uv.bat           - Interactive mode (default)
+REM   install_uv.bat --silent  - Silent mode for script calls
+REM
+REM Exit codes:
+REM   0 - Success (uv installed and available)
+REM   1 - Installation failed
+REM   2 - User cancelled (interactive mode only)
 
-echo ========================================
-echo Install uv Package Manager
-echo ========================================
-echo.
-echo This script will install uv, a fast Python package manager.
-echo Installation location: %USERPROFILE%\.local\bin\
-echo.
-echo Press any key to continue or Ctrl+C to cancel...
-pause >nul
-echo.
+REM Check for silent mode
+set SILENT_MODE=0
+if /i "%~1"=="--silent" set SILENT_MODE=1
+if /i "%~1"=="-s" set SILENT_MODE=1
+
+if %SILENT_MODE% EQU 0 (
+    echo ========================================
+    echo Install uv Package Manager
+    echo ========================================
+    echo.
+    echo This script will install uv, a fast Python package manager.
+    echo Installation location: %USERPROFILE%\.local\bin\
+    echo.
+    echo Press any key to continue or Ctrl+C to cancel...
+    pause >nul
+    echo.
+)
 
 REM Check if uv is already installed
 where uv >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
+    if %SILENT_MODE% EQU 1 (
+        REM In silent mode, uv already installed is success
+        endlocal & exit /b 0
+    )
+
     echo uv is already installed!
     echo Current version:
     uv --version
@@ -25,72 +47,116 @@ if %ERRORLEVEL% EQU 0 (
     echo.
 
     set /p REINSTALL="Reinstall uv? (Y/N): "
-    if /i not "%REINSTALL%"=="Y" (
+    if /i not "!REINSTALL!"=="Y" (
         echo.
         echo Installation cancelled.
         pause
-        exit /b 0
+        endlocal & exit /b 2
     )
     echo.
 )
 
-echo Installing uv...
-echo.
-
-REM Try winget first (Windows 10 1809+ / Windows 11)
-where winget >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    echo [Method 1] Using winget (Windows Package Manager)...
-    echo.
-    winget install --id=astral-sh.uv -e
-
-    if %ERRORLEVEL% EQU 0 (
-        echo.
-        echo ========================================
-        echo uv installed successfully via winget!
-        echo ========================================
-        goto :VerifyInstallation
-    ) else (
-        echo.
-        echo winget installation failed, trying PowerShell...
-        echo.
-    )
-) else (
-    echo [Info] winget not available, using PowerShell...
+if %SILENT_MODE% EQU 0 (
+    echo Installing uv...
     echo.
 )
 
-REM Fallback to PowerShell
-echo [Method 2] Using PowerShell...
-echo This may take a few moments...
-echo.
+REM Try PowerShell first (preferred method)
+if %SILENT_MODE% EQU 0 (
+    echo [Method 1] Using PowerShell...
+    echo This may take a few moments...
+    echo.
+)
 
 REM Check if PowerShell is available
 powershell -Command "Write-Host 'PowerShell is available'" >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo ========================================
-    echo ERROR: PowerShell not found!
-    echo ========================================
-    echo.
-    echo Neither winget nor PowerShell is available.
-    echo Please install uv manually from: https://astral.sh/uv
-    echo.
-    pause
-    exit /b 1
+if !ERRORLEVEL! EQU 0 (
+    REM Install uv using PowerShell
+    if %SILENT_MODE% EQU 1 (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "& {try { $ProgressPreference = 'SilentlyContinue'; Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression } catch { exit 1 }}" >nul 2>&1
+    ) else (
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "& {Write-Host 'Downloading uv installer...' -ForegroundColor Cyan; try { $ProgressPreference = 'SilentlyContinue'; Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression; Write-Host ''; Write-Host '========================================' -ForegroundColor Green; Write-Host 'uv installed successfully!' -ForegroundColor Green; Write-Host '========================================' -ForegroundColor Green } catch { Write-Host ''; Write-Host '========================================' -ForegroundColor Red; Write-Host 'Installation failed!' -ForegroundColor Red; Write-Host '========================================' -ForegroundColor Red; Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }}"
+    )
+
+    if !ERRORLEVEL! EQU 0 (
+        goto :VerifyInstallation
+    ) else (
+        if %SILENT_MODE% EQU 0 (
+            echo.
+            echo PowerShell installation failed, trying winget...
+            echo.
+        )
+    )
+) else (
+    if %SILENT_MODE% EQU 0 (
+        echo [Info] PowerShell not available, trying winget...
+        echo.
+    )
 )
 
-REM Install uv using PowerShell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& {Write-Host 'Downloading uv installer...' -ForegroundColor Cyan; try { $ProgressPreference = 'SilentlyContinue'; Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression; Write-Host ''; Write-Host '========================================' -ForegroundColor Green; Write-Host 'uv installed successfully!' -ForegroundColor Green; Write-Host '========================================' -ForegroundColor Green } catch { Write-Host ''; Write-Host '========================================' -ForegroundColor Red; Write-Host 'Installation failed!' -ForegroundColor Red; Write-Host '========================================' -ForegroundColor Red; Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }}"
+REM Fallback to winget (Windows 10 1809+ / Windows 11)
+where winget >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    if %SILENT_MODE% EQU 0 (
+        echo [Method 2] Using winget ^(Windows Package Manager^)...
+        echo.
+    )
+
+    if %SILENT_MODE% EQU 1 (
+        winget install --id=astral-sh.uv -e --silent >nul 2>&1
+    ) else (
+        winget install --id=astral-sh.uv -e
+    )
+
+    if !ERRORLEVEL! EQU 0 (
+        if %SILENT_MODE% EQU 0 (
+            echo.
+            echo ========================================
+            echo uv installed successfully via winget!
+            echo ========================================
+        )
+        goto :VerifyInstallation
+    ) else (
+        if %SILENT_MODE% EQU 0 (
+            echo.
+            echo winget installation also failed.
+            echo.
+        )
+    )
+) else (
+    if %SILENT_MODE% EQU 0 (
+        echo [Info] winget not available.
+        echo.
+    )
+)
+
+REM Both methods failed
+if %SILENT_MODE% EQU 0 (
+    echo ========================================
+    echo ERROR: All installation methods failed!
+    echo ========================================
+    echo.
+    echo Please install uv manually:
+    echo.
+    echo 1. Open PowerShell and run:
+    echo    irm https://astral.sh/uv/install.ps1 ^| iex
+    echo.
+    echo 2. Or use winget:
+    echo    winget install --id=astral-sh.uv -e
+    echo.
+    echo 3. Or download portable package:
+    echo    https://files.acemusic.ai/acemusic/win/ACE-Step-1.5.7z
+    echo.
+    pause
+)
+endlocal & exit /b 1
 
 :VerifyInstallation
 
-if %ERRORLEVEL% EQU 0 (
-    echo.
-    echo Verifying installation...
-
-    REM Check if uv is in PATH
-    where uv >nul 2>&1
-    if %ERRORLEVEL% EQU 0 (
+REM Check if uv is in PATH
+where uv >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    if %SILENT_MODE% EQU 0 (
         echo.
         echo ========================================
         echo Installation successful!
@@ -106,53 +172,64 @@ if %ERRORLEVEL% EQU 0 (
         echo   start_gradio_ui.bat
         echo   start_api_server.bat
         echo.
-    ) else (
-        REM Check in the default installation location
-        if exist "%USERPROFILE%\.local\bin\uv.exe" (
-            echo.
-            echo ========================================
-            echo Installation successful!
-            echo ========================================
-            echo.
-            echo Installation location: %USERPROFILE%\.local\bin\uv.exe
-            echo.
-            echo NOTE: uv is not in your PATH yet.
-            echo Please restart your terminal, or manually add to PATH:
-            echo   setx PATH "%%PATH%%;%USERPROFILE%\.local\bin"
-            echo.
-            echo For now, you can use the full path:
-            echo   %USERPROFILE%\.local\bin\uv.exe --version
-            echo.
-        ) else (
-            echo.
-            echo ========================================
-            echo Installation completed but uv not found!
-            echo ========================================
-            echo.
-            echo Please check the installation manually or try again.
-            echo.
-        )
+        pause
     )
-    pause
-    exit /b 0
-) else (
-    echo.
-    echo ========================================
-    echo Installation failed!
-    echo ========================================
-    echo.
-    echo Please try one of the following:
-    echo.
-    echo 1. Manual installation via PowerShell:
-    echo    Open PowerShell and run:
-    echo    irm https://astral.sh/uv/install.ps1 ^| iex
-    echo.
-    echo 2. Use the portable package instead:
-    echo    Download: https://files.acemusic.ai/acemusic/win/ACE-Step-1.5.7z
-    echo    Extract and run: start_gradio_ui.bat
-    echo.
-    echo 3. Check your internet connection and try again
-    echo.
-    pause
-    exit /b 1
+    endlocal & exit /b 0
 )
+
+REM Check in the default installation location and update PATH
+if exist "%USERPROFILE%\.local\bin\uv.exe" (
+    endlocal & set "PATH=%USERPROFILE%\.local\bin;%PATH%" & goto :PostEndlocal_UserProfile
+)
+if exist "%LOCALAPPDATA%\Microsoft\WinGet\Links\uv.exe" (
+    endlocal & set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%" & goto :PostEndlocal_WinGet
+)
+
+REM Not found anywhere
+if %SILENT_MODE% EQU 0 (
+    echo.
+    echo ========================================
+    echo Installation completed but uv not found!
+    echo ========================================
+    echo.
+    echo Please restart your terminal and try again.
+    echo.
+    pause
+)
+endlocal & exit /b 1
+
+:PostEndlocal_UserProfile
+if "%SILENT_MODE%"=="0" (
+    echo.
+    echo ========================================
+    echo Installation successful!
+    echo ========================================
+    echo.
+    echo Installation location: %USERPROFILE%\.local\bin\uv.exe
+    echo.
+    echo NOTE: uv is not in your PATH yet.
+    echo Please restart your terminal, or manually add to PATH:
+    echo   setx PATH "%%PATH%%;%USERPROFILE%\.local\bin"
+    echo.
+    echo For now, you can use the full path:
+    echo   %USERPROFILE%\.local\bin\uv.exe --version
+    echo.
+    pause
+)
+exit /b 0
+
+:PostEndlocal_WinGet
+if "%SILENT_MODE%"=="0" (
+    echo.
+    echo ========================================
+    echo Installation successful!
+    echo ========================================
+    echo.
+    echo Installation location: %LOCALAPPDATA%\Microsoft\WinGet\Links\uv.exe
+    echo.
+    echo NOTE: uv is not in your PATH yet.
+    echo Please restart your terminal.
+    echo.
+    pause
+)
+exit /b 0

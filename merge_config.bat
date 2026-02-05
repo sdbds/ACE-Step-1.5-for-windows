@@ -16,12 +16,14 @@ echo.
 
 for /d %%d in ("%~dp0.update_backup_*") do (
     set FOUND_BACKUPS=1
+    set "CURRENT_BACKUP_DIR=%%d"
     echo Found backup: %%~nxd
     echo   Location: %%d
     echo   Files:
     for /f "delims=" %%f in ('dir /b /s "%%d\*.*" 2^>nul') do (
-        set FILEPATH=%%f
-        set FILEPATH=!FILEPATH:%%d\=!
+        set "FILEPATH=%%f"
+        REM Use call to safely handle the string replacement
+        call set "FILEPATH=%%FILEPATH:!CURRENT_BACKUP_DIR!\=%%"
         echo     - !FILEPATH!
     )
     echo.
@@ -90,9 +92,11 @@ if not defined SELECTED_BACKUP (
 
 echo.
 echo Files in backup:
-for /f "delims=" %%f in ('dir /b /s "%SELECTED_BACKUP%\*.*" 2^>nul') do (
-    set FILEPATH=%%f
-    set FILEPATH=!FILEPATH:%SELECTED_BACKUP%\=!
+set "SELECTED_BACKUP_DISPLAY=!SELECTED_BACKUP!"
+for /f "delims=" %%f in ('dir /b /s "!SELECTED_BACKUP!\*.*" 2^>nul') do (
+    set "FILEPATH=%%f"
+    REM Use call to safely handle the string replacement
+    call set "FILEPATH=%%FILEPATH:!SELECTED_BACKUP_DISPLAY!\=%%"
     echo   - !FILEPATH!
 )
 
@@ -167,9 +171,11 @@ if not defined SELECTED_BACKUP (
 
 echo.
 echo Files in backup:
-for /f "delims=" %%f in ('dir /b /s "%SELECTED_BACKUP%\*.*" 2^>nul') do (
-    set FILEPATH=%%f
-    set FILEPATH=!FILEPATH:%SELECTED_BACKUP%\=!
+set "SELECTED_BACKUP_DISPLAY=!SELECTED_BACKUP!"
+for /f "delims=" %%f in ('dir /b /s "!SELECTED_BACKUP!\*.*" 2^>nul') do (
+    set "FILEPATH=%%f"
+    REM Use call to safely handle the string replacement
+    call set "FILEPATH=%%FILEPATH:!SELECTED_BACKUP_DISPLAY!\=%%"
     echo   - !FILEPATH!
 )
 
@@ -194,7 +200,7 @@ set /p CONFIRM="Are you sure? This will overwrite the current file. (Y/N): "
 
 if /i "%CONFIRM%"=="Y" (
     copy /y "%BACKUP_FILE%" "%CURRENT_FILE%" >nul
-    if %ERRORLEVEL% EQU 0 (
+    if !ERRORLEVEL! EQU 0 (
         echo.
         echo [Success] File restored successfully.
     ) else (
@@ -218,12 +224,14 @@ echo ========================================
 echo.
 
 for /d %%d in ("%~dp0.update_backup_*") do (
+    set "CURRENT_BACKUP_DIR=%%d"
     echo Backup: %%~nxd
     echo Location: %%d
     echo Files:
     for /f "delims=" %%f in ('dir /b /s "%%d" 2^>nul') do (
-        set FILEPATH=%%f
-        set FILEPATH=!FILEPATH:%%d\=!
+        set "FILEPATH=%%f"
+        REM Use call to safely handle the string replacement
+        call set "FILEPATH=%%FILEPATH:!CURRENT_BACKUP_DIR!\=%%"
         echo   - !FILEPATH!
     )
     echo.

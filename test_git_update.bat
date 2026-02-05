@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM Test Git Update Check Functionality
 REM This script tests the update check without actually starting the application
 
@@ -26,12 +27,12 @@ echo.
 REM Test 2: Check if this is a git repository
 echo [Test 2] Checking git repository...
 "%~dp0PortableGit\bin\git.exe" rev-parse --git-dir >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
+if !ERRORLEVEL! EQU 0 (
     echo [PASS] Valid git repository
     for /f "tokens=*" %%i in ('"%~dp0PortableGit\bin\git.exe" rev-parse --abbrev-ref HEAD 2^>nul') do set CURRENT_BRANCH=%%i
     for /f "tokens=*" %%i in ('"%~dp0PortableGit\bin\git.exe" rev-parse --short HEAD 2^>nul') do set CURRENT_COMMIT=%%i
-    echo   Branch: %CURRENT_BRANCH%
-    echo   Commit: %CURRENT_COMMIT%
+    echo   Branch: !CURRENT_BRANCH!
+    echo   Commit: !CURRENT_COMMIT!
 ) else (
     echo [FAIL] Not a git repository
     echo.
@@ -59,23 +60,23 @@ echo ========================================
 echo.
 
 call "%~dp0check_update.bat"
-set UPDATE_RESULT=%ERRORLEVEL%
+set UPDATE_RESULT=!ERRORLEVEL!
 
 echo.
 echo ========================================
 echo.
 
-if %UPDATE_RESULT% EQU 0 (
+if !UPDATE_RESULT! EQU 0 (
     echo [Test 4] Update check completed successfully
     echo   Result: Already up to date or updated
-) else if %UPDATE_RESULT% EQU 1 (
+) else if !UPDATE_RESULT! EQU 1 (
     echo [Test 4] Update check failed
     echo   Result: Error occurred
-) else if %UPDATE_RESULT% EQU 2 (
+) else if !UPDATE_RESULT! EQU 2 (
     echo [Test 4] Update check skipped
     echo   Result: Network timeout
 ) else (
-    echo [Test 4] Unknown result: %UPDATE_RESULT%
+    echo [Test 4] Unknown result: !UPDATE_RESULT!
 )
 echo.
 
@@ -85,7 +86,7 @@ echo Test Summary
 echo ========================================
 echo.
 
-if %UPDATE_RESULT% LEQ 2 (
+if !UPDATE_RESULT! LEQ 2 (
     echo [PASS] All tests completed
     echo.
     echo The update check feature is working correctly.
