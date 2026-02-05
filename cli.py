@@ -4,6 +4,7 @@ import ast
 import os
 import sys
 import toml
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 # Load environment variables from .env or .env.example (if available)
@@ -438,8 +439,17 @@ def _prompt_existing_file(prompt: str, default: Optional[str] = None) -> str:
         if not path and default:
             path = default
         if os.path.isfile(path):
-            return path
+            return _expand_audio_path(path)
         print("Invalid file path. Please try again.")
+
+
+def _expand_audio_path(path_str: Optional[str]) -> Optional[str]:
+    if not path_str or not isinstance(path_str, str):
+        return path_str
+    try:
+        return Path(path_str).expanduser().resolve(strict=False).as_posix()
+    except Exception:
+        return Path(path_str).expanduser().absolute().as_posix()
 
 
 def _parse_bool(value: str) -> bool:
@@ -1197,6 +1207,11 @@ def main():
         args.checkpoint_dir = os.path.expanduser(str(args.checkpoint_dir))
         if not os.path.isabs(args.checkpoint_dir):
             args.checkpoint_dir = os.path.join(args.project_root, args.checkpoint_dir)
+
+    if args.src_audio:
+        args.src_audio = _expand_audio_path(args.src_audio)
+    if args.reference_audio:
+        args.reference_audio = _expand_audio_path(args.reference_audio)
 
     device = _resolve_device(args.device)
 
