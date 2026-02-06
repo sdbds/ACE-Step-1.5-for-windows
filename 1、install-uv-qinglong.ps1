@@ -1,11 +1,11 @@
 ﻿Set-Location $PSScriptRoot
 
 $Env:HF_HOME = "huggingface"
-$Env:HF_ENDPOINT="https://hf-mirror.com"
+#$Env:HF_ENDPOINT="https://hf-mirror.com"
 $Env:PIP_DISABLE_PIP_VERSION_CHECK = 1
 $Env:PIP_NO_CACHE_DIR = 1
 #$Env:PIP_INDEX_URL="https://pypi.mirrors.ustc.edu.cn/simple"
-$Env:UV_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+#$Env:UV_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple/"
 $Env:UV_EXTRA_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 $Env:UV_CACHE_DIR = "${env:LOCALAPPDATA}/uv/cache"
 $Env:UV_NO_BUILD_ISOLATION = "1"
@@ -106,7 +106,7 @@ else {
 
 Write-Output "Installing main requirements"
 
-~/.local/bin/uv pip install --upgrade wheel_stub torch==2.10.0 psutil hatchling editables
+~/.local/bin/uv pip install --upgrade wheel_stub torch==2.9.1 psutil hatchling editables
 
 if ($env:OS -ilike "*windows*") {
     ~/.local/bin/uv pip install -r requirements.txt --index-strategy unsafe-best-match
