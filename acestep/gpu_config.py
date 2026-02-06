@@ -19,8 +19,9 @@ from loguru import logger
 # Environment variable for debugging/testing different GPU memory configurations
 DEBUG_MAX_CUDA_VRAM_ENV = "MAX_CUDA_VRAM"
 
-# Tolerance for 16GB detection: reported VRAM like 15.99GB is effectively 16GB hardware
-VRAM_16GB_TOLERANCE_GB = 0.1
+# Tolerance for 16GB detection: reported VRAM like 15.5GB is effectively 16GB hardware
+# Real-world 16GB GPUs often report 15.7-15.9GB due to system/driver reservations
+VRAM_16GB_TOLERANCE_GB = 0.5
 VRAM_16GB_MIN_GB = 16.0 - VRAM_16GB_TOLERANCE_GB  # treat as 16GB class if >= this
 
 

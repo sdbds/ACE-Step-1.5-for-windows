@@ -317,7 +317,6 @@ class LLMHandler:
         device: str = "auto",
         offload_to_cpu: bool = False,
         dtype: Optional[torch.dtype] = None,
-        disable_cuda_graphs: bool = False,
     ) -> Tuple[str, bool]:
         """
         Initialize 5Hz LM model
@@ -329,8 +328,6 @@ class LLMHandler:
             device: Device type ("auto", "cuda", or "cpu")
             offload_to_cpu: Whether to offload to CPU
             dtype: Data type (if None, auto-detect based on device)
-            disable_cuda_graphs: If True, disable CUDA graph capture for vLLM (use when LoRA
-                training may run in the same process to avoid cudaErrorStreamCaptureInvalidated).
         
         Returns:
             (status_message, success)
@@ -346,6 +343,7 @@ class LLMHandler:
 
             self.device = device
             self.offload_to_cpu = offload_to_cpu
+            
             # Set dtype based on device: bfloat16 for cuda, float32 for cpu
             if dtype is None:
                 self.dtype = torch.bfloat16 if device in ["cuda", "xpu"] else torch.float32
@@ -388,8 +386,8 @@ class LLMHandler:
             
             # Initialize based on user-selected backend
             if backend == "vllm":
-                # Try to initialize with vllm
-                status_msg = self._initialize_5hz_lm_vllm(full_lm_model_path, enforce_eager=disable_cuda_graphs)
+                # Try to initialize with vllm (LM always uses CUDA graphs for best performance)
+                status_msg = self._initialize_5hz_lm_vllm(full_lm_model_path, enforce_eager=False)
                 logger.info(f"5Hz LM status message: {status_msg}")
                 # Check if initialization failed (status_msg starts with ❌)
                 if status_msg.startswith("❌"):

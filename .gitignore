@@ -233,3 +233,4 @@ gradio_outputs/
 huggingface/
 .windsurf/
 .claude
+acestep/third_parts/vllm/

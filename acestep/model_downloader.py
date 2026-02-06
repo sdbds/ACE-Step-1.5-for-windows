@@ -30,12 +30,15 @@ def _can_access_google(timeout: float = 3.0) -> bool:
         True if Google is accessible, False otherwise
     """
     import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("www.google.com", 443))
+        sock.settimeout(timeout)
+        sock.connect(("www.google.com", 443))
         return True
     except (socket.timeout, socket.error, OSError):
         return False
+    finally:
+        sock.close()
 
 
 def _download_from_huggingface_internal(

@@ -196,7 +196,7 @@
     "prev_btn": "◀ Previous",
     "next_btn": "Next ▶",
     "restore_params_btn": "↙️ Apply These Settings to UI (Restore Batch Parameters)",
-    "batch_results_title": "📁 Batch Results & Generation Details",
+    "batch_results_title": "👇 Click here to view batch results & generation details",
     "all_files_label": "📁 All Generated Files (Download)",
     "generation_details": "Generation Details"
   },

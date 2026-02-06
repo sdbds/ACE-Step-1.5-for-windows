@@ -1,8 +1,17 @@
+import os
 from collections import deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+# Debug logging - enable with NANOVLLM_DEBUG=1
+_DEBUG = os.environ.get("NANOVLLM_DEBUG", "0") == "1"
+
+def _debug_log(msg: str):
+    """Print debug message if NANOVLLM_DEBUG is enabled"""
+    if _DEBUG:
+        print(f"[nanovllm scheduler DEBUG] {msg}", flush=True)
 
 
 class Scheduler:
@@ -22,6 +31,9 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        _debug_log(f"schedule: waiting={len(self.waiting)}, running={len(self.running)}, "
+                  f"free_blocks={len(self.block_manager.free_block_ids)}")
+        
         # prefill
         scheduled_seqs = []
         num_seqs = 0
@@ -209,6 +221,10 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+        _debug_log(f"postprocess: num_seqs={len(seqs)}, num_token_ids={len(token_ids) if token_ids else 0}")
+        if token_ids:
+            _debug_log(f"  token_ids: {token_ids[:10]}..." if len(token_ids) > 10 else f"  token_ids: {token_ids}")
+        
         # Check if this is a CFG batch
         is_cfg_batch = False
         if len(seqs) > 0 and seqs[0].cfg_scale > 1.0 and seqs[0].paired_seq is not None:
@@ -216,6 +232,7 @@ class Scheduler:
             is_cfg_batch = (num_cond > 0 and 
                            not seqs[0].is_unconditional and 
                            seqs[num_cond].is_unconditional)
+        _debug_log(f"  is_cfg_batch={is_cfg_batch}")
         
         if is_cfg_batch:
             # CFG batch: seqs = [cond_seq1, cond_seq2, ..., uncond_seq1, uncond_seq2, ...]

@@ -647,7 +647,10 @@ class AceStepHandler:
         """Check if tensor is on the target device (handles cuda vs cuda:0 comparison)."""
         if tensor is None:
             return True
-        target_type = "cpu" if target_device == "cpu" else "cuda"
+        try:
+            target_type = torch.device(target_device).type
+        except Exception:
+            target_type = str(target_device)
         return tensor.device.type == target_type
     
     def _ensure_silence_latent_on_device(self):
@@ -2498,6 +2501,22 @@ class AceStepHandler:
             offload_wav_to_cpu: If True, offload decoded wav audio to CPU immediately to save VRAM
         """
         B, C, T = latents.shape
+        
+        # Check device type (handle both string and torch.device)
+        device_type = self.device if isinstance(self.device, str) else self.device.type
+        if device_type == "mps":
+            # MPS conv1d has an output length limit; use smaller chunks to avoid it.
+            max_chunk_size = 32
+            if chunk_size > max_chunk_size:
+                orig_chunk_size = chunk_size
+                orig_overlap = overlap
+                chunk_size = max_chunk_size
+                overlap = min(overlap, max(1, chunk_size // 4))
+                logger.warning(
+                    f"[tiled_decode] MPS device detected; reducing chunk_size from {orig_chunk_size} "
+                    f"to {max_chunk_size} and overlap from {orig_overlap} to {overlap} "
+                    f"to avoid MPS conv output limit."
+                )
         
         # If short enough, decode directly
         if T <= chunk_size:
