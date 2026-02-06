@@ -164,6 +164,8 @@
     "lm_batch_chunk_info": "LMバッチチャンクあたりの最大アイテム数(デフォルト: 8、GPUメモリによる制限)",
     "codes_strength_label": "LM コード強度",
     "codes_strength_info": "LM生成コードを使用するデノイジングステップ数を制御",
+    "similarity_denoise_label": "類似度 / ノイズ除去",
+    "similarity_denoise_info": "出力が参照オーディオにどれだけ忠実かを制御します。高い値ほど構造を保持します。",
     "cover_strength_label": "オーディオカバー強度",
     "cover_strength_info": "カバーモードを使用するデノイジングステップ数を制御",
     "score_sensitivity_label": "品質スコア感度",

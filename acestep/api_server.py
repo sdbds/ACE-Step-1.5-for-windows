@@ -49,6 +49,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
+from loguru import logger
 
 import torch
 
@@ -359,6 +360,7 @@ PARAM_ALIASES = {
     "prompt": ["prompt", "caption"],
     "lyrics": ["lyrics"],
     "thinking": ["thinking"],
+    "analysis_only": ["analysis_only", "analysisOnly"],
     "sample_mode": ["sample_mode", "sampleMode"],
     "sample_query": ["sample_query", "sampleQuery", "description", "desc"],
     "use_format": ["use_format", "useFormat", "format"],
@@ -535,6 +537,7 @@ class GenerateMusicRequest(BaseModel):
     instruction: str = DEFAULT_DIT_INSTRUCTION
     audio_cover_strength: float = 1.0
     task_type: str = "text2music"
+    analysis_only: bool = False
 
     use_adg: bool = False
     cfg_interval_start: float = 0.0
@@ -705,6 +708,7 @@ class _JobRecord:
     finished_at: Optional[float] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    status_text: str = ""
     env: str = "development"
 
 
@@ -801,7 +805,11 @@ class _JobStore:
                 if rec.status in stats:
                     stats[rec.status] += 1
             return stats
-
+    
+    def update_status_text(self, job_id: str, text: str) -> None:
+        with self._lock:
+            if job_id in self._jobs:
+                self._jobs[job_id].status_text = text
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -991,6 +999,15 @@ async def _save_upload_to_temp(upload: StarletteUploadFile, *, prefix: str) -> s
             pass
     return path
 
+class LogBuffer:
+    def __init__(self):
+        self.last_message = "Waiting"
+
+    def write(self, message):
+        self.last_message = message.strip()
+
+log_buffer = LogBuffer()
+logger.add(lambda msg: log_buffer.write(msg), format="{time:HH:mm:ss} | {level} | {message}")
 
 def create_app() -> FastAPI:
     store = _JobStore()
@@ -1547,6 +1564,38 @@ def create_app() -> FastAPI:
                 llm_is_initialized = getattr(app.state, "_llm_initialized", False)
                 llm_to_pass = llm if llm_is_initialized else None
 
+                if req.analysis_only:
+                    lm_res = llm_to_pass.generate_with_stop_condition(
+                        caption=params.caption,
+                        lyrics=params.lyrics,
+                        infer_type="dit",
+                        temperature=req.lm_temperature,
+                        top_p=req.lm_top_p,
+                        use_cot_metas=True,
+                        use_cot_caption=req.use_cot_caption,
+                        use_cot_language=req.use_cot_language,
+                        use_constrained_decoding=True
+                    )
+
+                    if not lm_res.get("success"):
+                        raise RuntimeError(f"Analysis Failed: {lm_res.get('error')}")
+
+                    metas_found = lm_res.get("metadata", {})
+                    return {
+                        "first_audio_path": None,
+                        "audio_paths": [],
+                        "generation_info": "Analysis Only Mode Complete",
+                        "status_message": "Success",
+                        "metas": metas_found,
+                        "bpm": metas_found.get("bpm"),
+                        "keyscale": metas_found.get("keyscale"),
+                        "duration": metas_found.get("duration"),
+                        "prompt": metas_found.get("caption", params.caption),
+                        "lyrics": params.lyrics,
+                        "lm_model": os.getenv("ACESTEP_LM_MODEL_PATH", ""),
+                        "dit_model": "None (Analysis Only)"
+                    }
+
                 # Generate music using unified interface
                 result = generate_music(
                     dit_handler=h,
@@ -1989,6 +2038,7 @@ def create_app() -> FastAPI:
                 prompt=p.str("prompt"),
                 lyrics=p.str("lyrics"),
                 thinking=p.bool("thinking"),
+                analysis_only=p.bool("analysis_only"),
                 sample_mode=p.bool("sample_mode"),
                 sample_query=p.str("sample_query"),
                 use_format=p.bool("use_format"),
@@ -2202,6 +2252,7 @@ def create_app() -> FastAPI:
                                 "task_id": task_id,
                                 "result": data,
                                 "status": int(status) if status is not None else 1,
+                                "progress_text": log_buffer.last_message
                             })
                     continue
 
@@ -2256,6 +2307,7 @@ def create_app() -> FastAPI:
                     "task_id": task_id,
                     "result": json.dumps(result_data, ensure_ascii=False),
                     "status": status_int,
+                    "progress_text": log_buffer.last_message
                 })
             else:
                 data_list.append({"task_id": task_id, "result": "[]", "status": 0})

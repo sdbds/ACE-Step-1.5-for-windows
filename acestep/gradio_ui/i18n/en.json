@@ -164,6 +164,8 @@
     "lm_batch_chunk_info": "Max items per LM batch chunk (default: 8, limited by GPU memory)",
     "codes_strength_label": "LM Codes Strength",
     "codes_strength_info": "Control how many denoising steps use LM-generated codes",
+    "similarity_denoise_label": "Similarity / Denoise",
+    "similarity_denoise_info": "Controls how closely the output follows the reference audio. Higher values preserve more structure.",
     "cover_strength_label": "Audio Cover Strength",
     "cover_strength_info": "Control how many denoising steps use cover mode",
     "score_sensitivity_label": "Quality Score Sensitivity",
