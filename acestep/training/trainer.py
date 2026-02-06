@@ -7,7 +7,7 @@ Supports training from preprocessed tensor files for optimal performance.
 
 import os
 import time
-from typing import Optional, List, Dict, Any, Tuple, Generator
+from typing import Optional, Dict, Tuple, Generator
 from loguru import logger
 
 import torch
@@ -102,8 +102,43 @@ class PreprocessedLoRAModule(nn.Module):
         self.training_config = training_config
         self.device = device
         self.dtype = dtype
-        
-        # Inject LoRA into the decoder only
+        self.fp8_enabled = False
+        self.fp8_error = None
+
+        # FP8 conversion MUST happen BEFORE LoRA injection.
+        # convert_to_float8_training operates on a parent module, replacing its
+        # child nn.Linear layers with Float8Linear in-place.  After PEFT wraps
+        # the Linear layers into lora.Linear wrappers they are no longer direct
+        # nn.Linear instances, so the conversion would find nothing to convert.
+        if self.training_config.use_fp8:
+            try:
+                try:
+                    from torchao.float8 import convert_to_float8_training  # type: ignore
+                except ImportError:
+                    from torchao.float8.float8_linear_utils import convert_to_float8_training  # type: ignore
+
+                convert_to_float8_training(model.decoder)
+
+                float8_count = sum(
+                    1 for m in model.decoder.modules()
+                    if "Float8" in m.__class__.__name__
+                )
+                self.fp8_enabled = float8_count > 0
+                if self.fp8_enabled:
+                    logger.info(f"FP8: converted {float8_count} Linear layers to Float8Linear")
+                else:
+                    self.fp8_error = "convert_to_float8_training ran but no Float8 modules found"
+                    logger.warning(self.fp8_error)
+            except ImportError:
+                self.fp8_enabled = False
+                self.fp8_error = "torchao float8 not available"
+                logger.warning(f"FP8 requested but {self.fp8_error}")
+            except Exception as e:
+                self.fp8_enabled = False
+                self.fp8_error = str(e)
+                logger.warning(f"FP8 conversion failed: {self.fp8_error}")
+
+        # Inject LoRA into the decoder (after FP8 so PEFT wraps Float8Linear layers)
         if check_peft_available():
             self.model, self.lora_info = inject_lora_into_dit(model, lora_config)
             logger.info(f"LoRA injected: {self.lora_info['trainable_params']:,} trainable params")
@@ -142,6 +177,46 @@ class PreprocessedLoRAModule(nn.Module):
             encoder_hidden_states = batch["encoder_hidden_states"].to(self.device)
             encoder_attention_mask = batch["encoder_attention_mask"].to(self.device)
             context_latents = batch["context_latents"].to(self.device)
+
+            loss_attention_mask = attention_mask
+
+            if self.fp8_enabled:
+                multiple = 16
+
+                def _pad_len(n: int) -> int:
+                    r = n % multiple
+                    return 0 if r == 0 else (multiple - r)
+
+                def _pad_3d(x: torch.Tensor, pad_t: int) -> torch.Tensor:
+                    if pad_t <= 0:
+                        return x
+                    out = x.new_zeros((x.shape[0], x.shape[1] + pad_t, x.shape[2]))
+                    out[:, : x.shape[1], :] = x
+                    return out
+
+                def _pad_2d(x: torch.Tensor, pad_t: int) -> torch.Tensor:
+                    if pad_t <= 0:
+                        return x
+                    out = x.new_zeros((x.shape[0], x.shape[1] + pad_t))
+                    out[:, : x.shape[1]] = x
+                    return out
+
+                pad_t = _pad_len(int(target_latents.shape[1]))
+                target_latents = _pad_3d(target_latents, pad_t)
+                loss_attention_mask = _pad_2d(loss_attention_mask, pad_t)
+                context_latents = _pad_3d(context_latents, pad_t)
+
+                attention_mask = loss_attention_mask
+                if pad_t > 0:
+                    attention_mask = attention_mask.clone()
+                    attention_mask[:, -pad_t:] = 1
+
+                pad_l = _pad_len(int(encoder_hidden_states.shape[1]))
+                encoder_hidden_states = _pad_3d(encoder_hidden_states, pad_l)
+                encoder_attention_mask = _pad_2d(encoder_attention_mask, pad_l)
+                if pad_l > 0:
+                    encoder_attention_mask = encoder_attention_mask.clone()
+                    encoder_attention_mask[:, -pad_l:] = 1
             
             bsz = target_latents.shape[0]
             
@@ -169,7 +244,17 @@ class PreprocessedLoRAModule(nn.Module):
             
             # Flow matching loss: predict the flow field v = x1 - x0
             flow = x1 - x0
-            diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
+
+            if self.fp8_enabled:
+                valid = loss_attention_mask
+                if valid.dtype != torch.bool:
+                    valid = valid != 0
+                valid3 = valid.unsqueeze(-1)
+                diff = (decoder_outputs[0] - flow) ** 2
+                denom = valid3.sum().clamp(min=1)
+                diffusion_loss = (diff * valid3).sum() / denom
+            else:
+                diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
         
         # Convert loss to float32 for stable backward pass
         diffusion_loss = diffusion_loss.float()
@@ -299,6 +384,16 @@ class LoRATrainer:
         self.fabric.launch()
         
         yield 0, 0.0, f"🚀 Starting training (precision: {precision})..."
+
+        if self.training_config.use_fp8:
+            if getattr(self.module, "fp8_enabled", False):
+                yield 0, 0.0, "✅ FP8 training enabled (torchao float8)"
+            else:
+                err = getattr(self.module, "fp8_error", None)
+                if err:
+                    yield 0, 0.0, f"⚠️ FP8 requested but unavailable ({err}), using bf16"
+                else:
+                    yield 0, 0.0, "⚠️ FP8 requested but unavailable, using bf16"
         
         # Get dataloader
         train_loader = data_module.train_dataloader()
@@ -343,8 +438,8 @@ class LoRATrainer:
             milestones=[warmup_steps],
         )
         
-        # Convert model to bfloat16 (entire model for consistent dtype)
-        self.module.model = self.module.model.to(torch.bfloat16)
+        if not self.training_config.use_fp8 or not getattr(self.module, "fp8_enabled", False):
+            self.module.model = self.module.model.to(torch.bfloat16)
 
         # Setup with Fabric - only the decoder (which has LoRA)
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
@@ -566,7 +661,7 @@ class LoRATrainer:
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
                 save_lora_weights(self.module.model, checkpoint_dir)
-                yield global_step, avg_epoch_loss, f"💾 Checkpoint saved"
+                yield global_step, avg_epoch_loss, "💾 Checkpoint saved"
         
         final_path = os.path.join(self.training_config.output_dir, "final")
         save_lora_weights(self.module.model, final_path)

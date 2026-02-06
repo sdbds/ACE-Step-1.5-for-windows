@@ -6,11 +6,11 @@ readme = "README.md"
 requires-python = "==3.11.*"
 license = {text = "MIT"}
 dependencies = [
-    # PyTorch for Windows with CUDA 12.8
-    "torch==2.7.1; sys_platform == 'win32'",
+    # PyTorch for Windows with CUDA 13.0
+    "torch==2.9.1; sys_platform == 'win32'",
     "torchvision; sys_platform == 'win32'",
-    "torchaudio==2.7.1; sys_platform == 'win32'",
-    # PyTorch for Linux with CUDA 12.8
+    "torchaudio==2.9.1; sys_platform == 'win32'",
+    # PyTorch for Linux with CUDA 13.0
     "torch==2.10.0; sys_platform == 'linux'",
     "torchvision; sys_platform == 'linux'",
     "torchaudio==2.10.0; sys_platform == 'linux'",
@@ -33,7 +33,7 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "numba>=0.63.1",
     "vector-quantize-pytorch>=1.27.15",
-    "torchcodec>=0.9.1; sys_platform != 'darwin'",
+    "torchcodec<=0.9.1; sys_platform != 'darwin'",
     "torchao",
     "toml",
     # Training dependencies
@@ -45,8 +45,8 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv]
@@ -56,16 +56,18 @@ required-environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
 
+environments = ["sys_platform == 'win32'"]
+
 [tool.uv.sources]
 nano-vllm = { path = "acestep/third_parts/nano-vllm" }
 torch = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 torchvision = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 torchaudio = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 
 [project.scripts]

@@ -165,14 +165,14 @@ class AceStepHandler:
         
         try:
             import copy
-            # Backup base decoder if not already backed up
-            if self._base_decoder is None:
-                self._base_decoder = copy.deepcopy(self.model.decoder)
-                logger.info("Base decoder backed up")
-            else:
-                # Restore base decoder before loading new LoRA
+            # If LoRA is already loaded, restore base decoder first before loading new one
+            if self.lora_loaded and self._base_decoder is not None:
                 self.model.decoder = copy.deepcopy(self._base_decoder)
                 logger.info("Restored base decoder before loading new LoRA")
+            
+            # Always backup the CURRENT clean decoder (not a stale one from a previous model)
+            self._base_decoder = copy.deepcopy(self.model.decoder)
+            logger.info("Base decoder backed up")
             
             # Load PEFT adapter
             logger.info(f"Loading LoRA adapter from {lora_path}")
@@ -209,9 +209,16 @@ class AceStepHandler:
         try:
             import copy
             # Restore base decoder
+            old_decoder = self.model.decoder  # PeftModel-wrapped decoder
             self.model.decoder = copy.deepcopy(self._base_decoder)
             self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             self.model.decoder.eval()
+            
+            # Free the old PeftModel-wrapped decoder and the backup
+            del old_decoder
+            self._base_decoder = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             self.lora_loaded = False
             self.use_lora = False
@@ -529,6 +536,113 @@ class AceStepHandler:
             logger.exception("[initialize_service] Error initializing model")
             return error_msg, False
     
+    def switch_dit_model(self, config_path: str, use_flash_attention: bool = False) -> Tuple[str, bool]:
+        """
+        Switch only the DiT model weights, reusing VAE and TextEncoder.
+        
+        Args:
+            config_path: Model config directory name (e.g., "acestep-v15-sft")
+            use_flash_attention: Whether to use flash attention
+            
+        Returns:
+            (status_message, success)
+        """
+        try:
+            if self.vae is None or self.text_encoder is None:
+                return "❌ Handler not initialized. Call initialize_service first.", False
+
+            actual_project_root = self._get_project_root()
+            checkpoint_dir = os.path.join(actual_project_root, "checkpoints")
+
+            # Auto-download if not present
+            from pathlib import Path
+            checkpoint_path = Path(checkpoint_dir)
+            if not check_model_exists(config_path, checkpoint_path):
+                logger.info(f"[switch_dit_model] DiT model '{config_path}' not found, downloading...")
+                success, msg = ensure_dit_model(config_path, checkpoint_path)
+                if not success:
+                    return f"❌ Failed to download DiT model '{config_path}': {msg}", False
+                logger.info(f"[switch_dit_model] {msg}")
+
+            acestep_v15_checkpoint_path = os.path.join(checkpoint_dir, config_path)
+            if not os.path.exists(acestep_v15_checkpoint_path):
+                return f"❌ Model path not found: {acestep_v15_checkpoint_path}", False
+
+            # Unload LoRA before switching
+            if self.lora_loaded:
+                try:
+                    self.unload_lora()
+                except Exception as e:
+                    logger.warning(f"[switch_dit_model] Failed to unload LoRA cleanly: {e}")
+            
+            # Force-reset ALL LoRA state regardless of unload success
+            # This prevents stale _base_decoder from corrupting the new model
+            self._base_decoder = None
+            self.lora_loaded = False
+            self.use_lora = False
+            self.lora_scale = 1.0
+
+            # Free old model
+            old_model = self.model
+            self.model = None
+            if old_model is not None:
+                del old_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Load new DiT model
+            if use_flash_attention and self.is_flash_attention_available():
+                attn_implementation = "flash_attention_2"
+            else:
+                attn_implementation = "sdpa"
+
+            try:
+                logger.info(f"[switch_dit_model] Loading DiT model: {config_path} (attn={attn_implementation})")
+                self.model = AutoModel.from_pretrained(
+                    acestep_v15_checkpoint_path,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation,
+                    dtype="bfloat16"
+                )
+            except Exception as e:
+                logger.warning(f"[switch_dit_model] Failed with {attn_implementation}: {e}")
+                if attn_implementation == "sdpa":
+                    attn_implementation = "eager"
+                    self.model = AutoModel.from_pretrained(
+                        acestep_v15_checkpoint_path,
+                        trust_remote_code=True,
+                        attn_implementation=attn_implementation
+                    )
+                else:
+                    raise e
+
+            self.model.config._attn_implementation = attn_implementation
+            self.config = self.model.config
+
+            # Move to device
+            if not self.offload_to_cpu:
+                self.model = self.model.to(self.device).to(self.dtype)
+            else:
+                if not self.offload_dit_to_cpu:
+                    self.model = self.model.to(self.device).to(self.dtype)
+                else:
+                    self.model = self.model.to("cpu").to(self.dtype)
+            self.model.eval()
+
+            # Reload silence latent
+            silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
+            if os.path.exists(silence_latent_path):
+                self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
+                self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
+
+            logger.info(f"[switch_dit_model] Switched to {config_path} on {self.device}")
+            return f"✅ Switched to {config_path}", True
+
+        except Exception as e:
+            error_msg = f"❌ Error switching model: {str(e)}"
+            logger.exception("[switch_dit_model] Error")
+            return error_msg, False
+
     def _is_on_target_device(self, tensor, target_device):
         """Check if tensor is on the target device (handles cuda vs cuda:0 comparison)."""
         if tensor is None:

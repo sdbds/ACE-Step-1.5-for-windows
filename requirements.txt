@@ -1,7 +1,7 @@
 # PyTorch with CUDA 12.8 (for Windows/Linux)
---extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.7.1; sys_platform == 'win32'
-torchaudio==2.7.1; sys_platform == 'win32'
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.9.1; sys_platform == 'win32'
+torchaudio==2.9.1; sys_platform == 'win32'
 torchvision; sys_platform == 'win32'
 # macOS arm64 (Apple Silicon): latest CPU/MPS wheels
 torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'
@@ -26,9 +26,10 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 numba>=0.63.1
 vector-quantize-pytorch>=1.27.15
-torchcodec>=0.9.1; sys_platform != 'darwin' or platform_machine == 'arm64'
+torchcodec<=0.9.1; sys_platform != 'darwin' or platform_machine == 'arm64'
 torchao
 toml
+huggingface_hub[hf_xet]
 modelscope
 
 # Training dependencies (required for LoRA training)
@@ -37,11 +38,13 @@ lightning>=2.0.0
 tensorboard>=2.0.0
 
 # nano-vllm dependencies
-triton-windows>=3.0.0,<3.4; sys_platform == 'win32'
+triton-windows>=3.0.0,<3.5; sys_platform == 'win32'
 triton>=3.0.0; sys_platform != 'win32'
-flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.2/flash_attn-2.8.2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'
+flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu130torch2.9.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'
 flash-attn; sys_platform != 'win32'
 xxhash
 
 # Local package - install with: pip install -e acestep/third_parts/nano-vllm
 # nano-vllm
+lightning-fabric
+tensorboard

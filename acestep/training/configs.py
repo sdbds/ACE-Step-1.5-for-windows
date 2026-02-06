@@ -77,6 +77,7 @@ class TrainingConfig:
     mixed_precision: str = "bf16"  # Fixed: only bf16 supported
     seed: int = 42
     output_dir: str = "./lora_output"
+    use_fp8: bool = False  # Use FP8 quantization for decoder weights
     
     # Data loading
     num_workers: int = 4
@@ -101,6 +102,7 @@ class TrainingConfig:
             "mixed_precision": self.mixed_precision,
             "seed": self.seed,
             "output_dir": self.output_dir,
+            "use_fp8": self.use_fp8,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "log_every_n_steps": self.log_every_n_steps,

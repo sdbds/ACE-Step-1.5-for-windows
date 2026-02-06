@@ -438,8 +438,10 @@ class DatasetBuilder:
             Duration in seconds (integer)
         """
         try:
-            info = torchaudio.info(audio_path)
-            return int(info.num_frames / info.sample_rate)
+            # torchaudio 2.x removed top-level info(), use load() instead
+            waveform, sample_rate = torchaudio.load(audio_path)
+            num_frames = waveform.shape[1]
+            return int(num_frames / sample_rate)
         except Exception as e:
             logger.warning(f"Failed to get duration for {audio_path}: {e}")
             return 0
@@ -967,32 +969,44 @@ class DatasetBuilder:
                 use_genre = i in genre_indices
 
                 # Step 1: Load and preprocess audio to stereo @ 48kHz
-                audio, sr = torchaudio.load(sample.audio_path)
+                audio_cpu, sr = torchaudio.load(sample.audio_path)
                 
                 # Resample if needed
                 if sr != target_sample_rate:
                     resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
-                    audio = resampler(audio)
+                    audio_resampled = resampler(audio_cpu)
+                    del audio_cpu, resampler  # Free original audio and resampler
+                    audio_cpu = audio_resampled
                 
                 # Convert to stereo
-                if audio.shape[0] == 1:
-                    audio = audio.repeat(2, 1)
-                elif audio.shape[0] > 2:
-                    audio = audio[:2, :]
+                if audio_cpu.shape[0] == 1:
+                    audio_stereo = audio_cpu.repeat(2, 1)
+                    del audio_cpu
+                    audio_cpu = audio_stereo
+                elif audio_cpu.shape[0] > 2:
+                    audio_stereo = audio_cpu[:2, :]
+                    del audio_cpu
+                    audio_cpu = audio_stereo
                 
                 # Truncate to max duration
                 max_samples = int(max_duration * target_sample_rate)
-                if audio.shape[1] > max_samples:
-                    audio = audio[:, :max_samples]
+                if audio_cpu.shape[1] > max_samples:
+                    audio_truncated = audio_cpu[:, :max_samples]
+                    del audio_cpu
+                    audio_cpu = audio_truncated
                 
-                # Add batch dimension: [2, T] -> [1, 2, T]
-                audio = audio.unsqueeze(0).to(device).to(vae.dtype)
+                # Add batch dimension and move to GPU: [2, T] -> [1, 2, T]
+                audio = audio_cpu.unsqueeze(0).to(device).to(vae.dtype)
+                del audio_cpu  # Free CPU tensor before GPU operations
                 
                 # Step 2: VAE encode audio to get target_latents
                 with torch.no_grad():
-                    latent = vae.encode(audio).latent_dist.sample()
+                    latent_dist = vae.encode(audio).latent_dist
+                    latent = latent_dist.sample()
+                    del latent_dist  # Free distribution object
                     # [1, 64, T_latent] -> [1, T_latent, 64]
                     target_latents = latent.transpose(1, 2).to(dtype)
+                    del latent  # Free intermediate latent
                 
                 latent_length = target_latents.shape[1]
                 
@@ -1120,11 +1134,28 @@ class DatasetBuilder:
                 output_paths.append(output_path)
                 success_count += 1
                 
+                # Free VRAM: Delete intermediate tensors
+                del audio, target_latents, attention_mask
+                del text_inputs, text_input_ids, text_attention_mask, text_outputs, text_hidden_states
+                del lyric_inputs, lyric_input_ids, lyric_attention_mask, lyric_hidden_states
+                del refer_audio_hidden, refer_audio_order_mask
+                del encoder_hidden_states, encoder_attention_mask
+                del src_latents, chunk_masks, context_latents
+                del output_data
+                
+                # Aggressive cache clearing every sample
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
             except Exception as e:
                 logger.exception(f"Error preprocessing {sample.filename}")
                 fail_count += 1
                 if progress_callback:
                     progress_callback(f"❌ Failed: {sample.filename}: {str(e)}")
+                
+                # Clean up even on failure
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Save manifest file listing all preprocessed samples
         manifest = {

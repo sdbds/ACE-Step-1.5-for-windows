@@ -1,13 +1,29 @@
 """FastAPI server for ACE-Step V1.5.
 
 Endpoints:
-- POST /release_task          Create music generation task
-- POST /query_result          Batch query task results
-- POST /create_random_sample  Generate random music parameters via LLM
-- POST /format_input          Format and enhance lyrics/caption via LLM
-- GET  /v1/models             List available models
-- GET  /v1/audio              Download audio file
-- GET  /health                Health check
+- POST /release_task               Create music generation task
+- POST /query_result               Batch query task results
+- POST /create_random_sample       Generate random music parameters via LLM
+- POST /format_input               Format and enhance lyrics/caption via LLM
+- POST /v1/lora/load               Load LoRA adapter
+- POST /v1/lora/unload             Unload LoRA adapter
+- POST /v1/lora/toggle             Enable/disable LoRA
+- POST /v1/lora/scale              Set LoRA strength (0.0-1.0)
+- POST /v1/dataset/scan            Scan directory for audio files
+- POST /v1/dataset/load            Load existing dataset JSON
+- POST /v1/dataset/auto_label      Auto-label samples with AI
+- POST /v1/dataset/save            Save dataset to JSON
+- POST /v1/dataset/preprocess      Preprocess to tensors
+- GET  /v1/dataset/samples         Get all samples
+- GET  /v1/dataset/sample/{idx}    Get single sample
+- PUT  /v1/dataset/sample/{idx}    Update sample metadata
+- POST /v1/training/start          Start LoRA training
+- POST /v1/training/stop           Stop training
+- GET  /v1/training/status         Get training status
+- POST /v1/training/export         Export trained LoRA
+- GET  /v1/models                  List available models
+- GET  /v1/audio                   Download audio file
+- GET  /health                     Health check
 
 NOTE:
 - In-memory queue and job store -> run uvicorn with workers=1.
@@ -33,6 +49,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
+
+import torch
 
 try:
     from dotenv import load_dotenv
@@ -442,6 +460,40 @@ def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 
 
+@dataclass
+class AutoLabelTask:
+    """Auto-label task tracking."""
+    task_id: str
+    status: Literal["running", "completed", "failed"]
+    progress: str
+    current: int
+    total: int
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    created_at: float = 0.0
+
+
+_auto_label_tasks: Dict[str, AutoLabelTask] = {}
+_auto_label_lock = Lock()
+
+
+@dataclass
+class PreprocessTask:
+    """Preprocess task tracking."""
+    task_id: str
+    status: Literal["running", "completed", "failed"]
+    progress: str
+    current: int
+    total: int
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    created_at: float = 0.0
+
+
+_preprocess_tasks: Dict[str, PreprocessTask] = {}
+_preprocess_lock = Lock()
+
+
 class GenerateMusicRequest(BaseModel):
     prompt: str = Field(default="", description="Text prompt describing the music")
     lyrics: str = Field(default="", description="Lyric text")
@@ -521,6 +573,84 @@ class GenerateMusicRequest(BaseModel):
     class Config:
         allow_population_by_field_name = True
         allow_population_by_alias = True
+
+
+class LoadLoRARequest(BaseModel):
+    lora_path: str = Field(..., description="Path to LoRA adapter directory")
+
+
+class SetLoRAScaleRequest(BaseModel):
+    scale: float = Field(..., ge=0.0, le=1.0, description="LoRA scale (0.0-1.0)")
+
+
+class ToggleLoRARequest(BaseModel):
+    use_lora: bool = Field(..., description="Enable or disable LoRA")
+
+
+class ScanDirectoryRequest(BaseModel):
+    audio_dir: str = Field(..., description="Directory path to scan for audio files")
+    dataset_name: str = Field(default="my_lora_dataset", description="Dataset name")
+    custom_tag: str = Field(default="", description="Custom activation tag")
+    tag_position: str = Field(default="replace", description="Tag position: prepend/append/replace")
+    all_instrumental: bool = Field(default=True, description="All tracks instrumental")
+
+
+class LoadDatasetRequest(BaseModel):
+    dataset_path: str = Field(..., description="Path to dataset JSON file")
+
+
+class AutoLabelRequest(BaseModel):
+    skip_metas: bool = Field(default=False, description="Skip BPM/Key/TimeSig generation")
+    format_lyrics: bool = Field(default=False, description="Format user lyrics via LLM")
+    transcribe_lyrics: bool = Field(default=False, description="Transcribe lyrics from audio")
+    only_unlabeled: bool = Field(default=False, description="Only label unlabeled samples")
+
+
+class SaveDatasetRequest(BaseModel):
+    save_path: str = Field(..., description="Path to save dataset JSON")
+    dataset_name: str = Field(default="my_lora_dataset", description="Dataset name")
+    custom_tag: Optional[str] = Field(default=None, description="Custom activation tag")
+    tag_position: Optional[str] = Field(default=None, description="Tag position: prepend/append/replace")
+    all_instrumental: Optional[bool] = Field(default=None, description="All tracks instrumental")
+    genre_ratio: Optional[int] = Field(default=None, ge=0, le=100, description="Genre vs caption ratio")
+
+
+class UpdateSampleRequest(BaseModel):
+    sample_idx: int = Field(..., ge=0, description="Sample index")
+    caption: str = Field(default="", description="Music description")
+    genre: str = Field(default="", description="Genre tags")
+    prompt_override: Optional[str] = Field(default=None, description="caption/genre/None")
+    lyrics: str = Field(default="[Instrumental]", description="Lyrics")
+    bpm: Optional[int] = Field(default=None, description="BPM")
+    keyscale: str = Field(default="", description="Musical key")
+    timesignature: str = Field(default="", description="Time signature")
+    language: str = Field(default="unknown", description="Vocal language")
+    is_instrumental: bool = Field(default=True, description="Instrumental track")
+
+
+class PreprocessDatasetRequest(BaseModel):
+    output_dir: str = Field(..., description="Output directory for preprocessed tensors")
+
+
+class StartTrainingRequest(BaseModel):
+    tensor_dir: str = Field(..., description="Directory with preprocessed tensors")
+    lora_rank: int = Field(default=64, ge=1, le=256, description="LoRA rank")
+    lora_alpha: int = Field(default=128, ge=1, le=512, description="LoRA alpha")
+    lora_dropout: float = Field(default=0.1, ge=0.0, le=1.0, description="LoRA dropout")
+    learning_rate: float = Field(default=1e-4, gt=0.0, description="Learning rate")
+    train_epochs: int = Field(default=10, ge=1, description="Training epochs")
+    train_batch_size: int = Field(default=1, ge=1, description="Batch size")
+    gradient_accumulation: int = Field(default=4, ge=1, description="Gradient accumulation steps")
+    save_every_n_epochs: int = Field(default=5, ge=1, description="Save checkpoint every N epochs")
+    training_shift: float = Field(default=3.0, ge=0.0, description="Training timestep shift")
+    training_seed: int = Field(default=42, description="Random seed")
+    lora_output_dir: str = Field(default="./lora_output", description="Output directory")
+    use_fp8: bool = Field(default=False, description="Use FP8 quantization for decoder weights (reduces VRAM, requires Ada/Hopper GPU)")
+
+
+class ExportLoRARequest(BaseModel):
+    export_path: str = Field(..., description="Export destination path")
+    lora_output_dir: str = Field(..., description="Training output directory")
 
 
 class CreateJobResponse(BaseModel):
@@ -949,6 +1079,8 @@ def create_app() -> FastAPI:
         app.state._config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
         app.state._config_path2 = config_path2
         app.state._config_path3 = config_path3
+        app.state._model_switch_lock = Lock()
+        app.state._use_flash_attention = _env_bool("ACESTEP_USE_FLASH_ATTENTION", True)
 
         max_workers = int(os.getenv("ACESTEP_API_WORKERS", "1"))
         executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -975,6 +1107,10 @@ def create_app() -> FastAPI:
         # Temporary directory for saving generated audio files
         app.state.temp_audio_dir = os.path.join(tmp_root, "api_audio")
         os.makedirs(app.state.temp_audio_dir, exist_ok=True)
+        
+        # Dataset builder and training state
+        app.state.dataset_builder = None  # Will be created on first use
+        app.state.training_state = {"is_training": False, "should_stop": False}
 
         # Initialize local cache
         try:
@@ -1091,34 +1227,45 @@ def create_app() -> FastAPI:
             selected_handler: AceStepHandler = app.state.handler
             selected_model_name = _get_model_name(app.state._config_path)
             
-            if req.model:
+            if req.model and req.model != selected_model_name:
                 model_matched = False
                 
-                # Check if it matches the second model
+                # Check pre-loaded secondary handlers first (fast path)
                 if app.state.handler2 and getattr(app.state, "_initialized2", False):
                     model2_name = _get_model_name(app.state._config_path2)
                     if req.model == model2_name:
                         selected_handler = app.state.handler2
                         selected_model_name = model2_name
                         model_matched = True
-                        print(f"[API Server] Job {job_id}: Using second model: {model2_name}")
+                        print(f"[API Server] Job {job_id}: Using pre-loaded model: {model2_name}")
                 
-                # Check if it matches the third model
                 if not model_matched and app.state.handler3 and getattr(app.state, "_initialized3", False):
                     model3_name = _get_model_name(app.state._config_path3)
                     if req.model == model3_name:
                         selected_handler = app.state.handler3
                         selected_model_name = model3_name
                         model_matched = True
-                        print(f"[API Server] Job {job_id}: Using third model: {model3_name}")
+                        print(f"[API Server] Job {job_id}: Using pre-loaded model: {model3_name}")
                 
+                # Dynamic switching: hot-swap the primary handler's DiT model
                 if not model_matched:
-                    available_models = [_get_model_name(app.state._config_path)]
-                    if app.state.handler2 and getattr(app.state, "_initialized2", False):
-                        available_models.append(_get_model_name(app.state._config_path2))
-                    if app.state.handler3 and getattr(app.state, "_initialized3", False):
-                        available_models.append(_get_model_name(app.state._config_path3))
-                    print(f"[API Server] Job {job_id}: Model '{req.model}' not found in {available_models}, using primary: {selected_model_name}")
+                    with app.state._model_switch_lock:
+                        # Re-check after acquiring lock (another job may have switched)
+                        current_primary = _get_model_name(app.state._config_path)
+                        if req.model == current_primary:
+                            selected_model_name = current_primary
+                            print(f"[API Server] Job {job_id}: Model already switched to {current_primary}")
+                        else:
+                            print(f"[API Server] Job {job_id}: Switching primary model from {current_primary} to {req.model}...")
+                            use_flash = getattr(app.state, "_use_flash_attention", True)
+                            status_msg, ok = app.state.handler.switch_dit_model(req.model, use_flash_attention=use_flash)
+                            if ok:
+                                app.state._config_path = req.model
+                                selected_model_name = req.model
+                                print(f"[API Server] Job {job_id}: {status_msg}")
+                            else:
+                                print(f"[API Server] Job {job_id}: Switch failed: {status_msg}, using {current_primary}")
+                                selected_model_name = current_primary
             
             # Use selected handler for generation
             h: AceStepHandler = selected_handler
@@ -1586,9 +1733,9 @@ def create_app() -> FastAPI:
         print(f"{'='*60}\n")
 
         if auto_offload:
-            print(f"[API Server] Auto-enabling CPU offload (GPU < 16GB)")
+            print("[API Server] Auto-enabling CPU offload (GPU < 16GB)")
         elif gpu_memory_gb > 0:
-            print(f"[API Server] CPU offload disabled by default (GPU >= 16GB)")
+            print("[API Server] CPU offload disabled by default (GPU >= 16GB)")
         else:
             print("[API Server] No GPU detected, running on CPU")
 
@@ -2139,39 +2286,33 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/models")
     async def list_models(_: None = Depends(verify_api_key)):
-        """List available DiT models."""
-        models = []
+        """List available DiT models (includes all downloadable models)."""
+        current_model = _get_model_name(app.state._config_path) if getattr(app.state, "_initialized", False) else None
         
-        # Primary model (always available if initialized)
-        if getattr(app.state, "_initialized", False):
-            primary_model = _get_model_name(app.state._config_path)
-            if primary_model:
-                models.append({
-                    "name": primary_model,
-                    "is_default": True,
-                })
+        # Scan checkpoints directory for installed models
+        installed = set()
+        h: AceStepHandler = app.state.handler
+        if h:
+            installed = set(h.get_available_acestep_v15_models())
         
-        # Secondary model
+        # Pre-loaded secondary handlers
+        preloaded = set()
         if getattr(app.state, "_initialized2", False) and app.state._config_path2:
-            secondary_model = _get_model_name(app.state._config_path2)
-            if secondary_model:
-                models.append({
-                    "name": secondary_model,
-                    "is_default": False,
-                })
-        
-        # Third model
+            preloaded.add(_get_model_name(app.state._config_path2))
         if getattr(app.state, "_initialized3", False) and app.state._config_path3:
-            third_model = _get_model_name(app.state._config_path3)
-            if third_model:
-                models.append({
-                    "name": third_model,
-                    "is_default": False,
-                })
+            preloaded.add(_get_model_name(app.state._config_path3))
+        
+        models = []
+        for name in sorted(installed):
+            models.append({
+                "name": name,
+                "is_active": name == current_model,
+                "is_preloaded": name in preloaded or name == current_model,
+            })
         
         return _wrap_response({
             "models": models,
-            "default_model": models[0]["name"] if models else None,
+            "active_model": current_model,
         })
 
     @app.post("/create_random_sample")
@@ -2336,6 +2477,1218 @@ def create_app() -> FastAPI:
             })
         except Exception as e:
             return _wrap_response(None, code=500, error=f"format_sample error: {str(e)}")
+
+    @app.post("/v1/lora/load")
+    async def load_lora_endpoint(request: LoadLoRARequest, _: None = Depends(verify_api_key)):
+        """Load LoRA adapter into the primary model."""
+        handler: AceStepHandler = app.state.handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        try:
+            result = handler.load_lora(request.lora_path)
+            
+            if result.startswith("✅"):
+                return _wrap_response({"message": result, "lora_path": request.lora_path})
+            else:
+                raise HTTPException(status_code=400, detail=result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load LoRA: {str(e)}")
+
+    @app.post("/v1/lora/unload")
+    async def unload_lora_endpoint(_: None = Depends(verify_api_key)):
+        """Unload LoRA adapter and restore base model."""
+        handler: AceStepHandler = app.state.handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        try:
+            result = handler.unload_lora()
+            
+            if result.startswith("✅") or result.startswith("⚠️"):
+                return _wrap_response({"message": result})
+            else:
+                raise HTTPException(status_code=400, detail=result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to unload LoRA: {str(e)}")
+
+    @app.post("/v1/lora/toggle")
+    async def toggle_lora_endpoint(request: ToggleLoRARequest, _: None = Depends(verify_api_key)):
+        """Enable or disable LoRA adapter for inference."""
+        handler: AceStepHandler = app.state.handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        try:
+            result = handler.set_use_lora(request.use_lora)
+            
+            if result.startswith("✅"):
+                return _wrap_response({"message": result, "use_lora": request.use_lora})
+            else:
+                return _wrap_response(None, code=400, error=result)
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Failed to toggle LoRA: {str(e)}")
+
+    @app.post("/v1/lora/scale")
+    async def set_lora_scale_endpoint(request: SetLoRAScaleRequest, _: None = Depends(verify_api_key)):
+        """Set LoRA adapter scale/strength (0.0-1.0)."""
+        handler: AceStepHandler = app.state.handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        try:
+            result = handler.set_lora_scale(request.scale)
+            
+            if result.startswith("✅") or result.startswith("⚠️"):
+                return _wrap_response({"message": result, "scale": request.scale})
+            else:
+                return _wrap_response(None, code=400, error=result)
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Failed to set LoRA scale: {str(e)}")
+
+    @app.post("/v1/dataset/scan")
+    async def scan_dataset_directory(request: ScanDirectoryRequest, _: None = Depends(verify_api_key)):
+        """Scan directory for audio files and create dataset."""
+        from acestep.training.dataset_builder import DatasetBuilder
+        
+        try:
+            builder = DatasetBuilder()
+            builder.metadata.name = request.dataset_name
+            builder.metadata.custom_tag = request.custom_tag
+            builder.metadata.tag_position = request.tag_position
+            builder.metadata.all_instrumental = request.all_instrumental
+            
+            samples, status = builder.scan_directory(request.audio_dir.strip())
+            
+            if not samples:
+                return _wrap_response(None, code=400, error=status)
+            
+            builder.set_all_instrumental(request.all_instrumental)
+            if request.custom_tag:
+                builder.set_custom_tag(request.custom_tag, request.tag_position)
+            
+            app.state.dataset_builder = builder
+            
+            # Return full sample data with all metadata
+            samples_data = [
+                {
+                    "index": i,
+                    "filename": s.filename,
+                    "audio_path": s.audio_path,
+                    "duration": s.duration,
+                    "caption": s.caption,
+                    "genre": s.genre,
+                    "prompt_override": s.prompt_override,
+                    "lyrics": s.lyrics,
+                    "bpm": s.bpm,
+                    "keyscale": s.keyscale,
+                    "timesignature": s.timesignature,
+                    "language": s.language,
+                    "is_instrumental": s.is_instrumental,
+                    "labeled": s.labeled,
+                }
+                for i, s in enumerate(builder.samples)
+            ]
+            
+            return _wrap_response({
+                "message": status,
+                "num_samples": len(samples),
+                "samples": samples_data
+            })
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Scan failed: {str(e)}")
+
+    @app.post("/v1/dataset/load")
+    async def load_dataset(request: LoadDatasetRequest, _: None = Depends(verify_api_key)):
+        """Load existing dataset from JSON file."""
+        from acestep.training.dataset_builder import DatasetBuilder
+        
+        try:
+            builder = DatasetBuilder()
+            samples, status = builder.load_dataset(request.dataset_path.strip())
+            
+            if not samples:
+                return _wrap_response({
+                    "message": status,
+                    "dataset_name": "",
+                    "num_samples": 0,
+                    "labeled_count": 0,
+                    "samples": []
+                }, code=400, error=status)
+            
+            app.state.dataset_builder = builder
+            
+            # Return full sample data with all metadata
+            samples_data = [
+                {
+                    "index": i,
+                    "filename": s.filename,
+                    "audio_path": s.audio_path,
+                    "duration": s.duration,
+                    "caption": s.caption,
+                    "genre": s.genre,
+                    "prompt_override": s.prompt_override,
+                    "lyrics": s.lyrics,
+                    "bpm": s.bpm,
+                    "keyscale": s.keyscale,
+                    "timesignature": s.timesignature,
+                    "language": s.language,
+                    "is_instrumental": s.is_instrumental,
+                    "labeled": s.labeled,
+                }
+                for i, s in enumerate(builder.samples)
+            ]
+            
+            return _wrap_response({
+                "message": status,
+                "dataset_name": builder.metadata.name,
+                "num_samples": len(samples),
+                "labeled_count": builder.get_labeled_count(),
+                "samples": samples_data
+            })
+        except Exception as e:
+            error_msg = f"Load failed: {str(e)}"
+            return _wrap_response({
+                "message": error_msg,
+                "dataset_name": "",
+                "num_samples": 0,
+                "labeled_count": 0,
+                "samples": []
+            }, code=500, error=error_msg)
+
+    @app.post("/v1/dataset/auto_label")
+    async def auto_label_dataset(request: AutoLabelRequest, _: None = Depends(verify_api_key)):
+        """Auto-label all samples using AI."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
+        
+        handler: AceStepHandler = app.state.handler
+        llm: LLMHandler = app.state.llm_handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        if llm is None or not llm.llm_initialized:
+            raise HTTPException(status_code=500, detail="LLM not initialized")
+        
+        # Offload decoder to CPU during labeling to save VRAM
+        # Auto-labeling only needs: VAE + model.tokenize + LLM (no decoder required)
+        decoder_on_gpu = False
+        if handler.model is not None and hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
+            try:
+                # Check if decoder is on GPU
+                first_param = next(handler.model.decoder.parameters(), None)
+                if first_param is not None and first_param.device.type != "cpu":
+                    decoder_on_gpu = True
+                    import gc
+                    handler.model.decoder = handler.model.decoder.to("cpu")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            except Exception:
+                pass
+        
+        try:
+            samples, status = builder.label_all_samples(
+                dit_handler=handler,
+                llm_handler=llm,
+                format_lyrics=request.format_lyrics,
+                transcribe_lyrics=request.transcribe_lyrics,
+                skip_metas=request.skip_metas,
+                only_unlabeled=request.only_unlabeled,
+                progress_callback=None,
+            )
+            
+            # Return full sample data with all metadata
+            samples_data = [
+                {
+                    "index": i,
+                    "filename": s.filename,
+                    "audio_path": s.audio_path,
+                    "duration": s.duration,
+                    "caption": s.caption,
+                    "genre": s.genre,
+                    "prompt_override": s.prompt_override,
+                    "lyrics": s.lyrics,
+                    "bpm": s.bpm,
+                    "keyscale": s.keyscale,
+                    "timesignature": s.timesignature,
+                    "language": s.language,
+                    "is_instrumental": s.is_instrumental,
+                    "labeled": s.labeled,
+                }
+                for i, s in enumerate(builder.samples)
+            ]
+            
+            # Add note about decoder offloading
+            if decoder_on_gpu:
+                status += "\n⚠️ Decoder offloaded to CPU to save VRAM. It will be automatically reloaded to GPU when training starts."
+            
+            return _wrap_response({
+                "message": status,
+                "labeled_count": builder.get_labeled_count(),
+                "samples": samples_data
+            })
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Auto-label failed: {str(e)}")
+
+    @app.post("/v1/dataset/auto_label_async")
+    async def auto_label_dataset_async(request: AutoLabelRequest, _: None = Depends(verify_api_key)):
+        """Start auto-labeling task asynchronously and return task_id immediately."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
+        
+        handler: AceStepHandler = app.state.handler
+        llm: LLMHandler = app.state.llm_handler
+        
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        if llm is None or not llm.llm_initialized:
+            raise HTTPException(status_code=500, detail="LLM not initialized")
+        
+        # Generate task ID
+        task_id = str(uuid4())
+        
+        # Filter samples to label
+        if request.only_unlabeled:
+            samples_to_label = [s for s in builder.samples if not s.labeled or not s.caption]
+        else:
+            samples_to_label = builder.samples
+        
+        total = len(samples_to_label)
+        if total == 0:
+            return _wrap_response({
+                "task_id": task_id,
+                "message": "All samples already labeled" if request.only_unlabeled else "No samples to label",
+                "total": 0
+            })
+        
+        # Create task
+        with _auto_label_lock:
+            _auto_label_tasks[task_id] = AutoLabelTask(
+                task_id=task_id,
+                status="running",
+                progress="Starting...",
+                current=0,
+                total=total,
+                created_at=time.time()
+            )
+        
+        # Background labeling function
+        def run_labeling():
+            try:
+                # Offload decoder to CPU
+                decoder_on_gpu = False
+                if handler.model is not None and hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
+                    try:
+                        first_param = next(handler.model.decoder.parameters(), None)
+                        if first_param is not None and first_param.device.type != "cpu":
+                            decoder_on_gpu = True
+                            import gc
+                            handler.model.decoder = handler.model.decoder.to("cpu")
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                
+                # Progress callback
+                def progress_callback(msg: str):
+                    with _auto_label_lock:
+                        task = _auto_label_tasks.get(task_id)
+                        if task:
+                            # Extract progress from message like "Labeling 5/100: filename.mp3"
+                            import re
+                            match = re.match(r'Labeling (\d+)/(\d+)', msg)
+                            if match:
+                                task.current = int(match.group(1))
+                                task.progress = msg
+                
+                # Run labeling
+                samples, status = builder.label_all_samples(
+                    dit_handler=handler,
+                    llm_handler=llm,
+                    format_lyrics=request.format_lyrics,
+                    transcribe_lyrics=request.transcribe_lyrics,
+                    skip_metas=request.skip_metas,
+                    only_unlabeled=request.only_unlabeled,
+                    progress_callback=progress_callback,
+                )
+                
+                # Prepare result
+                samples_data = [
+                    {
+                        "index": i,
+                        "filename": s.filename,
+                        "audio_path": s.audio_path,
+                        "duration": s.duration,
+                        "caption": s.caption,
+                        "genre": s.genre,
+                        "prompt_override": s.prompt_override,
+                        "lyrics": s.lyrics,
+                        "bpm": s.bpm,
+                        "keyscale": s.keyscale,
+                        "timesignature": s.timesignature,
+                        "language": s.language,
+                        "is_instrumental": s.is_instrumental,
+                        "labeled": s.labeled,
+                    }
+                    for i, s in enumerate(builder.samples)
+                ]
+                
+                if decoder_on_gpu:
+                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM."
+                
+                # Update task status
+                with _auto_label_lock:
+                    task = _auto_label_tasks.get(task_id)
+                    if task:
+                        task.status = "completed"
+                        task.progress = status
+                        task.current = task.total
+                        task.result = {
+                            "message": status,
+                            "labeled_count": builder.get_labeled_count(),
+                            "samples": samples_data
+                        }
+            except Exception as e:
+                with _auto_label_lock:
+                    task = _auto_label_tasks.get(task_id)
+                    if task:
+                        task.status = "failed"
+                        task.error = str(e)
+                        task.progress = f"Failed: {str(e)}"
+        
+        # Start background task
+        import threading
+        thread = threading.Thread(target=run_labeling, daemon=True)
+        thread.start()
+        
+        return _wrap_response({
+            "task_id": task_id,
+            "message": "Auto-labeling task started",
+            "total": total
+        })
+
+    @app.get("/v1/dataset/auto_label_status/{task_id}")
+    async def get_auto_label_status(task_id: str, _: None = Depends(verify_api_key)):
+        """Get auto-labeling task status and progress."""
+        with _auto_label_lock:
+            task = _auto_label_tasks.get(task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            
+            response_data = {
+                "task_id": task.task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "current": task.current,
+                "total": task.total,
+            }
+            
+            if task.status == "completed" and task.result:
+                response_data["result"] = task.result
+            elif task.status == "failed" and task.error:
+                response_data["error"] = task.error
+            
+            return _wrap_response(response_data)
+
+    @app.post("/v1/dataset/save")
+    async def save_dataset(request: SaveDatasetRequest, _: None = Depends(verify_api_key)):
+        """Save dataset to JSON file."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset to save")
+        
+        try:
+            # Update metadata fields if provided
+            if request.custom_tag is not None:
+                builder.metadata.custom_tag = request.custom_tag
+            if request.tag_position is not None:
+                builder.metadata.tag_position = request.tag_position
+            if request.all_instrumental is not None:
+                builder.metadata.all_instrumental = request.all_instrumental
+            if request.genre_ratio is not None:
+                builder.metadata.genre_ratio = request.genre_ratio
+            
+            status = builder.save_dataset(request.save_path.strip(), request.dataset_name)
+            
+            if status.startswith("✅"):
+                return _wrap_response({"message": status, "save_path": request.save_path})
+            else:
+                return _wrap_response(None, code=400, error=status)
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Save failed: {str(e)}")
+
+    @app.post("/v1/dataset/preprocess")
+    async def preprocess_dataset(request: PreprocessDatasetRequest, _: None = Depends(verify_api_key)):
+        """Preprocess dataset to tensor files for training."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+        handler: AceStepHandler = app.state.handler
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Unload LLM before preprocessing to free VRAM (preprocessing doesn't need LLM)
+        llm: LLMHandler = app.state.llm_handler
+        llm_was_loaded = False
+        if llm and llm.llm_initialized:
+            llm_was_loaded = True
+            try:
+                llm.llm = None
+                llm.llm_tokenizer = None
+                llm.llm_initialized = False
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                # Silently continue if unload fails
+                pass
+        
+        try:
+            # Run preprocessing in thread pool to avoid blocking event loop
+            output_paths, status = await asyncio.to_thread(
+                builder.preprocess_to_tensors,
+                dit_handler=handler,
+                output_dir=request.output_dir.strip(),
+                progress_callback=None,
+            )
+            
+            if status.startswith("✅"):
+                # Unload VAE, text encoder, and model encoder after preprocessing
+                # Training only needs the decoder since all latents are pre-computed
+                components_unloaded = []
+                
+                try:
+                    if handler.vae is not None:
+                        handler.vae = None
+                        components_unloaded.append("VAE")
+                    
+                    if handler.text_encoder is not None:
+                        handler.text_encoder = None
+                        handler.text_tokenizer = None
+                        components_unloaded.append("Text Encoder")
+                    
+                    if handler.model is not None and handler.model.encoder is not None:
+                        handler.model.encoder = None
+                        components_unloaded.append("Model Encoder")
+                    
+                    if components_unloaded:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                
+                # Add notes about unloading
+                if llm_was_loaded:
+                    status += "\n⚠️ LLM has been unloaded."
+                if components_unloaded:
+                    status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
+                
+                return _wrap_response({
+                    "message": status,
+                    "output_dir": request.output_dir,
+                    "num_tensors": len(output_paths)
+                })
+            else:
+                return _wrap_response(None, code=400, error=status)
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Preprocessing failed: {str(e)}")
+
+    @app.post("/v1/dataset/preprocess_async")
+    async def preprocess_dataset_async(request: PreprocessDatasetRequest, _: None = Depends(verify_api_key)):
+        """Start preprocessing task asynchronously and return task_id immediately."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+        handler: AceStepHandler = app.state.handler
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Generate task ID
+        task_id = str(uuid4())
+        
+        # Count labeled samples
+        labeled_samples = [s for s in builder.samples if s.labeled]
+        total = len(labeled_samples)
+        
+        if total == 0:
+            return _wrap_response({
+                "task_id": task_id,
+                "message": "No labeled samples to preprocess",
+                "total": 0
+            })
+        
+        # Create task
+        with _preprocess_lock:
+            _preprocess_tasks[task_id] = PreprocessTask(
+                task_id=task_id,
+                status="running",
+                progress="Starting preprocessing...",
+                current=0,
+                total=total,
+                created_at=time.time()
+            )
+        
+        # Background preprocessing function
+        def run_preprocessing():
+            try:
+                # Unload LLM before preprocessing
+                llm: LLMHandler = app.state.llm_handler
+                llm_was_loaded = False
+                if llm and llm.llm_initialized:
+                    llm_was_loaded = True
+                    try:
+                        llm.llm = None
+                        llm.llm_tokenizer = None
+                        llm.llm_initialized = False
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                
+                # Progress callback
+                def progress_callback(msg: str):
+                    with _preprocess_lock:
+                        task = _preprocess_tasks.get(task_id)
+                        if task:
+                            # Extract progress from message like "Preprocessing 5/100: filename.mp3"
+                            import re
+                            match = re.match(r'Preprocessing (\d+)/(\d+)', msg)
+                            if match:
+                                task.current = int(match.group(1))
+                                task.progress = msg
+                
+                # Run preprocessing
+                output_paths, status = builder.preprocess_to_tensors(
+                    dit_handler=handler,
+                    output_dir=request.output_dir.strip(),
+                    progress_callback=progress_callback,
+                )
+                
+                # Unload VAE, text encoder, and model encoder after preprocessing
+                components_unloaded = []
+                try:
+                    if handler.vae is not None:
+                        handler.vae = None
+                        components_unloaded.append("VAE")
+                    
+                    if handler.text_encoder is not None:
+                        handler.text_encoder = None
+                        handler.text_tokenizer = None
+                        components_unloaded.append("Text Encoder")
+                    
+                    if handler.model is not None and handler.model.encoder is not None:
+                        handler.model.encoder = None
+                        components_unloaded.append("Model Encoder")
+                    
+                    if components_unloaded:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                
+                # Add notes about unloading
+                if llm_was_loaded:
+                    status += "\n⚠️ LLM has been unloaded."
+                if components_unloaded:
+                    status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
+                
+                # Update task status
+                with _preprocess_lock:
+                    task = _preprocess_tasks.get(task_id)
+                    if task:
+                        task.status = "completed"
+                        task.progress = status
+                        task.current = task.total
+                        task.result = {
+                            "message": status,
+                            "output_dir": request.output_dir,
+                            "num_tensors": len(output_paths)
+                        }
+            except Exception as e:
+                with _preprocess_lock:
+                    task = _preprocess_tasks.get(task_id)
+                    if task:
+                        task.status = "failed"
+                        task.error = str(e)
+                        task.progress = f"Failed: {str(e)}"
+        
+        # Start background task
+        import threading
+        thread = threading.Thread(target=run_preprocessing, daemon=True)
+        thread.start()
+        
+        return _wrap_response({
+            "task_id": task_id,
+            "message": "Preprocessing task started",
+            "total": total
+        })
+
+    @app.get("/v1/dataset/preprocess_status/{task_id}")
+    async def get_preprocess_status(task_id: str, _: None = Depends(verify_api_key)):
+        """Get preprocessing task status and progress."""
+        with _preprocess_lock:
+            task = _preprocess_tasks.get(task_id)
+            if not task:
+                raise HTTPException(status_code=404, detail="Task not found")
+            
+            response_data = {
+                "task_id": task.task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "current": task.current,
+                "total": task.total,
+            }
+            
+            if task.status == "completed" and task.result:
+                response_data["result"] = task.result
+            elif task.status == "failed" and task.error:
+                response_data["error"] = task.error
+            
+            return _wrap_response(response_data)
+
+    @app.get("/v1/dataset/samples")
+    async def get_all_samples(_: None = Depends(verify_api_key)):
+        """Get all samples in the current dataset."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+        # Return full sample data with all metadata
+        samples_data = [
+            {
+                "index": i,
+                "filename": s.filename,
+                "audio_path": s.audio_path,
+                "duration": s.duration,
+                "caption": s.caption,
+                "genre": s.genre,
+                "prompt_override": s.prompt_override,
+                "lyrics": s.lyrics,
+                "bpm": s.bpm,
+                "keyscale": s.keyscale,
+                "timesignature": s.timesignature,
+                "language": s.language,
+                "is_instrumental": s.is_instrumental,
+                "labeled": s.labeled,
+            }
+            for i, s in enumerate(builder.samples)
+        ]
+        
+        return _wrap_response({
+            "dataset_name": builder.metadata.name,
+            "num_samples": len(builder.samples),
+            "labeled_count": builder.get_labeled_count(),
+            "samples": samples_data
+        })
+
+    @app.get("/v1/dataset/sample/{sample_idx}")
+    async def get_sample(sample_idx: int, _: None = Depends(verify_api_key)):
+        """Get a specific sample by index."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+        if sample_idx < 0 or sample_idx >= len(builder.samples):
+            raise HTTPException(status_code=404, detail=f"Sample index {sample_idx} out of range")
+        
+        sample = builder.samples[sample_idx]
+        return _wrap_response(sample.to_dict())
+
+    @app.put("/v1/dataset/sample/{sample_idx}")
+    async def update_sample(sample_idx: int, request: UpdateSampleRequest, _: None = Depends(verify_api_key)):
+        """Update a sample's metadata."""
+        builder = app.state.dataset_builder
+        if builder is None:
+            raise HTTPException(status_code=400, detail="No dataset loaded")
+        
+        try:
+            sample, status = builder.update_sample(
+                sample_idx,
+                caption=request.caption,
+                genre=request.genre,
+                prompt_override=request.prompt_override,
+                lyrics=request.lyrics if not request.is_instrumental else "[Instrumental]",
+                bpm=request.bpm,
+                keyscale=request.keyscale,
+                timesignature=request.timesignature,
+                language="unknown" if request.is_instrumental else request.language,
+                is_instrumental=request.is_instrumental,
+                labeled=True,
+            )
+            
+            if status.startswith("✅"):
+                return _wrap_response({"message": status, "sample": sample.to_dict()})
+            else:
+                return _wrap_response(None, code=400, error=status)
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Update failed: {str(e)}")
+
+    @app.post("/v1/reinitialize")
+    async def reinitialize_service(_: None = Depends(verify_api_key)):
+        """Reinitialize components that were unloaded during training/preprocessing."""
+        handler: AceStepHandler = app.state.handler
+        llm: LLMHandler = app.state.llm_handler
+        
+        if handler is None:
+            raise HTTPException(status_code=500, detail="Service not initialized")
+        
+        try:
+            import gc
+            reloaded = []
+            
+            # Reload LLM if needed
+            if llm and not llm.llm_initialized:
+                project_root = _get_project_root()
+                checkpoint_dir = os.path.join(project_root, "checkpoints")
+                lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
+                backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
+                lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
+                lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
+                
+                status, ok = llm.initialize(
+                    checkpoint_dir=checkpoint_dir,
+                    lm_model_path=lm_model_path,
+                    backend=backend,
+                    device=lm_device,
+                    offload_to_cpu=lm_offload,
+                    dtype=handler.dtype,
+                )
+                if ok:
+                    reloaded.append("LLM")
+            
+            # Reload model components if needed
+            if handler.model is not None:
+                # Check if decoder is on CPU, move to GPU
+                if hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
+                    first_param = next(handler.model.decoder.parameters(), None)
+                    if first_param is not None and first_param.device.type == "cpu":
+                        handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
+                        reloaded.append("Decoder (moved to GPU)")
+            
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            message = "✅ Service reinitialized"
+            if reloaded:
+                message += f"\n🔄 Reloaded: {', '.join(reloaded)}"
+            
+            return _wrap_response({"message": message, "reloaded": reloaded})
+            
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Reinitialization failed: {str(e)}")
+
+    @app.post("/v1/training/start")
+    async def start_training(request: StartTrainingRequest, _: None = Depends(verify_api_key)):
+        """Start LoRA training from preprocessed tensors."""
+        training_state = app.state.training_state
+        
+        if training_state.get("is_training", False):
+            raise HTTPException(status_code=400, detail="Training already in progress")
+        
+        handler: AceStepHandler = app.state.handler
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Check if decoder exists
+        if not hasattr(handler.model, 'decoder') or handler.model.decoder is None:
+            raise HTTPException(
+                status_code=500, 
+                detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
+            )
+        
+        # If decoder is on CPU (e.g., after auto-labeling), move it back to GPU
+        try:
+            first_param = next(handler.model.decoder.parameters(), None)
+            if first_param is not None and first_param.device.type == "cpu":
+                handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        except Exception:
+            pass
+        
+        # Unload unnecessary components before training to free VRAM
+        # Training only needs decoder - all inputs are pre-computed tensors
+        try:
+            import gc
+            components_unloaded = []
+            
+            # Unload LLM
+            llm: LLMHandler = app.state.llm_handler
+            if llm and llm.llm_initialized:
+                llm.llm = None
+                llm.llm_tokenizer = None
+                llm.llm_initialized = False
+                components_unloaded.append("LLM")
+            
+            # Unload VAE
+            if handler.vae is not None:
+                handler.vae = None
+                components_unloaded.append("VAE")
+            
+            # Unload text encoder
+            if handler.text_encoder is not None:
+                handler.text_encoder = None
+                handler.text_tokenizer = None
+                components_unloaded.append("Text Encoder")
+            
+            # Unload model encoder (training only uses decoder)
+            if handler.model is not None and hasattr(handler.model, 'encoder') and handler.model.encoder is not None:
+                handler.model.encoder = None
+                components_unloaded.append("Model Encoder")
+            
+            if components_unloaded:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        except Exception:
+            pass
+        
+        try:
+            from acestep.training.trainer import LoRATrainer
+            from acestep.training.configs import LoRAConfig as LoRAConfigClass, TrainingConfig
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
+        
+        try:
+            lora_config = LoRAConfigClass(
+                r=request.lora_rank,
+                alpha=request.lora_alpha,
+                dropout=request.lora_dropout,
+            )
+            
+            training_config = TrainingConfig(
+                shift=request.training_shift,
+                learning_rate=request.learning_rate,
+                batch_size=request.train_batch_size,
+                gradient_accumulation_steps=request.gradient_accumulation,
+                max_epochs=request.train_epochs,
+                save_every_n_epochs=request.save_every_n_epochs,
+                seed=request.training_seed,
+                output_dir=request.lora_output_dir,
+                use_fp8=request.use_fp8,
+            )
+            
+            fp8_status = ""
+            if request.use_fp8:
+                try:
+                    try:
+                        from torchao.float8 import convert_to_float8_training  # type: ignore
+                    except Exception:
+                        from torchao.float8.float8_linear_utils import convert_to_float8_training  # type: ignore
+
+                    _ = convert_to_float8_training
+                    fp8_status = "✅ FP8 training requested (torchao float8)"
+                except ImportError:
+                    fp8_status = "⚠️ torchao not available, using bf16"
+                except Exception as e:
+                    fp8_status = f"⚠️ FP8 failed ({e}), using bf16"
+            
+            trainer = LoRATrainer(
+                dit_handler=handler,
+                lora_config=lora_config,
+                training_config=training_config,
+            )
+            
+            # TensorBoard log directory
+            tensorboard_logdir = os.path.join(request.lora_output_dir, "logs")
+            os.makedirs(tensorboard_logdir, exist_ok=True)
+            
+            import time
+            training_state["is_training"] = True
+            training_state["should_stop"] = False
+            training_state["trainer"] = trainer
+            training_state["tensor_dir"] = request.tensor_dir
+            training_state["tensorboard_logdir"] = tensorboard_logdir
+            training_state["loss_history"] = []  # Track loss history for plotting
+            training_state["training_log"] = ""  # Accumulated log text for frontend
+            training_state["start_time"] = time.time()  # Track training start time
+            training_state["current_epoch"] = 0
+            training_state["last_step_time"] = time.time()  # For speed calculation
+            training_state["steps_per_second"] = 0.0
+            training_state["estimated_time_remaining"] = 0.0
+            training_state["config"] = {
+                "lora_rank": request.lora_rank,
+                "lora_alpha": request.lora_alpha,
+                "learning_rate": request.learning_rate,
+                "epochs": request.train_epochs,
+            }
+            
+            # Start TensorBoard server if not already running
+            if not hasattr(app.state, 'tensorboard_process') or app.state.tensorboard_process is None:
+                try:
+                    import subprocess
+                    tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
+                    app.state.tensorboard_process = subprocess.Popen(
+                        ["tensorboard", "--logdir", request.lora_output_dir, "--port", str(tensorboard_port), "--bind_all"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+                except Exception:
+                    # TensorBoard not available or failed to start
+                    training_state["tensorboard_url"] = None
+            else:
+                tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
+                training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+            
+            def _run_training_sync():
+                """Run training synchronously in thread pool."""
+                try:
+                    for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
+                        training_state["current_step"] = step
+                        training_state["current_loss"] = loss
+                        training_state["status"] = status
+                        
+                        # Accumulate loss history (only valid values)
+                        if step > 0 and loss is not None and loss == loss:  # Check for NaN
+                            training_state["loss_history"].append({"step": step, "loss": float(loss)})
+                            # Keep last 1000 points to avoid unbounded growth
+                            if len(training_state["loss_history"]) > 1000:
+                                training_state["loss_history"] = training_state["loss_history"][-1000:]
+                            
+                            # Extract epoch from status (e.g., "Epoch 1/1000, Step 5, Loss: 0.1234")
+                            import re
+                            epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
+                            if epoch_match:
+                                training_state["current_epoch"] = int(epoch_match.group(1))
+                            
+                            # Calculate training speed and ETA
+                            current_time = time.time()
+                            if step > 1:  # Skip first step for more accurate measurement
+                                elapsed_since_last = current_time - training_state["last_step_time"]
+                                if elapsed_since_last > 0:
+                                    training_state["steps_per_second"] = 1.0 / elapsed_since_last
+                                    
+                                    # Calculate ETA based on total steps
+                                    total_epochs = training_state["config"]["epochs"]
+                                    # Estimate total steps (rough estimate)
+                                    if training_state["current_epoch"] > 0:
+                                        steps_per_epoch = step / training_state["current_epoch"]
+                                        total_steps = int(steps_per_epoch * total_epochs)
+                                        remaining_steps = total_steps - step
+                                        training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
+                            
+                            training_state["last_step_time"] = current_time
+                            
+                            # Accumulate training log
+                            log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
+                            if training_state["training_log"]:
+                                training_state["training_log"] += "\n" + log_entry
+                            else:
+                                training_state["training_log"] = log_entry
+                            # Keep last 100 lines to avoid unbounded growth
+                            log_lines = training_state["training_log"].split("\n")
+                            if len(log_lines) > 100:
+                                training_state["training_log"] = "\n".join(log_lines[-100:])
+                        
+                        if training_state.get("should_stop", False):
+                            break
+                    
+                    training_state["is_training"] = False
+                except Exception as e:
+                    training_state["is_training"] = False
+                    training_state["error"] = str(e)
+            
+            # Run in thread pool to avoid blocking event loop
+            executor: ThreadPoolExecutor = app.state.executor
+            executor.submit(_run_training_sync)
+            
+            message = "Training started"
+            if fp8_status:
+                message += f"\n{fp8_status}"
+            
+            return _wrap_response({
+                "message": message,
+                "tensor_dir": request.tensor_dir,
+                "output_dir": request.lora_output_dir,
+                "config": training_state["config"],
+                "fp8_enabled": request.use_fp8
+            })
+            
+        except Exception as e:
+            training_state["is_training"] = False
+            return _wrap_response(None, code=500, error=f"Failed to start training: {str(e)}")
+
+    @app.post("/v1/training/stop")
+    async def stop_training(_: None = Depends(verify_api_key)):
+        """Stop the current training process."""
+        training_state = app.state.training_state
+        
+        if not training_state.get("is_training", False):
+            raise HTTPException(status_code=400, detail="No training in progress")
+        
+        training_state["should_stop"] = True
+        
+        return _wrap_response({"message": "Stopping training..."})
+
+    @app.post("/v1/training/load_tensor_info")
+    async def load_tensor_info(request: dict, _: None = Depends(verify_api_key)):
+        """Load preprocessed tensor dataset info from directory."""
+        tensor_dir = request.get("tensor_dir", "").strip()
+        
+        if not tensor_dir:
+            raise HTTPException(status_code=400, detail="Please enter a tensor directory path")
+        
+        if not os.path.exists(tensor_dir):
+            raise HTTPException(status_code=400, detail=f"Directory not found: {tensor_dir}")
+        
+        if not os.path.isdir(tensor_dir):
+            raise HTTPException(status_code=400, detail=f"Not a directory: {tensor_dir}")
+        
+        try:
+            # Check for manifest.json (created by preprocess_to_tensors)
+            manifest_path = os.path.join(tensor_dir, "manifest.json")
+            dataset_name = "Unknown"
+            num_samples = 0
+            custom_tag = ""
+            has_manifest = False
+            
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        manifest = json.load(f)
+                    
+                    num_samples = manifest.get("num_samples", 0)
+                    metadata = manifest.get("metadata", {})
+                    dataset_name = metadata.get("name", "Unknown")
+                    custom_tag = metadata.get("custom_tag", "")
+                    has_manifest = True
+                    
+                    message = f"✅ Loaded preprocessed dataset: {dataset_name}\n"
+                    message += f"📊 Samples: {num_samples} preprocessed tensors"
+                    if custom_tag:
+                        message += f"\n🏷️ Custom Tag: {custom_tag}"
+                    
+                    return _wrap_response({
+                        "dataset_name": dataset_name,
+                        "num_samples": num_samples,
+                        "custom_tag": custom_tag,
+                        "tensor_dir": tensor_dir,
+                        "message": message
+                    })
+                except Exception as e:
+                    # Manifest exists but failed to parse, continue to fallback
+                    pass
+            
+            # Fallback: count .pt files
+            pt_files = [f for f in os.listdir(tensor_dir) if f.endswith('.pt')]
+            num_samples = len(pt_files)
+            
+            if num_samples == 0:
+                raise HTTPException(status_code=400, detail=f"No .pt tensor files found in {tensor_dir}")
+            
+            message = f"✅ Found {num_samples} tensor files in {tensor_dir}\n"
+            message += "⚠️ No manifest.json found - using all .pt files"
+            
+            return _wrap_response({
+                "dataset_name": dataset_name,
+                "num_samples": num_samples,
+                "custom_tag": custom_tag,
+                "tensor_dir": tensor_dir,
+                "message": message
+            })
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Failed to load tensor info: {str(e)}")
+
+    @app.get("/v1/training/status")
+    async def get_training_status(_: None = Depends(verify_api_key)):
+        """Get current training status."""
+        training_state = app.state.training_state
+        
+        is_training = training_state.get("is_training", False)
+        
+        response = {
+            "is_training": is_training,
+            "should_stop": training_state.get("should_stop", False),
+        }
+        
+        if is_training:
+            response.update({
+                "current_step": training_state.get("current_step", 0),
+                "current_loss": training_state.get("current_loss"),
+                "status": training_state.get("status", "Training..."),
+                "config": training_state.get("config", {}),
+                "tensor_dir": training_state.get("tensor_dir", ""),
+                "loss_history": training_state.get("loss_history", []),
+                "tensorboard_url": training_state.get("tensorboard_url"),
+                "tensorboard_logdir": training_state.get("tensorboard_logdir"),
+                "training_log": training_state.get("training_log", ""),
+                "start_time": training_state.get("start_time"),
+                "current_epoch": training_state.get("current_epoch", 0),
+                "steps_per_second": training_state.get("steps_per_second", 0.0),
+                "estimated_time_remaining": training_state.get("estimated_time_remaining", 0.0),
+            })
+        
+        if "error" in training_state:
+            response["error"] = training_state["error"]
+        
+        return _wrap_response(response)
+
+    @app.post("/v1/training/export")
+    async def export_lora(request: ExportLoRARequest, _: None = Depends(verify_api_key)):
+        """Export trained LoRA weights."""
+        import shutil
+        
+        final_dir = os.path.join(request.lora_output_dir, "final")
+        checkpoint_dir = os.path.join(request.lora_output_dir, "checkpoints")
+        
+        if os.path.exists(final_dir):
+            source_path = final_dir
+        elif os.path.exists(checkpoint_dir):
+            checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
+            if not checkpoints:
+                raise HTTPException(status_code=404, detail="No checkpoints found")
+            
+            checkpoints.sort(key=lambda x: int(x.split("_")[1]))
+            latest = checkpoints[-1]
+            source_path = os.path.join(checkpoint_dir, latest)
+        else:
+            raise HTTPException(status_code=404, detail=f"No trained model found in {request.lora_output_dir}")
+        
+        try:
+            export_path = request.export_path.strip()
+            os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
+            
+            if os.path.exists(export_path):
+                shutil.rmtree(export_path)
+            
+            shutil.copytree(source_path, export_path)
+            
+            return _wrap_response({
+                "message": f"LoRA exported successfully",
+                "export_path": export_path,
+                "source": source_path
+            })
+            
+        except Exception as e:
+            return _wrap_response(None, code=500, error=f"Export failed: {str(e)}")
 
     @app.get("/v1/audio")
     async def get_audio(path: str, request: Request, _: None = Depends(verify_api_key)):

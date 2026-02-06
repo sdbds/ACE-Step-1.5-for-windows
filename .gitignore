@@ -230,3 +230,5 @@ issues/
 PortableGit/
 proxy_config.txt
 gradio_outputs/
+huggingface/
+.windsurf/
