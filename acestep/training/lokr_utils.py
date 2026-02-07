@@ -6,6 +6,7 @@ into the DiT decoder model using the lycoris-lora library.
 """
 
 import os
+import json
 from typing import Optional, Dict, Any, Tuple
 from loguru import logger
 
@@ -176,7 +177,13 @@ def save_lokr_weights(
 
     save_metadata = {"algo": "lokr", "format": "lycoris"}
     if metadata:
-        save_metadata.update(metadata)
+        for k, v in metadata.items():
+            if v is None:
+                continue
+            if isinstance(v, str):
+                save_metadata[k] = v
+            else:
+                save_metadata[k] = json.dumps(v, ensure_ascii=False)
 
     lycoris_net.save_weights(weights_path, dtype=dtype, metadata=save_metadata)
     logger.info(f"LoKR weights saved to {weights_path}")

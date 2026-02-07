@@ -51,7 +51,7 @@ warnings.filterwarnings("ignore")
 
 class AceStepHandler:
     """ACE-Step Business Logic Handler"""
-    
+
     def __init__(self):
         self.model = None
         self.config = None
@@ -60,36 +60,38 @@ class AceStepHandler:
 
         # VAE for audio encoding/decoding
         self.vae = None
-        
+
         # Text encoder and tokenizer
         self.text_encoder = None
         self.text_tokenizer = None
-        
+
         # Silence latent for initialization
         self.silence_latent = None
-        
+
         # Sample rate
         self.sample_rate = 48000
-        
+
         # Reward model (temporarily disabled)
         self.reward_model = None
-        
+
         # Batch size
         self.batch_size = 2
-        
+
         # Custom layers config
         self.custom_layers_config = {2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}
         self.offload_to_cpu = False
         self.offload_dit_to_cpu = False
         self.compiled = False
         self.current_offload_cost = 0.0
-        
+
         # LoRA state
         self.lora_loaded = False
         self.use_lora = False
         self.lora_scale = 1.0  # LoRA influence scale (0-1)
         self._base_decoder = None  # Backup of original decoder
-    
+        self._adapter_type = None  # None | "peft_lora" | "lycoris_lokr"
+        self._lycoris_net = None
+
     def get_available_checkpoints(self) -> str:
         """Return project root directory path"""
         # Get project root (handler.py is in acestep/, so go up two levels to project root)
@@ -100,13 +102,13 @@ class AceStepHandler:
             return [checkpoint_dir]
         else:
             return []
-    
+
     def get_available_acestep_v15_models(self) -> List[str]:
         """Scan and return all model directory names starting with 'acestep-v15-'"""
         # Get project root
         project_root = self._get_project_root()
         checkpoint_dir = os.path.join(project_root, "checkpoints")
-        
+
         models = []
         if os.path.exists(checkpoint_dir):
             # Scan all directories starting with 'acestep-v15-' in checkpoints folder
@@ -114,11 +116,11 @@ class AceStepHandler:
                 item_path = os.path.join(checkpoint_dir, item)
                 if os.path.isdir(item_path) and item.startswith("acestep-v15-"):
                     models.append(item)
-        
+
         # Sort by name
         models.sort()
         return models
-    
+
     def is_flash_attention_available(self) -> bool:
         """Check if flash attention is available on the system"""
         try:
@@ -126,87 +128,159 @@ class AceStepHandler:
             return True
         except ImportError:
             return False
-    
+
     def is_turbo_model(self) -> bool:
         """Check if the currently loaded model is a turbo model"""
         if self.config is None:
             return False
         return getattr(self.config, 'is_turbo', False)
-    
+
     def load_lora(self, lora_path: str) -> str:
         """Load LoRA adapter into the decoder.
-        
+
         Args:
             lora_path: Path to the LoRA adapter directory (containing adapter_config.json)
-            
+
         Returns:
             Status message
         """
         if self.model is None:
             return "❌ Model not initialized. Please initialize service first."
-        
+
         if not lora_path or not lora_path.strip():
             return "❌ Please provide a LoRA path."
-        
+
         lora_path = lora_path.strip()
-        
+
         # Check if path exists
         if not os.path.exists(lora_path):
             return f"❌ LoRA path not found: {lora_path}"
-        
-        # Check if it's a valid PEFT adapter directory
-        config_file = os.path.join(lora_path, "adapter_config.json")
-        if not os.path.exists(config_file):
-            return f"❌ Invalid LoRA adapter: adapter_config.json not found in {lora_path}"
-        
-        try:
-            from peft import PeftModel, PeftConfig
-        except ImportError:
-            return "❌ PEFT library not installed. Please install with: pip install peft"
-        
+
+        is_peft_adapter_dir = False
+        if os.path.isdir(lora_path):
+            config_file = os.path.join(lora_path, "adapter_config.json")
+            is_peft_adapter_dir = os.path.exists(config_file)
+
+        lokr_weights_path = None
+        if os.path.isdir(lora_path):
+            _candidate = os.path.join(lora_path, "lokr_weights.safetensors")
+            if os.path.exists(_candidate):
+                lokr_weights_path = _candidate
+        elif lora_path.endswith(".safetensors"):
+            lokr_weights_path = lora_path
+
         try:
             import copy
             # If LoRA is already loaded, restore base decoder first before loading new one
             if self.lora_loaded and self._base_decoder is not None:
                 self.model.decoder = copy.deepcopy(self._base_decoder)
                 logger.info("Restored base decoder before loading new LoRA")
-            
+
             # Always backup the CURRENT clean decoder (not a stale one from a previous model)
             self._base_decoder = copy.deepcopy(self.model.decoder)
             logger.info("Base decoder backed up")
-            
-            # Load PEFT adapter
-            logger.info(f"Loading LoRA adapter from {lora_path}")
-            self.model.decoder = PeftModel.from_pretrained(
-                self.model.decoder,
-                lora_path,
-                is_trainable=False,
+
+            if is_peft_adapter_dir:
+                try:
+                    from peft import PeftModel  # noqa: F401
+                except ImportError:
+                    return "❌ PEFT library not installed. Please install with: pip install peft"
+
+                # Load PEFT adapter
+                logger.info(f"Loading LoRA adapter from {lora_path}")
+                from peft import PeftModel
+                self.model.decoder = PeftModel.from_pretrained(
+                    self.model.decoder,
+                    lora_path,
+                    is_trainable=False,
+                )
+                self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                self.model.decoder.eval()
+
+                self._adapter_type = "peft_lora"
+                self._lycoris_net = None
+                self.lora_loaded = True
+                self.use_lora = True  # Enable LoRA by default after loading
+                self.lora_scale = 1.0
+
+                logger.info(f"LoRA adapter loaded successfully from {lora_path}")
+                return f"✅ LoRA loaded from {lora_path}"
+
+            if lokr_weights_path is not None:
+                try:
+                    from safetensors import safe_open
+                except ImportError:
+                    return "❌ safetensors library not installed. Please install with: pip install safetensors"
+
+                try:
+                    from acestep.training.lokr_utils import (
+                        check_lycoris_available,
+                        inject_lokr_into_dit,
+                        load_lokr_weights,
+                    )
+                    from acestep.training.configs import LoKRConfig
+                except Exception as e:
+                    return f"❌ LoKr dependencies not available: {str(e)}"
+
+                if not check_lycoris_available():
+                    return "❌ LyCORIS library not installed. Please install with: pip install lycoris-lora"
+
+                with safe_open(lokr_weights_path, framework="pt", device="cpu") as f:
+                    meta = f.metadata() or {}
+
+                algo = (meta.get("algo") or "").lower()
+                if algo and algo != "lokr":
+                    return f"❌ Unsupported adapter algo in metadata: {algo}"
+
+                lokr_cfg_dict = None
+                if "lokr_config" in meta:
+                    try:
+                        lokr_cfg_dict = json.loads(meta["lokr_config"])
+                    except Exception as e:
+                        return f"❌ Invalid lokr_config metadata: {str(e)}"
+                if not isinstance(lokr_cfg_dict, dict):
+                    return "❌ LoKr weights missing lokr_config metadata. Please re-train/re-save with updated code."
+
+                lokr_cfg = LoKRConfig()
+                for k, v in lokr_cfg_dict.items():
+                    if hasattr(lokr_cfg, k):
+                        setattr(lokr_cfg, k, v)
+
+                logger.info(f"Loading LoKr adapter from {lokr_weights_path}")
+                self.model, self._lycoris_net, _ = inject_lokr_into_dit(self.model, lokr_cfg)
+                load_lokr_weights(self._lycoris_net, lokr_weights_path)
+
+                self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
+                self.model.decoder.eval()
+
+                self._adapter_type = "lycoris_lokr"
+                self.lora_loaded = True
+                self.use_lora = True
+                self.lora_scale = 1.0
+
+                return f"✅ LoKr loaded from {lokr_weights_path}"
+
+            return (
+                "❌ Invalid adapter path. Expected a PEFT LoRA adapter directory (adapter_config.json) "
+                "or a LoKr weights file/directory (lokr_weights.safetensors)."
             )
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
-            self.model.decoder.eval()
-            
-            self.lora_loaded = True
-            self.use_lora = True  # Enable LoRA by default after loading
-            
-            logger.info(f"LoRA adapter loaded successfully from {lora_path}")
-            return f"✅ LoRA loaded from {lora_path}"
-            
+
         except Exception as e:
             logger.exception("Failed to load LoRA adapter")
             return f"❌ Failed to load LoRA: {str(e)}"
-    
+
     def unload_lora(self) -> str:
         """Unload LoRA adapter and restore base decoder.
-        
+
         Returns:
             Status message
         """
         if not self.lora_loaded:
             return "⚠️ No LoRA adapter loaded."
-        
+
         if self._base_decoder is None:
             return "❌ Base decoder backup not found. Cannot restore."
-        
+
         try:
             import copy
             # Restore base decoder
@@ -214,38 +288,53 @@ class AceStepHandler:
             self.model.decoder = copy.deepcopy(self._base_decoder)
             self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             self.model.decoder.eval()
-            
+
             # Free the old PeftModel-wrapped decoder and the backup
             del old_decoder
             self._base_decoder = None
+            self._adapter_type = None
+            self._lycoris_net = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            
+
             self.lora_loaded = False
             self.use_lora = False
             self.lora_scale = 1.0  # Reset scale to default
-            
+
             logger.info("LoRA unloaded, base decoder restored")
             return "✅ LoRA unloaded, using base model"
-            
+
         except Exception as e:
             logger.exception("Failed to unload LoRA")
             return f"❌ Failed to unload LoRA: {str(e)}"
-    
+
     def set_use_lora(self, use_lora: bool) -> str:
         """Toggle LoRA usage for inference.
-        
+
         Args:
             use_lora: Whether to use LoRA adapter
-            
+
         Returns:
             Status message
         """
         if use_lora and not self.lora_loaded:
             return "❌ No LoRA adapter loaded. Please load a LoRA first."
-        
+
         self.use_lora = use_lora
-        
+
+        if self.lora_loaded and self._adapter_type == "lycoris_lokr" and self._lycoris_net is not None:
+            try:
+                multiplier = self.lora_scale if use_lora else 0.0
+                if hasattr(self._lycoris_net, "set_multiplier"):
+                    self._lycoris_net.set_multiplier(multiplier)
+                elif hasattr(self._lycoris_net, "multiplier"):
+                    self._lycoris_net.multiplier = multiplier
+                for m in getattr(self._lycoris_net, "loras", []) or []:
+                    if hasattr(m, "multiplier"):
+                        m.multiplier = multiplier
+            except Exception as e:
+                logger.warning(f"Could not toggle LoKr multiplier: {e}")
+
         # Use PEFT's enable/disable methods if available
         if self.lora_loaded and hasattr(self.model.decoder, 'disable_adapter_layers'):
             try:
@@ -257,25 +346,41 @@ class AceStepHandler:
                     logger.info("LoRA adapter disabled")
             except Exception as e:
                 logger.warning(f"Could not toggle adapter layers: {e}")
-        
+
         status = "enabled" if use_lora else "disabled"
         return f"✅ LoRA {status}"
-    
+
     def set_lora_scale(self, scale: float) -> str:
         """Set LoRA adapter scale/weight (0-1 range).
-        
+
         Args:
             scale: LoRA influence scale (0=disabled, 1=full effect)
-            
+
         Returns:
             Status message
         """
         if not self.lora_loaded:
             return "⚠️ No LoRA loaded"
-        
+
         # Clamp scale to 0-1 range
         self.lora_scale = max(0.0, min(1.0, scale))
-        
+
+        if self._adapter_type == "lycoris_lokr" and self._lycoris_net is not None:
+            try:
+                multiplier = self.lora_scale if self.use_lora else 0.0
+                if hasattr(self._lycoris_net, "set_multiplier"):
+                    self._lycoris_net.set_multiplier(multiplier)
+                elif hasattr(self._lycoris_net, "multiplier"):
+                    self._lycoris_net.multiplier = multiplier
+                for m in getattr(self._lycoris_net, "loras", []) or []:
+                    if hasattr(m, "multiplier"):
+                        m.multiplier = multiplier
+                logger.info(f"LoKr scale set to {self.lora_scale:.2f}")
+                return f"✅ LoRA scale: {self.lora_scale:.2f}"
+            except Exception as e:
+                logger.warning(f"Could not set LoKr scale: {e}")
+                return f"⚠️ Scale set to {self.lora_scale:.2f} (partial)"
+
         # Iterate through all LoRA layers and set their scaling
         try:
             for name, module in self.model.decoder.named_modules():
@@ -294,16 +399,16 @@ class AceStepHandler:
                         if not hasattr(module, '_original_scaling'):
                             module._original_scaling = scaling
                         module.scaling = module._original_scaling * self.lora_scale
-            
+
             logger.info(f"LoRA scale set to {self.lora_scale:.2f}")
             return f"✅ LoRA scale: {self.lora_scale:.2f}"
         except Exception as e:
             logger.warning(f"Could not set LoRA scale: {e}")
             return f"⚠️ Scale set to {self.lora_scale:.2f} (partial)"
-    
+
     def get_lora_status(self) -> Dict[str, Any]:
         """Get current LoRA status.
-        
+
         Returns:
             Dictionary with LoRA status info
         """
@@ -312,7 +417,7 @@ class AceStepHandler:
             "active": self.use_lora,
             "scale": self.lora_scale,
         }
-    
+
     def initialize_service(
         self,
         project_root: str,
@@ -353,7 +458,7 @@ class AceStepHandler:
                     device = "cpu"
 
             status_msg = ""
-            
+
             self.device = device
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
@@ -371,7 +476,7 @@ class AceStepHandler:
                     import torchao
                 except ImportError:
                     raise ImportError("torchao is required for quantization but is not installed. Please install torchao to use quantization features.")
-                
+
 
             # Auto-detect project root (independent of passed project_root parameter)
             actual_project_root = self._get_project_root()
@@ -380,7 +485,7 @@ class AceStepHandler:
             # Auto-download models if not present
             from pathlib import Path
             checkpoint_path = Path(checkpoint_dir)
-            
+
             # Check and download main model components (vae, text_encoder, default DiT)
             if not check_main_model_exists(checkpoint_path):
                 logger.info("[initialize_service] Main model not found, starting auto-download...")
@@ -411,8 +516,8 @@ class AceStepHandler:
                 try:
                     logger.info(f"[initialize_service] Attempting to load model with attention implementation: {attn_implementation}")
                     self.model = AutoModel.from_pretrained(
-                        acestep_v15_checkpoint_path, 
-                        trust_remote_code=True, 
+                        acestep_v15_checkpoint_path,
+                        trust_remote_code=True,
                         attn_implementation=attn_implementation,
                         dtype="bfloat16"
                     )
@@ -422,8 +527,8 @@ class AceStepHandler:
                         logger.info("[initialize_service] Falling back to eager attention")
                         attn_implementation = "eager"
                         self.model = AutoModel.from_pretrained(
-                            acestep_v15_checkpoint_path, 
-                            trust_remote_code=True, 
+                            acestep_v15_checkpoint_path,
+                            trust_remote_code=True,
                             attn_implementation=attn_implementation
                         )
                     else:
@@ -442,7 +547,7 @@ class AceStepHandler:
                     else:
                         self.model = self.model.to("cpu").to(self.dtype)
                 self.model.eval()
-                
+
                 if compile_model:
                     # Add __len__ method to model to support torch.compile
                     # torch.compile's dynamo requires this method for introspection
@@ -452,9 +557,9 @@ class AceStepHandler:
                             """Return 0 as default length for torch.compile compatibility"""
                             return 0
                         self.model.__class__.__len__ = _model_len
-                    
+
                     self.model = torch.compile(self.model)
-                    
+
                     if self.quantization is not None:
                         from torchao.quantization import quantize_
                         if self.quantization == "int8_weight_only":
@@ -468,11 +573,11 @@ class AceStepHandler:
                             quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
                         else:
                             raise ValueError(f"Unsupported quantization type: {self.quantization}")
-                        
+
                         quantize_(self.model, quant_config)
                         logger.info(f"[initialize_service] DiT quantized with: {self.quantization}")
-                    
-                    
+
+
                 silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
                 if os.path.exists(silence_latent_path):
                     self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
@@ -483,7 +588,7 @@ class AceStepHandler:
                     raise FileNotFoundError(f"Silence latent not found at {silence_latent_path}")
             else:
                 raise FileNotFoundError(f"ACE-Step V1.5 checkpoint not found at {acestep_v15_checkpoint_path}")
-            
+
             # 2. Load VAE
             vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
             if os.path.exists(vae_checkpoint_path):
@@ -506,9 +611,9 @@ class AceStepHandler:
                         """Return 0 as default length for torch.compile compatibility"""
                         return 0
                     self.vae.__class__.__len__ = _vae_len
-                
+
                 self.vae = torch.compile(self.vae)
-            
+
             # 3. Load text encoder and tokenizer
             text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
             if os.path.exists(text_encoder_path):
@@ -524,7 +629,7 @@ class AceStepHandler:
 
             # Determine actual attention implementation used
             actual_attn = getattr(self.config, "_attn_implementation", "eager")
-            
+
             status_msg = f"✅ Model initialized successfully on {device}\n"
             status_msg += f"Main model: {acestep_v15_checkpoint_path}\n"
             status_msg += f"VAE: {vae_checkpoint_path}\n"
@@ -534,22 +639,22 @@ class AceStepHandler:
             status_msg += f"Compiled: {compile_model}\n"
             status_msg += f"Offload to CPU: {self.offload_to_cpu}\n"
             status_msg += f"Offload DiT to CPU: {self.offload_dit_to_cpu}"
-            
+
             return status_msg, True
-            
+
         except Exception as e:
             error_msg = f"❌ Error initializing model: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.exception("[initialize_service] Error initializing model")
             return error_msg, False
-    
+
     def switch_dit_model(self, config_path: str, use_flash_attention: bool = False) -> Tuple[str, bool]:
         """
         Switch only the DiT model weights, reusing VAE and TextEncoder.
-        
+
         Args:
             config_path: Model config directory name (e.g., "acestep-v15-sft")
             use_flash_attention: Whether to use flash attention
-            
+
         Returns:
             (status_message, success)
         """
@@ -580,7 +685,7 @@ class AceStepHandler:
                     self.unload_lora()
                 except Exception as e:
                     logger.warning(f"[switch_dit_model] Failed to unload LoRA cleanly: {e}")
-            
+
             # Force-reset ALL LoRA state regardless of unload success
             # This prevents stale _base_decoder from corrupting the new model
             self._base_decoder = None
@@ -692,13 +797,13 @@ class AceStepHandler:
         except Exception:
             target_type = str(target_device)
         return tensor.device.type == target_type
-    
+
     def _ensure_silence_latent_on_device(self):
         """Ensure silence_latent is on the correct device (self.device)."""
         if hasattr(self, "silence_latent") and self.silence_latent is not None:
             if not self._is_on_target_device(self.silence_latent, self.device):
                 self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
-    
+
     def _move_module_recursive(self, module, target_device, dtype=None, visited=None):
         """
         Recursively move a module and all its submodules to the target device.
@@ -706,34 +811,34 @@ class AceStepHandler:
         """
         if visited is None:
             visited = set()
-        
+
         module_id = id(module)
         if module_id in visited:
             return
         visited.add(module_id)
-        
+
         # Move the module itself
         module.to(target_device)
         if dtype is not None:
             module.to(dtype)
-        
+
         # Move all direct parameters
         for param_name, param in module._parameters.items():
             if param is not None and not self._is_on_target_device(param, target_device):
                 module._parameters[param_name] = param.to(target_device)
                 if dtype is not None:
                     module._parameters[param_name] = module._parameters[param_name].to(dtype)
-        
+
         # Move all direct buffers
         for buf_name, buf in module._buffers.items():
             if buf is not None and not self._is_on_target_device(buf, target_device):
                 module._buffers[buf_name] = buf.to(target_device)
-        
+
         # Recursively process all submodules (registered and unregistered)
         for name, child in module._modules.items():
             if child is not None:
                 self._move_module_recursive(child, target_device, dtype, visited)
-        
+
         # Also check for any nn.Module attributes that might not be in _modules
         for attr_name in dir(module):
             if attr_name.startswith('_'):
@@ -744,28 +849,28 @@ class AceStepHandler:
                     self._move_module_recursive(attr, target_device, dtype, visited)
             except Exception:
                 pass
-    
+
     def _recursive_to_device(self, model, device, dtype=None):
         """
         Recursively move all parameters and buffers of a model to the specified device.
         This is more thorough than model.to() for some custom HuggingFace models.
         """
         target_device = torch.device(device) if isinstance(device, str) else device
-        
+
         # Method 1: Standard .to() call
         model.to(target_device)
         if dtype is not None:
             model.to(dtype)
-        
+
         # Method 2: Use our thorough recursive moving for any missed modules
         self._move_module_recursive(model, target_device, dtype)
-        
+
         # Method 3: Force move via state_dict if there are still parameters on wrong device
         wrong_device_params = []
         for name, param in model.named_parameters():
             if not self._is_on_target_device(param, device):
                 wrong_device_params.append(name)
-        
+
         if wrong_device_params and device != "cpu":
             logger.warning(f"[_recursive_to_device] {len(wrong_device_params)} parameters on wrong device, using state_dict method")
             # Get current state dict and move all tensors
@@ -779,11 +884,11 @@ class AceStepHandler:
                 else:
                     moved_state_dict[key] = value
             model.load_state_dict(moved_state_dict)
-        
+
         # Synchronize accelerator to ensure all transfers are complete
         if device != "cpu":
             self._synchronize()
-        
+
         # Final verification
         if device != "cpu":
             still_wrong = []
@@ -792,12 +897,12 @@ class AceStepHandler:
                     still_wrong.append(f"{name} on {param.device}")
             if still_wrong:
                 logger.error(f"[_recursive_to_device] CRITICAL: {len(still_wrong)} parameters still on wrong device: {still_wrong[:10]}")
-    
+
     @contextmanager
     def _load_model_context(self, model_name: str):
         """
         Context manager to load a model to GPU and offload it back to CPU after use.
-        
+
         Args:
             model_name: Name of the model to load ("text_encoder", "vae", "model")
         """
@@ -837,10 +942,10 @@ class AceStepHandler:
             self._recursive_to_device(model, self.device, vae_dtype)
         else:
             self._recursive_to_device(model, self.device, self.dtype)
-        
+
         if model_name == "model" and hasattr(self, "silence_latent"):
              self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
-        
+
         load_time = time.time() - start_time
         self.current_offload_cost += load_time
         logger.info(f"[_load_model_context] Loaded {model_name} to {self.device} in {load_time:.4f}s")
@@ -852,11 +957,11 @@ class AceStepHandler:
             logger.info(f"[_load_model_context] Offloading {model_name} to CPU")
             start_time = time.time()
             self._recursive_to_device(model, "cpu")
-            
+
             # NOTE: Do NOT offload silence_latent to CPU here!
             # silence_latent is used in many places outside of model context,
             # so it should stay on GPU to avoid device mismatch errors.
-            
+
             self._empty_cache()
             offload_time = time.time() - start_time
             self.current_offload_cost += offload_time
@@ -866,7 +971,7 @@ class AceStepHandler:
         """Process target audio"""
         if audio_file is None:
             return None
-        
+
         try:
             # Load audio using soundfile
             audio_np, sr = sf.read(audio_file, dtype='float32')
@@ -875,15 +980,15 @@ class AceStepHandler:
                 audio = torch.from_numpy(audio_np).unsqueeze(0)
             else:
                 audio = torch.from_numpy(audio_np.T)
-            
+
             # Normalize to stereo 48kHz
             audio = self._normalize_audio_to_stereo_48k(audio, sr)
-            
+
             return audio
         except Exception as e:
             logger.exception("[process_target_audio] Error processing target audio")
             return None
-    
+
     def _parse_audio_code_string(self, code_str: str) -> List[int]:
         """Extract integer audio codes from prompt tokens like <|audio_code_123|>.
         Code values are clamped to valid range [0, 63999] (codebook size = 64000).
@@ -908,51 +1013,51 @@ class AceStepHandler:
         except Exception as e:
             logger.debug(f"[_parse_audio_code_string] Failed to parse audio code string: {e}")
             return []
-    
+
     def _decode_audio_codes_to_latents(self, code_str: str) -> Optional[torch.Tensor]:
         """
         Convert serialized audio code string into 25Hz latents using model quantizer/detokenizer.
-        
+
         Note: Code values are already clamped to valid range [0, 63999] by _parse_audio_code_string(),
         ensuring indices are within the quantizer's codebook size (64000).
         """
         if self.model is None or not hasattr(self.model, 'tokenizer') or not hasattr(self.model, 'detokenizer'):
             return None
-        
+
         code_ids = self._parse_audio_code_string(code_str)
         if len(code_ids) == 0:
             return None
-        
+
         with self._load_model_context("model"):
             quantizer = self.model.tokenizer.quantizer
             detokenizer = self.model.detokenizer
-            
+
             num_quantizers = getattr(quantizer, "num_quantizers", 1)
             # Create indices tensor: [T_5Hz]
             # Note: code_ids are already clamped to [0, 63999] by _parse_audio_code_string()
             indices = torch.tensor(code_ids, device=self.device, dtype=torch.long)  # [T_5Hz]
-            
+
             indices = indices.unsqueeze(0).unsqueeze(-1)  # [1, T_5Hz, 1]
-            
+
             # Get quantized representation from indices
             # The quantizer expects [batch, T_5Hz] format and handles quantizer dimension internally
             quantized = quantizer.get_output_from_indices(indices)
             if quantized.dtype != self.dtype:
                 quantized = quantized.to(self.dtype)
-            
+
             # Detokenize to 25Hz: [1, T_5Hz, dim] -> [1, T_25Hz, dim]
             lm_hints_25hz = detokenizer(quantized)
             return lm_hints_25hz
-    
+
     def _create_default_meta(self) -> str:
         """Create default metadata string."""
         return (
             "- bpm: N/A\n"
-            "- timesignature: N/A\n" 
+            "- timesignature: N/A\n"
             "- keyscale: N/A\n"
             "- duration: 30 seconds\n"
         )
-    
+
     def _dict_to_meta_string(self, meta_dict: Dict[str, Any]) -> str:
         """Convert metadata dict to formatted string."""
         bpm = meta_dict.get('bpm', meta_dict.get('tempo', 'N/A'))
@@ -965,21 +1070,21 @@ class AceStepHandler:
             duration = f"{int(duration)} seconds"
         elif not isinstance(duration, str):
             duration = "30 seconds"
-        
+
         return (
             f"- bpm: {bpm}\n"
             f"- timesignature: {timesignature}\n"
             f"- keyscale: {keyscale}\n"
             f"- duration: {duration}\n"
         )
-    
+
     def _parse_metas(self, metas: List[Union[str, Dict[str, Any]]]) -> List[str]:
         """
         Parse and normalize metadata with fallbacks.
-        
+
         Args:
             metas: List of metadata (can be strings, dicts, or None)
-            
+
         Returns:
             List of formatted metadata strings
         """
@@ -997,11 +1102,11 @@ class AceStepHandler:
             else:
                 # Fallback for any other type
                 parsed_meta = self._create_default_meta()
-            
+
             parsed_metas.append(parsed_meta)
-        
+
         return parsed_metas
-    
+
     def build_dit_inputs(
         self,
         task: str,
@@ -1043,7 +1148,7 @@ class AceStepHandler:
         # Fallback to user-provided values if not in metas
         actual_caption = caption
         actual_language = vocal_language
-        
+
         if metas is not None:
             # Parse metas to dict if it's a string
             if isinstance(metas, str):
@@ -1057,11 +1162,11 @@ class AceStepHandler:
                 meta_dict = metas
             else:
                 meta_dict = {}
-            
+
             # Extract caption from metas if available
             if 'caption' in meta_dict and meta_dict['caption']:
                 actual_caption = str(meta_dict['caption'])
-            
+
             # Extract language from metas if available
             if 'language' in meta_dict and meta_dict['language']:
                 actual_language = str(meta_dict['language'])
@@ -1070,12 +1175,12 @@ class AceStepHandler:
         caption_input = SFT_GEN_PROMPT.format(final_instruction, actual_caption, parsed_meta)
         lyrics_input = self._format_lyrics(lyrics, actual_language)
         return caption_input, lyrics_input
-    
+
     def _get_text_hidden_states(self, text_prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get text hidden states from text encoder."""
         if self.text_tokenizer is None or self.text_encoder is None:
             raise ValueError("Text encoder not initialized")
-        
+
         with self._load_model_context("text_encoder"):
             # Tokenize
             text_inputs = self.text_tokenizer(
@@ -1087,7 +1192,7 @@ class AceStepHandler:
             )
             text_input_ids = text_inputs.input_ids.to(self.device)
             text_attention_mask = text_inputs.attention_mask.to(self.device).bool()
-            
+
             # Encode
             with torch.no_grad():
                 text_outputs = self.text_encoder(text_input_ids)
@@ -1097,11 +1202,11 @@ class AceStepHandler:
                     text_hidden_states = text_outputs[0]
                 else:
                     text_hidden_states = text_outputs
-            
+
             text_hidden_states = text_hidden_states.to(self.dtype)
-            
+
             return text_hidden_states, text_attention_mask
-    
+
     def extract_caption_from_sft_format(self, caption: str) -> str:
         try:
             if "# Instruction" in caption and "# Caption" in caption:
@@ -1175,59 +1280,59 @@ class AceStepHandler:
 
             seed_value_for_ui = ", ".join(str(s) for s in actual_seed_list)
         return actual_seed_list, seed_value_for_ui
-    
+
     def prepare_metadata(self, bpm, key_scale, time_signature):
         """Build metadata dict - use "N/A" as default for empty fields."""
         return self._build_metadata_dict(bpm, key_scale, time_signature)
-    
+
     def is_silence(self, audio):
         return torch.all(audio.abs() < 1e-6)
-    
+
     def _get_project_root(self) -> str:
         """Get project root directory path."""
         current_file = os.path.abspath(__file__)
         return os.path.dirname(os.path.dirname(current_file))
-    
+
     def _get_vae_dtype(self, device: Optional[str] = None) -> torch.dtype:
         """Get VAE dtype based on device."""
         device = device or self.device
         if device in ["cuda", "xpu", "mps"]:
             return torch.bfloat16
         return self.dtype
-    
+
     def _format_instruction(self, instruction: str) -> str:
         """Format instruction to ensure it ends with colon."""
         if not instruction.endswith(":"):
             instruction = instruction + ":"
         return instruction
-    
+
     def _normalize_audio_to_stereo_48k(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         """
         Normalize audio to stereo 48kHz format.
-        
+
         Args:
             audio: Audio tensor [channels, samples] or [samples]
             sr: Sample rate
-            
+
         Returns:
             Normalized audio tensor [2, samples] at 48kHz
         """
         # Convert to stereo (duplicate channel if mono)
         if audio.shape[0] == 1:
             audio = torch.cat([audio, audio], dim=0)
-        
+
         # Keep only first 2 channels
         audio = audio[:2]
-        
+
         # Resample to 48kHz if needed
         if sr != 48000:
             audio = torchaudio.transforms.Resample(sr, 48000)(audio)
-        
+
         # Clamp values to [-1.0, 1.0]
         audio = torch.clamp(audio, -1.0, 1.0)
-        
+
         return audio
-    
+
     def _normalize_audio_code_hints(self, audio_code_hints: Optional[Union[str, List[str]]], batch_size: int) -> List[Optional[str]]:
         """Normalize audio_code_hints to list of correct length."""
         if audio_code_hints is None:
@@ -1243,11 +1348,11 @@ class AceStepHandler:
                 normalized.append(None)
         else:
             normalized = list(audio_code_hints)
-        
+
         # Clean up: convert empty strings to None
         normalized = [hint if isinstance(hint, str) and hint.strip() else None for hint in normalized]
         return normalized
-    
+
     def _normalize_instructions(self, instructions: Optional[Union[str, List[str]]], batch_size: int, default: Optional[str] = None) -> List[str]:
         """Normalize instructions to list of correct length."""
         if instructions is None:
@@ -1266,27 +1371,27 @@ class AceStepHandler:
             return normalized
         else:
             return list(instructions)
-    
+
     def _format_lyrics(self, lyrics: str, language: str) -> str:
         """Format lyrics text with language header."""
         return f"# Languages\n{language}\n\n# Lyric\n{lyrics}<|endoftext|>"
-    
+
     def _pad_sequences(self, sequences: List[torch.Tensor], max_length: int, pad_value: int = 0) -> torch.Tensor:
         """Pad sequences to same length."""
         return torch.stack([
             torch.nn.functional.pad(seq, (0, max_length - len(seq)), 'constant', pad_value)
             for seq in sequences
         ])
-    
+
     def _extract_caption_and_language(self, metas: List[Union[str, Dict[str, Any]]], captions: List[str], vocal_languages: List[str]) -> Tuple[List[str], List[str]]:
         """Extract caption and language from metas with fallback to provided values."""
         actual_captions = list(captions)
         actual_languages = list(vocal_languages)
-        
+
         for i, meta in enumerate(metas):
             if i >= len(actual_captions):
                 break
-                
+
             meta_dict = None
             if isinstance(meta, str):
                 parsed = self._parse_metas([meta])
@@ -1294,59 +1399,59 @@ class AceStepHandler:
                     meta_dict = parsed[0]
             elif isinstance(meta, dict):
                 meta_dict = meta
-            
+
             if meta_dict:
                 if 'caption' in meta_dict and meta_dict['caption']:
                     actual_captions[i] = str(meta_dict['caption'])
                 if 'language' in meta_dict and meta_dict['language']:
                     actual_languages[i] = str(meta_dict['language'])
-        
+
         return actual_captions, actual_languages
-    
+
     def _encode_audio_to_latents(self, audio: torch.Tensor) -> torch.Tensor:
         """
         Encode audio to latents using VAE with tiled encoding for long audio.
-        
+
         Args:
             audio: Audio tensor [channels, samples] or [batch, channels, samples]
-            
+
         Returns:
             Latents tensor [T, D] or [batch, T, D]
         """
         # Save original dimension info BEFORE modifying audio
         input_was_2d = (audio.dim() == 2)
-        
+
         # Ensure batch dimension
         if input_was_2d:
             audio = audio.unsqueeze(0)
-        
+
         # Use tiled_encode for memory-efficient encoding
         # tiled_encode handles device transfer and dtype conversion internally
         with torch.no_grad():
             latents = self.tiled_encode(audio, offload_latent_to_cpu=True)
-        
+
         # Move back to device and cast to model dtype
         latents = latents.to(self.device).to(self.dtype)
-        
+
         # Transpose: [batch, d, T] -> [batch, T, d]
         latents = latents.transpose(1, 2)
-        
+
         # Remove batch dimension if input didn't have it
         if input_was_2d:
             latents = latents.squeeze(0)
-        
+
         return latents
-    
+
     def _build_metadata_dict(self, bpm: Optional[Union[int, str]], key_scale: str, time_signature: str, duration: Optional[float] = None) -> Dict[str, Any]:
         """
         Build metadata dictionary with default values.
-        
+
         Args:
             bpm: BPM value (optional)
             key_scale: Key/scale string
             time_signature: Time signature string
             duration: Duration in seconds (optional)
-            
+
         Returns:
             Metadata dictionary
         """
@@ -1365,11 +1470,11 @@ class AceStepHandler:
             metadata_dict["timesignature"] = time_signature
         else:
             metadata_dict["timesignature"] = "N/A"
-        
+
         # Add duration if provided
         if duration is not None:
             metadata_dict["duration"] = f"{int(duration)} seconds"
-        
+
         return metadata_dict
 
     def generate_instruction(
@@ -1408,58 +1513,58 @@ class AceStepHandler:
                 return TASK_INSTRUCTIONS["complete_default"]
         else:
             return TASK_INSTRUCTIONS["text2music"]
-    
+
     def process_reference_audio(self, audio_file) -> Optional[torch.Tensor]:
         if audio_file is None:
             return None
-            
+
         try:
             # Load audio file
             audio, sr = torchaudio.load(audio_file)
-            
+
             logger.debug(f"[process_reference_audio] Reference audio shape: {audio.shape}")
             logger.debug(f"[process_reference_audio] Reference audio sample rate: {sr}")
             logger.debug(f"[process_reference_audio] Reference audio duration: {audio.shape[-1] / 48000.0} seconds")
-            
+
             # Normalize to stereo 48kHz
             audio = self._normalize_audio_to_stereo_48k(audio, sr)
-            
+
             is_silence = self.is_silence(audio)
             if is_silence:
                 return None
-            
+
             # Target length: 30 seconds at 48kHz
             target_frames = 30 * 48000
             segment_frames = 10 * 48000  # 10 seconds per segment
-            
+
             # If audio is less than 30 seconds, repeat to at least 30 seconds
             if audio.shape[-1] < target_frames:
                 repeat_times = math.ceil(target_frames / audio.shape[-1])
                 audio = audio.repeat(1, repeat_times)
             # If audio is greater than or equal to 30 seconds, no operation needed
-            
+
             # For all cases, select random 10-second segments from front, middle, and back
             # then concatenate them to form 30 seconds
             total_frames = audio.shape[-1]
             segment_size = total_frames // 3
-            
+
             # Front segment: [0, segment_size]
             front_start = random.randint(0, max(0, segment_size - segment_frames))
             front_audio = audio[:, front_start:front_start + segment_frames]
-            
+
             # Middle segment: [segment_size, 2*segment_size]
             middle_start = segment_size + random.randint(0, max(0, segment_size - segment_frames))
             middle_audio = audio[:, middle_start:middle_start + segment_frames]
-            
+
             # Back segment: [2*segment_size, total_frames]
             back_start = 2 * segment_size + random.randint(0, max(0, (total_frames - 2 * segment_size) - segment_frames))
             back_audio = audio[:, back_start:back_start + segment_frames]
-            
+
             # Concatenate three segments to form 30 seconds
             audio = torch.cat([front_audio, middle_audio, back_audio], dim=-1)
-            
+
             return audio
-            
+
         except Exception as e:
             logger.exception("[process_reference_audio] Error processing reference audio")
             return None
@@ -1467,78 +1572,78 @@ class AceStepHandler:
     def process_src_audio(self, audio_file) -> Optional[torch.Tensor]:
         if audio_file is None:
             return None
-            
+
         try:
             # Load audio file
             audio, sr = torchaudio.load(audio_file)
-            
+
             # Normalize to stereo 48kHz
             audio = self._normalize_audio_to_stereo_48k(audio, sr)
-            
+
             return audio
-            
+
         except Exception as e:
             logger.exception("[process_src_audio] Error processing source audio")
             return None
-    
+
     def convert_src_audio_to_codes(self, audio_file) -> str:
         """
         Convert uploaded source audio to audio codes string.
-        
+
         Args:
             audio_file: Path to audio file or None
-            
+
         Returns:
             Formatted codes string like '<|audio_code_123|><|audio_code_456|>...' or error message
         """
         if audio_file is None:
             return "❌ Please upload source audio first"
-        
+
         if self.model is None or self.vae is None:
             return "❌ Model not initialized. Please initialize the service first."
-        
+
         try:
             # Process audio file
             processed_audio = self.process_src_audio(audio_file)
             if processed_audio is None:
                 return "❌ Failed to process audio file"
-            
+
             # Encode audio to latents using VAE
             with torch.no_grad():
                 with self._load_model_context("vae"):
                     # Check if audio is silence
                     if self.is_silence(processed_audio.unsqueeze(0)):
                         return "❌ Audio file appears to be silent"
-                    
+
                     # Encode to latents using helper method
                     latents = self._encode_audio_to_latents(processed_audio)  # [T, d]
-                
+
                 # Create attention mask for latents
                 attention_mask = torch.ones(latents.shape[0], dtype=torch.bool, device=self.device)
-                
+
                 # Tokenize latents to get code indices
                 with self._load_model_context("model"):
                     # Prepare latents for tokenize: [T, d] -> [1, T, d]
                     hidden_states = latents.unsqueeze(0)  # [1, T, d]
-                    
+
                     # Call tokenize method
                     # tokenize returns: (quantized, indices, attention_mask)
                     _, indices, _ = self.model.tokenize(hidden_states, self.silence_latent, attention_mask.unsqueeze(0))
-                    
+
                     # Format indices as code string
                     # indices shape: [1, T_5Hz] or [1, T_5Hz, num_quantizers]
                     # Flatten and convert to list
                     indices_flat = indices.flatten().cpu().tolist()
                     codes_string = "".join([f"<|audio_code_{idx}|>" for idx in indices_flat])
-                    
+
                     logger.info(f"[convert_src_audio_to_codes] Generated {len(indices_flat)} audio codes")
                     return codes_string
-                    
+
         except Exception as e:
             error_msg = f"❌ Error converting audio to codes: {str(e)}\n{traceback.format_exc()}"
             logger.exception("[convert_src_audio_to_codes] Error converting audio to codes")
             return error_msg
-        
+
     def prepare_batch_data(
         self,
         actual_batch_size,
@@ -1571,7 +1676,7 @@ class AceStepHandler:
         # Create a copy for each batch item (in case we modify it)
         metas_batch = [metadata_dict.copy() for _ in range(actual_batch_size)]
         return captions_batch, instructions_batch, lyrics_batch, vocal_languages_batch, metas_batch
-    
+
     def determine_task_type(self, task_type, audio_code_string):
         # Determine task type - repaint and lego tasks can have repainting parameters
         # Other tasks (cover, text2music, extract, complete) should NOT have repainting
@@ -1604,7 +1709,7 @@ class AceStepHandler:
             logger.exception("[create_target_wavs] Error creating target audio")
             # Fallback to 30 seconds if error
             return torch.zeros(2, 30 * 48000)
-    
+
     def prepare_padding_info(
         self,
         actual_batch_size,
@@ -1747,7 +1852,7 @@ class AceStepHandler:
             # Only repaint and lego tasks should have repainting parameters
             repainting_start_batch = None
             repainting_end_batch = None
-            
+
         return repainting_start_batch, repainting_end_batch, target_wavs_tensor
 
     def _prepare_batch(
@@ -1767,7 +1872,7 @@ class AceStepHandler:
     ) -> Dict[str, Any]:
         """
         Prepare batch data with fallbacks for missing inputs.
-        
+
         Args:
             captions: List of text captions (optional, can be empty strings)
             lyrics: List of lyrics (optional, can be empty strings)
@@ -1776,12 +1881,12 @@ class AceStepHandler:
             refer_audios: Reference audio tensors (optional, will use silence if not provided)
             metas: Metadata (optional, will use defaults if not provided)
             vocal_languages: Vocal languages (optional, will default to 'en')
-            
+
         Returns:
             Batch dictionary ready for model input
         """
         batch_size = len(captions)
-        
+
         # Ensure silence_latent is on the correct device for batch preparation
         self._ensure_silence_latent_on_device()
 
@@ -1798,13 +1903,13 @@ class AceStepHandler:
                     refer_audio_list[idx] = refer_audio_list[idx].to(self.device).to(torch.bfloat16)
             elif isinstance(refer_audio_list, torch.Tensor):
                 refer_audios[ii] = refer_audios[ii].to(self.device)
-        
+
         if vocal_languages is None:
             vocal_languages = self._create_fallback_vocal_languages(batch_size)
-        
+
         # Parse metas with fallbacks
         parsed_metas = self._parse_metas(metas)
-        
+
         # Encode target_wavs to get target_latents
         with torch.no_grad():
             target_latents_list = []
@@ -1813,7 +1918,7 @@ class AceStepHandler:
             target_wavs_list = [target_wavs[i].clone() for i in range(batch_size)]
             if target_wavs.device != self.device:
                 target_wavs = target_wavs.to(self.device)
-            
+
             with self._load_model_context("vae"):
                 for i in range(batch_size):
                     code_hint = audio_code_hints[i]
@@ -1840,7 +1945,7 @@ class AceStepHandler:
                         target_latent = self._encode_audio_to_latents(current_wav.squeeze(0))  # Remove batch dim for helper
                     target_latents_list.append(target_latent)
                     latent_lengths.append(target_latent.shape[0])
-             
+
             # Pad target_wavs to consistent length for outputs
             max_target_frames = max(wav.shape[-1] for wav in target_wavs_list)
             padded_target_wavs = []
@@ -1851,20 +1956,20 @@ class AceStepHandler:
                 padded_target_wavs.append(wav)
             target_wavs = torch.stack(padded_target_wavs)
             wav_lengths = torch.tensor([target_wavs.shape[-1]] * batch_size, dtype=torch.long)
-            
+
             # Pad latents to same length
             max_latent_length = max(latent.shape[0] for latent in target_latents_list)
             max_latent_length = max(128, max_latent_length)
-            
+
             padded_latents = []
             for latent in target_latents_list:
                 latent_length = latent.shape[0]
-                
+
                 if latent.shape[0] < max_latent_length:
                     pad_length = max_latent_length - latent.shape[0]
                     latent = torch.cat([latent, self.silence_latent[0, :pad_length, :]], dim=0)
                 padded_latents.append(latent)
-            
+
             target_latents = torch.stack(padded_latents)
             latent_masks = torch.stack([
                 torch.cat([
@@ -1873,11 +1978,11 @@ class AceStepHandler:
                 ])
                 for l in latent_lengths
             ])
-        
+
         # Process instructions early so we can use them for task type detection
         # Use custom instructions if provided, otherwise use default
         instructions = self._normalize_instructions(instructions, batch_size, DEFAULT_DIT_INSTRUCTION)
-        
+
         # Generate chunk_masks and spans based on repainting parameters
         # Also determine if this is a cover task (target audio provided without repainting)
         chunk_masks = []
@@ -1885,7 +1990,7 @@ class AceStepHandler:
         is_covers = []
         # Store repainting latent ranges for later use in src_latents creation
         repainting_ranges = {}  # {batch_idx: (start_latent, end_latent)}
-        
+
         for i in range(batch_size):
             has_code_hint = audio_code_hints[i] is not None
             # Check if repainting is enabled for this batch item
@@ -1893,20 +1998,20 @@ class AceStepHandler:
             if repainting_start is not None and repainting_end is not None:
                 start_sec = repainting_start[i] if repainting_start[i] is not None else 0.0
                 end_sec = repainting_end[i]
-                
+
                 if end_sec is not None and end_sec > start_sec:
                     # Repainting mode with outpainting support
                     # The target_wavs may have been padded for outpainting
                     # Need to calculate the actual position in the padded audio
-                    
+
                     # Calculate padding (if start < 0, there's left padding)
                     left_padding_sec = max(0, -start_sec)
-                    
+
                     # Adjust positions to account for padding
                     # In the padded audio, the original start is shifted by left_padding
                     adjusted_start_sec = start_sec + left_padding_sec
                     adjusted_end_sec = end_sec + left_padding_sec
-                    
+
                     # Convert seconds to latent frames (audio_frames / 1920 = latent_frames)
                     start_latent = int(adjusted_start_sec * self.sample_rate // 1920)
                     end_latent = int(adjusted_end_sec * self.sample_rate // 1920)
@@ -1932,7 +2037,7 @@ class AceStepHandler:
                     instruction_i = instructions[i] if instructions and i < len(instructions) else ""
                     instruction_lower = instruction_i.lower()
                     # Cover task instruction: "Generate audio semantic tokens based on the given conditions:"
-                    is_cover = ("generate audio semantic tokens" in instruction_lower and 
+                    is_cover = ("generate audio semantic tokens" in instruction_lower and
                                "based on the given conditions" in instruction_lower) or has_code_hint
                     is_covers.append(is_cover)
             else:
@@ -1944,13 +2049,13 @@ class AceStepHandler:
                 instruction_i = instructions[i] if instructions and i < len(instructions) else ""
                 instruction_lower = instruction_i.lower()
                 # Cover task instruction: "Generate audio semantic tokens based on the given conditions:"
-                is_cover = ("generate audio semantic tokens" in instruction_lower and 
+                is_cover = ("generate audio semantic tokens" in instruction_lower and
                            "based on the given conditions" in instruction_lower) or has_code_hint
                 is_covers.append(is_cover)
-        
+
         chunk_masks = torch.stack(chunk_masks)
         is_covers = torch.BoolTensor(is_covers).to(self.device)
-        
+
         # Create src_latents based on task type
         # For cover/extract/complete/lego/repaint tasks: src_latents = target_latents.clone() (if target_wavs provided)
         # For text2music task: src_latents = silence_latent (if no target_wavs or silence)
@@ -1961,12 +2066,12 @@ class AceStepHandler:
             # Check if target_wavs is provided and not silent (for extract/complete/lego/cover/repaint tasks)
             has_code_hint = audio_code_hints[i] is not None
             has_target_audio = has_code_hint or (target_wavs is not None and target_wavs[i].abs().sum() > 1e-6)
-            
+
             if has_target_audio:
                 # For tasks that use input audio (cover/extract/complete/lego/repaint)
                 # Check if this item has repainting
                 item_has_repainting = (i in repainting_ranges)
-                
+
                 if item_has_repainting:
                     # Repaint task: src_latents = target_latents with inpainting region replaced by silence_latent
                     # 1. Clone target_latents (encoded from src audio, preserving original audio)
@@ -1983,9 +2088,9 @@ class AceStepHandler:
                 # Text2music task: src_latents = silence_latent (no input audio)
                 # Use silence_latent for the full length
                 src_latents_list.append(silence_latent_tiled.clone())
-        
+
         src_latents = torch.stack(src_latents_list)
-        
+
         # Process audio_code_hints to generate precomputed_lm_hints_25Hz
         precomputed_lm_hints_25Hz_list = []
         for i in range(batch_size):
@@ -2014,7 +2119,7 @@ class AceStepHandler:
                     precomputed_lm_hints_25Hz_list.append(None)
             else:
                 precomputed_lm_hints_25Hz_list.append(None)
-        
+
         # Stack precomputed hints if any exist, otherwise set to None
         if any(h is not None for h in precomputed_lm_hints_25Hz_list):
             # For items without hints, use silence_latent as placeholder
@@ -2024,25 +2129,25 @@ class AceStepHandler:
             ])
         else:
             precomputed_lm_hints_25Hz = None
-        
+
         # Extract caption and language from metas if available (from LM CoT output)
         # Fallback to user-provided values if not in metas
         actual_captions, actual_languages = self._extract_caption_and_language(parsed_metas, captions, vocal_languages)
-        
+
         # Format text_inputs
         text_inputs = []
         text_token_idss = []
         text_attention_masks = []
         lyric_token_idss = []
         lyric_attention_masks = []
-        
+
         for i in range(batch_size):
             # Use custom instruction for this batch item
             instruction = self._format_instruction(instructions[i] if i < len(instructions) else DEFAULT_DIT_INSTRUCTION)
-            
+
             actual_caption = actual_captions[i]
             actual_language = actual_languages[i]
-            
+
             # Format text prompt with custom instruction (using LM-generated caption if available)
             text_prompt = SFT_GEN_PROMPT.format(instruction, actual_caption, parsed_metas[i])
 
@@ -2064,7 +2169,7 @@ class AceStepHandler:
             )
             text_token_ids = text_inputs_dict.input_ids[0]
             text_attention_mask = text_inputs_dict.attention_mask[0].bool()
-            
+
             # Format and tokenize lyrics (using LM-generated language if available)
             lyrics_text = self._format_lyrics(lyrics[i], actual_language)
             lyrics_inputs_dict = self.text_tokenizer(
@@ -2076,21 +2181,21 @@ class AceStepHandler:
             )
             lyric_token_ids = lyrics_inputs_dict.input_ids[0]
             lyric_attention_mask = lyrics_inputs_dict.attention_mask[0].bool()
-            
+
             # Build full text input
             text_input = text_prompt + "\n\n" + lyrics_text
-            
+
             text_inputs.append(text_input)
             text_token_idss.append(text_token_ids)
             text_attention_masks.append(text_attention_mask)
             lyric_token_idss.append(lyric_token_ids)
             lyric_attention_masks.append(lyric_attention_mask)
-            
+
         # Pad tokenized sequences
         max_text_length = max(len(seq) for seq in text_token_idss)
         padded_text_token_idss = self._pad_sequences(text_token_idss, max_text_length, self.text_tokenizer.pad_token_id)
         padded_text_attention_masks = self._pad_sequences(text_attention_masks, max_text_length, 0)
-        
+
         max_lyric_length = max(len(seq) for seq in lyric_token_idss)
         padded_lyric_token_idss = self._pad_sequences(lyric_token_idss, max_lyric_length, self.text_tokenizer.pad_token_id)
         padded_lyric_attention_masks = self._pad_sequences(lyric_attention_masks, max_lyric_length, 0)
@@ -2103,13 +2208,13 @@ class AceStepHandler:
             for i in range(batch_size):
                 # Use custom instruction for this batch item
                 instruction = self._format_instruction(DEFAULT_DIT_INSTRUCTION)
-                
+
                 # Extract caption from metas if available (from LM CoT output)
                 actual_caption = actual_captions[i]
-                
+
                 # Format text prompt with custom instruction (using LM-generated caption if available)
                 text_prompt = SFT_GEN_PROMPT.format(instruction, actual_caption, parsed_metas[i])
-                
+
                 # Tokenize text
                 text_inputs_dict = self.text_tokenizer(
                     text_prompt,
@@ -2122,10 +2227,10 @@ class AceStepHandler:
                 non_cover_text_attention_mask = text_inputs_dict.attention_mask[0].bool()
                 non_cover_text_input_ids.append(text_token_ids)
                 non_cover_text_attention_masks.append(non_cover_text_attention_mask)
-            
+
             padded_non_cover_text_input_ids = self._pad_sequences(non_cover_text_input_ids, max_text_length, self.text_tokenizer.pad_token_id)
             padded_non_cover_text_attention_masks = self._pad_sequences(non_cover_text_attention_masks, max_text_length, 0)
-        
+
         if audio_cover_strength < 1.0:
             assert padded_non_cover_text_input_ids is not None, "When audio_cover_strength < 1.0, padded_non_cover_text_input_ids must not be None"
             assert padded_non_cover_text_attention_masks is not None, "When audio_cover_strength < 1.0, padded_non_cover_text_attention_masks must not be None"
@@ -2161,11 +2266,11 @@ class AceStepHandler:
                 if torch.is_floating_point(v):
                     batch[k] = v.to(self.dtype)
         return batch
-    
+
     def infer_refer_latent(self, refer_audioss):
         refer_audio_order_mask = []
         refer_audio_latents = []
-        
+
         # Ensure silence_latent is on the correct device
         self._ensure_silence_latent_on_device()
 
@@ -2252,7 +2357,7 @@ class AceStepHandler:
         chunk_mask = chunk_mask.to(device).unsqueeze(-1).repeat(1, 1, target_latents.shape[2])
 
         spans = batch["spans"]
-        
+
         text_token_idss = batch["text_token_idss"]
         text_attention_mask = batch["text_attention_masks"]
         lyric_token_idss = batch["lyric_token_idss"]
@@ -2266,10 +2371,10 @@ class AceStepHandler:
             lyric_hidden_states = self.infer_lyric_embeddings(lyric_token_idss)
 
             is_covers = batch["is_covers"]
-            
+
             # Get precomputed hints from batch if available
             precomputed_lm_hints_25Hz = batch.get("precomputed_lm_hints_25Hz", None)
-            
+
             # Get non-cover text input ids and attention masks from batch if available
             non_cover_text_input_ids = batch.get("non_cover_text_input_ids", None)
             non_cover_text_attention_masks = batch.get("non_cover_text_attention_masks", None)
@@ -2300,7 +2405,7 @@ class AceStepHandler:
             non_cover_text_hidden_states,
             non_cover_text_attention_masks,
         )
-    
+
     @torch.no_grad()
     def service_generate(
         self,
@@ -2330,7 +2435,7 @@ class AceStepHandler:
 
         """
         Generate music from text inputs.
-        
+
         Args:
             captions: Text caption(s) describing the music (optional, can be empty strings)
             lyrics: Lyric text(s) (optional, can be empty strings)
@@ -2350,7 +2455,7 @@ class AceStepHandler:
             use_adg: Whether to use ADG (Adaptive Diffusion Guidance) (default: False)
             cfg_interval_start: Start of CFG interval (0.0-1.0, default: 0.0)
             cfg_interval_end: End of CFG interval (0.0-1.0, default: 1.0)
-            
+
         Returns:
             Dictionary containing:
             - pred_wavs: Generated audio tensors
@@ -2370,7 +2475,7 @@ class AceStepHandler:
                 infer_steps = 8
             # CFG parameters are not adjustable for dmd_gan (they will be ignored)
             # Note: guidance_scale, cfg_interval_start, cfg_interval_end are still passed but may be ignored by the model
-        
+
         # Convert single inputs to lists
         if isinstance(captions, str):
             captions = [captions]
@@ -2382,20 +2487,20 @@ class AceStepHandler:
             vocal_languages = [vocal_languages]
         if isinstance(metas, (str, dict)):
             metas = [metas]
-            
+
         # Convert repainting parameters to lists
         if isinstance(repainting_start, (int, float)):
             repainting_start = [repainting_start]
         if isinstance(repainting_end, (int, float)):
             repainting_end = [repainting_end]
-        
+
         # Get batch size from captions
         batch_size = len(captions)
 
         # Normalize instructions and audio_code_hints to match batch size
         instructions = self._normalize_instructions(instructions, batch_size, DEFAULT_DIT_INSTRUCTION) if instructions is not None else None
         audio_code_hints = self._normalize_audio_code_hints(audio_code_hints, batch_size) if audio_code_hints is not None else None
-        
+
         # Convert seed to list format
         if seed is None:
             seed_list = None
@@ -2415,7 +2520,7 @@ class AceStepHandler:
             seed_list = [int(seed)] * batch_size
 
         # Don't set global random seed here - each item will use its own seed
-        
+
         # Prepare batch
         batch = self._prepare_batch(
             captions=captions,
@@ -2431,9 +2536,9 @@ class AceStepHandler:
             audio_code_hints=audio_code_hints,
             audio_cover_strength=audio_cover_strength,
         )
-        
+
         processed_data = self.preprocess_batch(batch)
-        
+
         (
             keys,
             text_inputs,
@@ -2464,10 +2569,10 @@ class AceStepHandler:
             seed_param = seed_list
         else:
             seed_param = random.randint(0, 2**32 - 1)
-        
+
         # Ensure silence_latent is on the correct device before creating generate_kwargs
         self._ensure_silence_latent_on_device()
-        
+
         generate_kwargs = {
             "text_hidden_states": text_hidden_states,
             "text_attention_mask": text_attention_mask,
@@ -2513,29 +2618,29 @@ class AceStepHandler:
                 is_covers=is_covers,
                 precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
             )
-            
+
             outputs = self.model.generate_audio(**generate_kwargs)
-        
+
         # Add intermediate information to outputs for extra_outputs
         outputs["src_latents"] = src_latents
         outputs["target_latents_input"] = target_latents  # Input target latents (before generation)
         outputs["chunk_masks"] = chunk_mask
         outputs["spans"] = spans
         outputs["latent_masks"] = batch.get("latent_masks")  # Latent masks for valid length
-        
+
         # Add condition tensors for LRC timestamp generation
         outputs["encoder_hidden_states"] = encoder_hidden_states
         outputs["encoder_attention_mask"] = encoder_attention_mask
         outputs["context_latents"] = context_latents
         outputs["lyric_token_idss"] = lyric_token_idss
-        
+
         return outputs
 
     def tiled_decode(self, latents, chunk_size=512, overlap=64, offload_wav_to_cpu=True):
         """
         Decode latents using tiling to reduce VRAM usage.
         Uses overlap-discard strategy to avoid boundary artifacts.
-        
+
         Args:
             latents: [Batch, Channels, Length]
             chunk_size: Size of latent chunk to process at once
@@ -2543,7 +2648,7 @@ class AceStepHandler:
             offload_wav_to_cpu: If True, offload decoded wav audio to CPU immediately to save VRAM
         """
         B, C, T = latents.shape
-        
+
         # Check device type (handle both string and torch.device)
         device_type = self.device if isinstance(self.device, str) else self.device.type
         if device_type == "mps":
@@ -2559,7 +2664,7 @@ class AceStepHandler:
                     f"to {max_chunk_size} and overlap from {orig_overlap} to {overlap} "
                     f"to avoid MPS conv output limit."
                 )
-        
+
         # If short enough, decode directly
         if T <= chunk_size:
             # Decode and immediately extract .sample to avoid keeping DecoderOutput object
@@ -2572,63 +2677,63 @@ class AceStepHandler:
         stride = chunk_size - 2 * overlap
         if stride <= 0:
             raise ValueError(f"chunk_size {chunk_size} must be > 2 * overlap {overlap}")
-        
+
         num_steps = math.ceil(T / stride)
-        
+
         if offload_wav_to_cpu:
             # Optimized path: offload wav to CPU immediately to save VRAM
             return self._tiled_decode_offload_cpu(latents, B, T, stride, overlap, num_steps)
         else:
             # Default path: keep everything on GPU
             return self._tiled_decode_gpu(latents, B, T, stride, overlap, num_steps)
-    
+
     def _tiled_decode_gpu(self, latents, B, T, stride, overlap, num_steps):
         """Standard tiled decode keeping all data on GPU."""
         decoded_audio_list = []
         upsample_factor = None
-        
+
         for i in tqdm(range(num_steps), desc="Decoding audio chunks"):
             # Core range in latents
             core_start = i * stride
             core_end = min(core_start + stride, T)
-            
+
             # Window range (with overlap)
             win_start = max(0, core_start - overlap)
             win_end = min(T, core_end + overlap)
-            
+
             # Extract chunk
             latent_chunk = latents[:, :, win_start:win_end]
-            
+
             # Decode
             # [Batch, Channels, AudioSamples]
             decoder_output = self.vae.decode(latent_chunk)
             audio_chunk = decoder_output.sample
             del decoder_output
-            
+
             # Determine upsample factor from the first chunk
             if upsample_factor is None:
                 upsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-            
+
             # Calculate trim amounts in audio samples
             # How much overlap was added at the start?
             added_start = core_start - win_start  # latent frames
             trim_start = int(round(added_start * upsample_factor))
-            
+
             # How much overlap was added at the end?
             added_end = win_end - core_end  # latent frames
             trim_end = int(round(added_end * upsample_factor))
-            
+
             # Trim audio
             audio_len = audio_chunk.shape[-1]
             end_idx = audio_len - trim_end if trim_end > 0 else audio_len
-            
+
             audio_core = audio_chunk[:, :, trim_start:end_idx]
             decoded_audio_list.append(audio_core)
-            
+
         # Concatenate
         final_audio = torch.cat(decoded_audio_list, dim=-1)
         return final_audio
-    
+
     def _tiled_decode_offload_cpu(self, latents, B, T, stride, overlap, num_steps):
         """Optimized tiled decode that offloads to CPU immediately to save VRAM."""
         # First pass: decode first chunk to get upsample_factor and audio channels
@@ -2636,90 +2741,90 @@ class AceStepHandler:
         first_core_end = min(stride, T)
         first_win_start = 0
         first_win_end = min(T, first_core_end + overlap)
-        
+
         first_latent_chunk = latents[:, :, first_win_start:first_win_end]
         first_decoder_output = self.vae.decode(first_latent_chunk)
         first_audio_chunk = first_decoder_output.sample
         del first_decoder_output
-        
+
         upsample_factor = first_audio_chunk.shape[-1] / first_latent_chunk.shape[-1]
         audio_channels = first_audio_chunk.shape[1]
-        
+
         # Calculate total audio length and pre-allocate CPU tensor
         total_audio_length = int(round(T * upsample_factor))
-        final_audio = torch.zeros(B, audio_channels, total_audio_length, 
+        final_audio = torch.zeros(B, audio_channels, total_audio_length,
                                   dtype=first_audio_chunk.dtype, device='cpu')
-        
+
         # Process first chunk: trim and copy to CPU
         first_added_end = first_win_end - first_core_end
         first_trim_end = int(round(first_added_end * upsample_factor))
         first_audio_len = first_audio_chunk.shape[-1]
         first_end_idx = first_audio_len - first_trim_end if first_trim_end > 0 else first_audio_len
-        
+
         first_audio_core = first_audio_chunk[:, :, :first_end_idx]
         audio_write_pos = first_audio_core.shape[-1]
         final_audio[:, :, :audio_write_pos] = first_audio_core.cpu()
-        
+
         # Free GPU memory
         del first_audio_chunk, first_audio_core, first_latent_chunk
-        
+
         # Process remaining chunks
         for i in tqdm(range(1, num_steps), desc="Decoding audio chunks"):
             # Core range in latents
             core_start = i * stride
             core_end = min(core_start + stride, T)
-            
+
             # Window range (with overlap)
             win_start = max(0, core_start - overlap)
             win_end = min(T, core_end + overlap)
-            
+
             # Extract chunk
             latent_chunk = latents[:, :, win_start:win_end]
-            
+
             # Decode on GPU
             # [Batch, Channels, AudioSamples]
             decoder_output = self.vae.decode(latent_chunk)
             audio_chunk = decoder_output.sample
             del decoder_output
-            
+
             # Calculate trim amounts in audio samples
             added_start = core_start - win_start  # latent frames
             trim_start = int(round(added_start * upsample_factor))
-            
+
             added_end = win_end - core_end  # latent frames
             trim_end = int(round(added_end * upsample_factor))
-            
+
             # Trim audio
             audio_len = audio_chunk.shape[-1]
             end_idx = audio_len - trim_end if trim_end > 0 else audio_len
-            
+
             audio_core = audio_chunk[:, :, trim_start:end_idx]
-            
+
             # Copy to pre-allocated CPU tensor
             core_len = audio_core.shape[-1]
             final_audio[:, :, audio_write_pos:audio_write_pos + core_len] = audio_core.cpu()
             audio_write_pos += core_len
-            
+
             # Free GPU memory immediately
             del audio_chunk, audio_core, latent_chunk
-        
+
         # Trim to actual length (in case of rounding differences)
         final_audio = final_audio[:, :, :audio_write_pos]
-        
+
         return final_audio
-    
+
     def tiled_encode(self, audio, chunk_size=None, overlap=None, offload_latent_to_cpu=True):
         """
         Encode audio to latents using tiling to reduce VRAM usage.
         Uses overlap-discard strategy to avoid boundary artifacts.
-        
+
         Args:
             audio: Audio tensor [Batch, Channels, Samples] or [Channels, Samples]
-            chunk_size: Size of audio chunk to process at once (in samples). 
+            chunk_size: Size of audio chunk to process at once (in samples).
                        Default: 48000 * 30 = 1440000 (30 seconds at 48kHz)
             overlap: Overlap size in audio samples. Default: 48000 * 2 = 96000 (2 seconds)
             offload_latent_to_cpu: If True, offload encoded latents to CPU immediately to save VRAM
-            
+
         Returns:
             Latents tensor [Batch, Channels, T] (same format as vae.encode output)
         """
@@ -2732,14 +2837,14 @@ class AceStepHandler:
                 chunk_size = 48000 * 30  # 30 seconds for normal VRAM
         if overlap is None:
             overlap = 48000 * 2  # 2 seconds overlap
-        
+
         # Handle 2D input [Channels, Samples]
         input_was_2d = (audio.dim() == 2)
         if input_was_2d:
             audio = audio.unsqueeze(0)
-        
+
         B, C, S = audio.shape  # Batch, Channels, Samples
-        
+
         # If short enough, encode directly
         if S <= chunk_size:
             vae_input = audio.to(self.device).to(self.vae.dtype)
@@ -2748,69 +2853,69 @@ class AceStepHandler:
             if input_was_2d:
                 latents = latents.squeeze(0)
             return latents
-        
+
         # Calculate stride (core size)
         stride = chunk_size - 2 * overlap
         if stride <= 0:
             raise ValueError(f"chunk_size {chunk_size} must be > 2 * overlap {overlap}")
-        
+
         num_steps = math.ceil(S / stride)
-        
+
         if offload_latent_to_cpu:
             result = self._tiled_encode_offload_cpu(audio, B, S, stride, overlap, num_steps, chunk_size)
         else:
             result = self._tiled_encode_gpu(audio, B, S, stride, overlap, num_steps, chunk_size)
-        
+
         if input_was_2d:
             result = result.squeeze(0)
-        
+
         return result
-    
+
     def _tiled_encode_gpu(self, audio, B, S, stride, overlap, num_steps, chunk_size):
         """Standard tiled encode keeping all data on GPU."""
         encoded_latent_list = []
         downsample_factor = None
-        
+
         for i in tqdm(range(num_steps), desc="Encoding audio chunks"):
             # Core range in audio samples
             core_start = i * stride
             core_end = min(core_start + stride, S)
-            
+
             # Window range (with overlap)
             win_start = max(0, core_start - overlap)
             win_end = min(S, core_end + overlap)
-            
+
             # Extract chunk and move to GPU
             audio_chunk = audio[:, :, win_start:win_end].to(self.device).to(self.vae.dtype)
-            
+
             # Encode
             with torch.no_grad():
                 latent_chunk = self.vae.encode(audio_chunk).latent_dist.sample()
-            
+
             # Determine downsample factor from the first chunk
             if downsample_factor is None:
                 downsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-            
+
             # Calculate trim amounts in latent frames
             added_start = core_start - win_start  # audio samples
             trim_start = int(round(added_start / downsample_factor))
-            
+
             added_end = win_end - core_end  # audio samples
             trim_end = int(round(added_end / downsample_factor))
-            
+
             # Trim latent
             latent_len = latent_chunk.shape[-1]
             end_idx = latent_len - trim_end if trim_end > 0 else latent_len
-            
+
             latent_core = latent_chunk[:, :, trim_start:end_idx]
             encoded_latent_list.append(latent_core)
-            
+
             del audio_chunk
-        
+
         # Concatenate
         final_latents = torch.cat(encoded_latent_list, dim=-1)
         return final_latents
-    
+
     def _tiled_encode_offload_cpu(self, audio, B, S, stride, overlap, num_steps, chunk_size):
         """Optimized tiled encode that offloads latents to CPU immediately to save VRAM."""
         # First pass: encode first chunk to get downsample_factor and latent channels
@@ -2818,73 +2923,73 @@ class AceStepHandler:
         first_core_end = min(stride, S)
         first_win_start = 0
         first_win_end = min(S, first_core_end + overlap)
-        
+
         first_audio_chunk = audio[:, :, first_win_start:first_win_end].to(self.device).to(self.vae.dtype)
         with torch.no_grad():
             first_latent_chunk = self.vae.encode(first_audio_chunk).latent_dist.sample()
-        
+
         downsample_factor = first_audio_chunk.shape[-1] / first_latent_chunk.shape[-1]
         latent_channels = first_latent_chunk.shape[1]
-        
+
         # Calculate total latent length and pre-allocate CPU tensor
         total_latent_length = int(round(S / downsample_factor))
-        final_latents = torch.zeros(B, latent_channels, total_latent_length, 
+        final_latents = torch.zeros(B, latent_channels, total_latent_length,
                                    dtype=first_latent_chunk.dtype, device='cpu')
-        
+
         # Process first chunk: trim and copy to CPU
         first_added_end = first_win_end - first_core_end
         first_trim_end = int(round(first_added_end / downsample_factor))
         first_latent_len = first_latent_chunk.shape[-1]
         first_end_idx = first_latent_len - first_trim_end if first_trim_end > 0 else first_latent_len
-        
+
         first_latent_core = first_latent_chunk[:, :, :first_end_idx]
         latent_write_pos = first_latent_core.shape[-1]
         final_latents[:, :, :latent_write_pos] = first_latent_core.cpu()
-        
+
         # Free GPU memory
         del first_audio_chunk, first_latent_chunk, first_latent_core
-        
+
         # Process remaining chunks
         for i in tqdm(range(1, num_steps), desc="Encoding audio chunks"):
             # Core range in audio samples
             core_start = i * stride
             core_end = min(core_start + stride, S)
-            
+
             # Window range (with overlap)
             win_start = max(0, core_start - overlap)
             win_end = min(S, core_end + overlap)
-            
+
             # Extract chunk and move to GPU
             audio_chunk = audio[:, :, win_start:win_end].to(self.device).to(self.vae.dtype)
-            
+
             # Encode on GPU
             with torch.no_grad():
                 latent_chunk = self.vae.encode(audio_chunk).latent_dist.sample()
-            
+
             # Calculate trim amounts in latent frames
             added_start = core_start - win_start  # audio samples
             trim_start = int(round(added_start / downsample_factor))
-            
+
             added_end = win_end - core_end  # audio samples
             trim_end = int(round(added_end / downsample_factor))
-            
+
             # Trim latent
             latent_len = latent_chunk.shape[-1]
             end_idx = latent_len - trim_end if trim_end > 0 else latent_len
-            
+
             latent_core = latent_chunk[:, :, trim_start:end_idx]
-            
+
             # Copy to pre-allocated CPU tensor
             core_len = latent_core.shape[-1]
             final_latents[:, :, latent_write_pos:latent_write_pos + core_len] = latent_core.cpu()
             latent_write_pos += core_len
-            
+
             # Free GPU memory immediately
             del audio_chunk, latent_chunk, latent_core
-        
+
         # Trim to actual length (in case of rounding differences)
         final_latents = final_latents[:, :, :latent_write_pos]
-        
+
         return final_latents
 
     def generate_music(
@@ -2920,7 +3025,7 @@ class AceStepHandler:
     ) -> Dict[str, Any]:
         """
         Main interface for music generation
-        
+
         Returns:
             Dictionary containing:
             - audios: List of audio dictionaries with path, key, params
@@ -2962,7 +3067,7 @@ class AceStepHandler:
         if progress:
             progress(0.51, desc="Preparing inputs...")
         logger.info("[generate_music] Preparing inputs...")
-        
+
         # Reset offload cost
         self.current_offload_cost = 0.0
 
@@ -2972,7 +3077,7 @@ class AceStepHandler:
         actual_batch_size = max(1, actual_batch_size)  # Ensure at least 1
 
         actual_seed_list, seed_value_for_ui = self.prepare_seeds(actual_batch_size, seed, use_random_seed)
-        
+
         # Convert special values to None
         if audio_duration is not None and float(audio_duration) <= 0:
             audio_duration = None
@@ -2980,7 +3085,7 @@ class AceStepHandler:
         #     seed = None
         if repainting_end is not None and float(repainting_end) < 0:
             repainting_end = None
-            
+
         try:
             # 1. Process reference audio
             refer_audios = None
@@ -2993,7 +3098,7 @@ class AceStepHandler:
                     refer_audios = [[processed_ref_audio] for _ in range(actual_batch_size)]
             else:
                 refer_audios = [[torch.zeros(2, 30*self.sample_rate)] for _ in range(actual_batch_size)]
-            
+
             # 2. Process source audio
             # If audio_code_string is provided, ignore src_audio and use codes instead
             processed_src_audio = None
@@ -3004,7 +3109,7 @@ class AceStepHandler:
                 else:
                     logger.info("[generate_music] Processing source audio...")
                     processed_src_audio = self.process_src_audio(src_audio)
-                
+
             # 3. Prepare batch data
             captions_batch, instructions_batch, lyrics_batch, vocal_languages_batch, metas_batch = self.prepare_batch_data(
                 actual_batch_size,
@@ -3018,9 +3123,9 @@ class AceStepHandler:
                 key_scale,
                 time_signature
             )
-            
+
             is_repaint_task, is_lego_task, is_cover_task, can_use_repainting = self.determine_task_type(task_type, audio_code_string)
-            
+
             repainting_start_batch, repainting_end_batch, target_wavs_tensor = self.prepare_padding_info(
                 actual_batch_size,
                 processed_src_audio,
@@ -3032,9 +3137,9 @@ class AceStepHandler:
                 is_cover_task,
                 can_use_repainting
             )
-            
+
             progress(0.52, desc=f"Generating music (batch size: {actual_batch_size})...")
-            
+
             # Prepare audio_code_hints - use if audio_code_string is provided
             # This works for both text2music (auto-switched to cover) and cover tasks
             audio_code_hints_batch = None
@@ -3068,7 +3173,7 @@ class AceStepHandler:
                 return_intermediate=should_return_intermediate,
                 timesteps=timesteps,  # Pass custom timesteps if provided
             )
-            
+
             logger.info("[generate_music] Model generation completed. Decoding latents...")
             pred_latents = outputs["target_latents"]  # [batch, latent_length, latent_dim]
             time_costs = outputs["time_costs"]
@@ -3078,25 +3183,25 @@ class AceStepHandler:
             if progress:
                 progress(0.8, desc="Decoding audio...")
             logger.info("[generate_music] Decoding latents with VAE...")
-            
+
             # Decode latents to audio
             start_time = time.time()
             with torch.no_grad():
                 with self._load_model_context("vae"):
                     # Move pred_latents to CPU early to save VRAM (will be used in extra_outputs later)
                     pred_latents_cpu = pred_latents.detach().cpu()
-                    
+
                     # Transpose for VAE decode: [batch, latent_length, latent_dim] -> [batch, latent_dim, latent_length]
                     pred_latents_for_decode = pred_latents.transpose(1, 2).contiguous()
                     # Ensure input is in VAE's dtype
                     pred_latents_for_decode = pred_latents_for_decode.to(self.vae.dtype)
-                    
+
                     # Release original pred_latents to free VRAM before VAE decode
                     del pred_latents
                     self._empty_cache()
-                    
+
                     logger.debug(f"[generate_music] Before VAE decode: allocated={self._memory_allocated()/1024**3:.2f}GB, max={self._max_memory_allocated()/1024**3:.2f}GB")
-                    
+
                     if use_tiled_decode:
                         logger.info("[generate_music] Using tiled VAE decode to reduce VRAM usage...")
                         pred_wavs = self.tiled_decode(pred_latents_for_decode)  # [batch, channels, samples]
@@ -3104,60 +3209,60 @@ class AceStepHandler:
                         decoder_output = self.vae.decode(pred_latents_for_decode)
                         pred_wavs = decoder_output.sample
                         del decoder_output
-                    
+
                     logger.debug(f"[generate_music] After VAE decode: allocated={self._memory_allocated()/1024**3:.2f}GB, max={self._max_memory_allocated()/1024**3:.2f}GB")
-                    
+
                     # Release pred_latents_for_decode after decode
                     del pred_latents_for_decode
-                    
+
                     # Cast output to float32 for audio processing/saving (in-place if possible)
                     if pred_wavs.dtype != torch.float32:
                         pred_wavs = pred_wavs.float()
-                    
+
                     # Anti-clipping normalization: scale down audio that exceeds [-1, 1] range
                     # Uses 5*std as an estimate of peak amplitude; if already within range, leave unchanged
                     std = torch.std(pred_wavs, dim=[1, 2], keepdim=True) * 5.0
                     std[std < 1.0] = 1.0
                     pred_wavs /= std
-                    
+
                     self._empty_cache()
             end_time = time.time()
             time_costs["vae_decode_time_cost"] = end_time - start_time
             time_costs["total_time_cost"] = time_costs["total_time_cost"] + time_costs["vae_decode_time_cost"]
-            
+
             # Update offload cost one last time to include VAE offloading
             time_costs["offload_time_cost"] = self.current_offload_cost
-            
+
             logger.info("[generate_music] VAE decode completed. Preparing audio tensors...")
             if progress:
                 progress(0.99, desc="Preparing audio data...")
-            
+
             # Prepare audio tensors (no file I/O here, no UUID generation)
             # pred_wavs is already [batch, channels, samples] format
             # Move to CPU and convert to float32 for return
             audio_tensors = []
-            
+
             for i in range(actual_batch_size):
                 # Extract audio tensor: [channels, samples] format, CPU, float32
                 audio_tensor = pred_wavs[i].cpu().float()
                 audio_tensors.append(audio_tensor)
-            
+
             status_message = f"✅ Generation completed successfully!"
             logger.info(f"[generate_music] Done! Generated {len(audio_tensors)} audio tensors.")
-            
+
             # Extract intermediate information from outputs
             src_latents = outputs.get("src_latents")  # [batch, T, D]
             target_latents_input = outputs.get("target_latents_input")  # [batch, T, D]
             chunk_masks = outputs.get("chunk_masks")  # [batch, T]
             spans = outputs.get("spans", [])  # List of tuples
             latent_masks = outputs.get("latent_masks")  # [batch, T]
-            
+
             # Extract condition tensors for LRC timestamp generation
             encoder_hidden_states = outputs.get("encoder_hidden_states")
             encoder_attention_mask = outputs.get("encoder_attention_mask")
             context_latents = outputs.get("context_latents")
             lyric_token_idss = outputs.get("lyric_token_idss")
-            
+
             # Move all tensors to CPU to save VRAM (detach to release computation graph)
             extra_outputs = {
                 "pred_latents": pred_latents_cpu,  # Already moved to CPU earlier to save VRAM during VAE decode
@@ -3174,7 +3279,7 @@ class AceStepHandler:
                 "context_latents": context_latents.detach().cpu() if context_latents is not None else None,
                 "lyric_token_idss": lyric_token_idss.detach().cpu() if lyric_token_idss is not None else None,
             }
-            
+
             # Build audios list with tensor data (no file paths, no UUIDs, handled outside)
             audios = []
             for idx, audio_tensor in enumerate(audio_tensors):
@@ -3183,7 +3288,7 @@ class AceStepHandler:
                     "sample_rate": self.sample_rate,
                 }
                 audios.append(audio_dict)
-            
+
             return {
                 "audios": audios,
                 "status_message": status_message,
@@ -3219,10 +3324,10 @@ class AceStepHandler:
     ) -> Dict[str, Any]:
         """
         Generate lyrics timestamps from generated audio latents using cross-attention alignment.
-        
+
         This method adds noise to the final pred_latent and re-infers one step to get
         cross-attention matrices, then uses DTW to align lyrics tokens with audio frames.
-        
+
         Args:
             pred_latent: Generated latent tensor [batch, T, D]
             encoder_hidden_states: Cached encoder hidden states
@@ -3234,7 +3339,7 @@ class AceStepHandler:
             inference_steps: Number of inference steps (for noise level calculation)
             seed: Random seed for noise generation
             custom_layers_config: Dict mapping layer indices to head indices
-            
+
         Returns:
             Dict containing:
             - lrc_text: LRC formatted lyrics with timestamps
@@ -3244,7 +3349,7 @@ class AceStepHandler:
             - error: Error message if failed
         """
         from transformers.cache_utils import EncoderDecoderCache, DynamicCache
-        
+
         if self.model is None:
             return {
                 "lrc_text": "",
@@ -3253,28 +3358,28 @@ class AceStepHandler:
                 "success": False,
                 "error": "Model not initialized"
             }
-        
+
         if custom_layers_config is None:
             custom_layers_config = self.custom_layers_config
-        
+
         try:
             # Move tensors to device
             device = self.device
             dtype = self.dtype
-            
+
             pred_latent = pred_latent.to(device=device, dtype=dtype)
             encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=dtype)
             encoder_attention_mask = encoder_attention_mask.to(device=device, dtype=dtype)
             context_latents = context_latents.to(device=device, dtype=dtype)
-            
+
             bsz = pred_latent.shape[0]
-            
+
             # Calculate noise level: t_last = 1.0 / inference_steps
             t_last_val = 1.0 / inference_steps
             t_curr_tensor = torch.tensor([t_last_val] * bsz, device=device, dtype=dtype)
-            
+
             x1 = pred_latent
-            
+
             # Generate noise
             if seed is None:
                 x0 = torch.randn_like(x1)
@@ -3283,13 +3388,13 @@ class AceStepHandler:
                 gen_device = "cpu" if (isinstance(device, str) and device == "mps") or (hasattr(device, 'type') and device.type == "mps") else device
                 generator = torch.Generator(device=gen_device).manual_seed(int(seed))
                 x0 = torch.randn(x1.shape, generator=generator, device=gen_device, dtype=dtype).to(device)
-            
+
             # Add noise to pred_latent: xt = t * noise + (1 - t) * x1
             xt = t_last_val * x0 + (1.0 - t_last_val) * x1
 
             xt_in = xt
             t_in = t_curr_tensor
-            
+
             # Get null condition embedding
             encoder_hidden_states_in = encoder_hidden_states
             encoder_attention_mask_in = encoder_attention_mask
@@ -3298,7 +3403,7 @@ class AceStepHandler:
             attention_mask = torch.ones(bsz, latent_length, device=device, dtype=dtype)
             attention_mask_in = attention_mask
             past_key_values = None
-            
+
             # Run decoder with output_attentions=True
             with self._load_model_context("model"):
                 decoder = self.model.decoder
@@ -3316,7 +3421,7 @@ class AceStepHandler:
                     custom_layers_config=custom_layers_config,
                     enable_early_exit=True
                 )
-                
+
                 # Extract cross-attention matrices
                 if decoder_outputs[2] is None:
                     return {
@@ -3326,9 +3431,9 @@ class AceStepHandler:
                         "success": False,
                         "error": "Model did not return attentions"
                     }
-                
+
                 cross_attns = decoder_outputs[2]  # Tuple of tensors (some may be None)
-                
+
                 captured_layers_list = []
                 for layer_attn in cross_attns:
                     # Skip None values (layers that didn't return attention)
@@ -3338,7 +3443,7 @@ class AceStepHandler:
                     cond_attn = layer_attn[:bsz]
                     layer_matrix = cond_attn.transpose(-1, -2)
                     captured_layers_list.append(layer_matrix)
-                
+
                 if not captured_layers_list:
                     return {
                         "lrc_text": "",
@@ -3347,36 +3452,36 @@ class AceStepHandler:
                         "success": False,
                         "error": "No valid attention layers returned"
                     }
-                
+
                 stacked = torch.stack(captured_layers_list)
                 if bsz == 1:
                     all_layers_matrix = stacked.squeeze(1)
                 else:
                     all_layers_matrix = stacked
-            
+
             # Process lyric token IDs to extract pure lyrics
             if isinstance(lyric_token_ids, torch.Tensor):
                 raw_lyric_ids = lyric_token_ids[0].tolist()
             else:
                 raw_lyric_ids = lyric_token_ids
-            
+
             # Parse header to find lyrics start position
             header_str = f"# Languages\n{vocal_language}\n\n# Lyric\n"
             header_ids = self.text_tokenizer.encode(header_str, add_special_tokens=False)
             start_idx = len(header_ids)
-            
+
             # Find end of lyrics (before endoftext token)
             try:
                 end_idx = raw_lyric_ids.index(151643)  # <|endoftext|> token
             except ValueError:
                 end_idx = len(raw_lyric_ids)
-            
+
             pure_lyric_ids = raw_lyric_ids[start_idx:end_idx]
             pure_lyric_matrix = all_layers_matrix[:, :, start_idx:end_idx, :]
-            
+
             # Create aligner and generate timestamps
             aligner = MusicStampsAligner(self.text_tokenizer)
-            
+
             align_info = aligner.stamps_align_info(
                 attention_matrix=pure_lyric_matrix,
                 lyrics_tokens=pure_lyric_ids,
@@ -3386,7 +3491,7 @@ class AceStepHandler:
                 violence_level=2.0,
                 medfilt_width=1,
             )
-            
+
             if align_info.get("calc_matrix") is None:
                 return {
                     "lrc_text": "",
@@ -3395,14 +3500,14 @@ class AceStepHandler:
                     "success": False,
                     "error": align_info.get("error", "Failed to process attention matrix")
                 }
-            
+
             # Generate timestamps
             result = aligner.get_timestamps_and_lrc(
                 calc_matrix=align_info["calc_matrix"],
                 lyrics_tokens=pure_lyric_ids,
                 total_duration_seconds=total_duration_seconds
             )
-            
+
             return {
                 "lrc_text": result["lrc_text"],
                 "sentence_timestamps": result["sentence_timestamps"],
@@ -3410,7 +3515,7 @@ class AceStepHandler:
                 "success": True,
                 "error": None
             }
-            
+
         except Exception as e:
             error_msg = f"Error generating timestamps: {str(e)}"
             logger.exception("[get_lyric_timestamp] Failed")
