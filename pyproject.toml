@@ -46,6 +46,11 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
@@ -67,6 +72,9 @@ torchvision = [
 ]
 torchaudio = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchao = [
+    { index = "pypi" },
 ]
 
 [project.scripts]
