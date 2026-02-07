@@ -34,7 +34,7 @@ dependencies = [
     "numba>=0.63.1",
     "vector-quantize-pytorch>=1.27.15",
     "torchcodec<=0.9.1; sys_platform != 'darwin'",
-    "torchao",
+    "torchao===0.15.0",
     "toml",
     # Training dependencies
     "peft>=0.7.0",
