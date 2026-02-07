@@ -39,6 +39,40 @@ class LoRAConfig:
 
 
 @dataclass
+class LoKRConfig:
+    linear_dim: int = 64
+    linear_alpha: int = 128
+    factor: int = -1
+    decompose_both: bool = False
+    use_tucker: bool = False
+    use_scalar: bool = False
+    weight_decompose: bool = False
+    target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj"
+    ])
+    full_matrix: bool = False
+    bypass_mode: bool = False
+    rs_lora: bool = False
+    unbalanced_factorization: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "linear_dim": self.linear_dim,
+            "linear_alpha": self.linear_alpha,
+            "factor": self.factor,
+            "decompose_both": self.decompose_both,
+            "use_tucker": self.use_tucker,
+            "use_scalar": self.use_scalar,
+            "weight_decompose": self.weight_decompose,
+            "target_modules": self.target_modules,
+            "full_matrix": self.full_matrix,
+            "bypass_mode": self.bypass_mode,
+            "rs_lora": self.rs_lora,
+            "unbalanced_factorization": self.unbalanced_factorization,
+        }
+
+
+@dataclass
 class TrainingConfig:
     """Configuration for LoRA training process.
     

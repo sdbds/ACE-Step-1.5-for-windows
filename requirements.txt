@@ -48,3 +48,4 @@ xxhash
 # nano-vllm
 lightning-fabric
 tensorboard
+git+https://github.com/sdbds/LyCORIS

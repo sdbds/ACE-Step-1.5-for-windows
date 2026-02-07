@@ -656,6 +656,25 @@ class StartTrainingRequest(BaseModel):
     use_fp8: bool = Field(default=False, description="Use FP8 quantization for decoder weights (reduces VRAM, requires Ada/Hopper GPU)")
 
 
+class StartLoKRTrainingRequest(BaseModel):
+    tensor_dir: str = Field(..., description="Directory with preprocessed tensors")
+    lokr_linear_dim: int = Field(default=64, ge=1, le=256, description="LoKR linear dimension")
+    lokr_linear_alpha: int = Field(default=128, ge=1, le=512, description="LoKR linear alpha")
+    lokr_factor: int = Field(default=-1, description="Kronecker factor (-1 = auto)")
+    lokr_decompose_both: bool = Field(default=False, description="Decompose both matrices")
+    lokr_use_tucker: bool = Field(default=False, description="Use Tucker decomposition")
+    lokr_use_scalar: bool = Field(default=False, description="Use scalar calibration")
+    lokr_weight_decompose: bool = Field(default=False, description="Enable DoRA mode")
+    learning_rate: float = Field(default=1e-4, gt=0.0, description="Learning rate")
+    train_epochs: int = Field(default=10, ge=1, description="Training epochs")
+    train_batch_size: int = Field(default=1, ge=1, description="Batch size")
+    gradient_accumulation: int = Field(default=4, ge=1, description="Gradient accumulation steps")
+    save_every_n_epochs: int = Field(default=5, ge=1, description="Save checkpoint every N epochs")
+    training_shift: float = Field(default=3.0, ge=0.0, description="Training timestep shift")
+    training_seed: int = Field(default=42, description="Random seed")
+    output_dir: str = Field(default="./lokr_output", description="Output directory")
+
+
 class ExportLoRARequest(BaseModel):
     export_path: str = Field(..., description="Export destination path")
     lora_output_dir: str = Field(..., description="Training output directory")
@@ -3662,6 +3681,205 @@ def create_app() -> FastAPI:
         except Exception as e:
             training_state["is_training"] = False
             return _wrap_response(None, code=500, error=f"Failed to start training: {str(e)}")
+
+    @app.post("/v1/training/start_lokr")
+    async def start_lokr_training(request: StartLoKRTrainingRequest, _: None = Depends(verify_api_key)):
+        """Start LoKR training from preprocessed tensors."""
+        training_state = app.state.training_state
+
+        if training_state.get("is_training", False):
+            raise HTTPException(status_code=400, detail="Training already in progress")
+
+        handler: AceStepHandler = app.state.handler
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+
+        if not hasattr(handler.model, 'decoder') or handler.model.decoder is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
+            )
+
+        # Move decoder to GPU if on CPU
+        try:
+            first_param = next(handler.model.decoder.parameters(), None)
+            if first_param is not None and first_param.device.type == "cpu":
+                handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Unload unnecessary components to free VRAM
+        try:
+            import gc
+            components_unloaded = []
+
+            llm: LLMHandler = app.state.llm_handler
+            if llm and llm.llm_initialized:
+                llm.llm = None
+                llm.llm_tokenizer = None
+                llm.llm_initialized = False
+                components_unloaded.append("LLM")
+
+            if handler.vae is not None:
+                handler.vae = None
+                components_unloaded.append("VAE")
+
+            if handler.text_encoder is not None:
+                handler.text_encoder = None
+                handler.text_tokenizer = None
+                components_unloaded.append("Text Encoder")
+
+            if handler.model is not None and hasattr(handler.model, 'encoder') and handler.model.encoder is not None:
+                handler.model.encoder = None
+                components_unloaded.append("Model Encoder")
+
+            if components_unloaded:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        try:
+            from acestep.training.trainer import LoKRTrainer
+            from acestep.training.configs import LoKRConfig as LoKRConfigClass, TrainingConfig
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
+
+        try:
+            lokr_config = LoKRConfigClass(
+                linear_dim=request.lokr_linear_dim,
+                linear_alpha=request.lokr_linear_alpha,
+                factor=request.lokr_factor,
+                decompose_both=request.lokr_decompose_both,
+                use_tucker=request.lokr_use_tucker,
+                use_scalar=request.lokr_use_scalar,
+                weight_decompose=request.lokr_weight_decompose,
+            )
+
+            training_config = TrainingConfig(
+                shift=request.training_shift,
+                learning_rate=request.learning_rate,
+                batch_size=request.train_batch_size,
+                gradient_accumulation_steps=request.gradient_accumulation,
+                max_epochs=request.train_epochs,
+                save_every_n_epochs=request.save_every_n_epochs,
+                seed=request.training_seed,
+                output_dir=request.output_dir,
+            )
+
+            trainer = LoKRTrainer(
+                dit_handler=handler,
+                lokr_config=lokr_config,
+                training_config=training_config,
+            )
+
+            tensorboard_logdir = os.path.join(request.output_dir, "logs")
+            os.makedirs(tensorboard_logdir, exist_ok=True)
+
+            import time as _time
+            training_state["is_training"] = True
+            training_state["should_stop"] = False
+            training_state["trainer"] = trainer
+            training_state["tensor_dir"] = request.tensor_dir
+            training_state["tensorboard_logdir"] = tensorboard_logdir
+            training_state["loss_history"] = []
+            training_state["training_log"] = ""
+            training_state["start_time"] = _time.time()
+            training_state["current_epoch"] = 0
+            training_state["last_step_time"] = _time.time()
+            training_state["steps_per_second"] = 0.0
+            training_state["estimated_time_remaining"] = 0.0
+            training_state["config"] = {
+                "adapter_type": "lokr",
+                "lokr_linear_dim": request.lokr_linear_dim,
+                "lokr_linear_alpha": request.lokr_linear_alpha,
+                "learning_rate": request.learning_rate,
+                "epochs": request.train_epochs,
+            }
+
+            # Start TensorBoard server if not already running
+            if not hasattr(app.state, 'tensorboard_process') or app.state.tensorboard_process is None:
+                try:
+                    import subprocess
+                    tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
+                    app.state.tensorboard_process = subprocess.Popen(
+                        ["tensorboard", "--logdir", request.output_dir, "--port", str(tensorboard_port), "--bind_all"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+                except Exception:
+                    training_state["tensorboard_url"] = None
+            else:
+                tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
+                training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+
+            def _run_lokr_training_sync():
+                """Run LoKR training synchronously in thread pool."""
+                try:
+                    for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
+                        training_state["current_step"] = step
+                        training_state["current_loss"] = loss
+                        training_state["status"] = status
+
+                        if step > 0 and loss is not None and loss == loss:
+                            training_state["loss_history"].append({"step": step, "loss": float(loss)})
+                            if len(training_state["loss_history"]) > 1000:
+                                training_state["loss_history"] = training_state["loss_history"][-1000:]
+
+                            import re
+                            epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
+                            if epoch_match:
+                                training_state["current_epoch"] = int(epoch_match.group(1))
+
+                            current_time = _time.time()
+                            if step > 1:
+                                elapsed_since_last = current_time - training_state["last_step_time"]
+                                if elapsed_since_last > 0:
+                                    training_state["steps_per_second"] = 1.0 / elapsed_since_last
+
+                                    total_epochs = training_state["config"]["epochs"]
+                                    if training_state["current_epoch"] > 0:
+                                        steps_per_epoch = step / training_state["current_epoch"]
+                                        total_steps = int(steps_per_epoch * total_epochs)
+                                        remaining_steps = total_steps - step
+                                        training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
+
+                            training_state["last_step_time"] = current_time
+
+                            log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
+                            if training_state["training_log"]:
+                                training_state["training_log"] += "\n" + log_entry
+                            else:
+                                training_state["training_log"] = log_entry
+                            log_lines = training_state["training_log"].split("\n")
+                            if len(log_lines) > 100:
+                                training_state["training_log"] = "\n".join(log_lines[-100:])
+
+                        if training_state.get("should_stop", False):
+                            break
+
+                    training_state["is_training"] = False
+                except Exception as e:
+                    training_state["is_training"] = False
+                    training_state["error"] = str(e)
+
+            executor: ThreadPoolExecutor = app.state.executor
+            executor.submit(_run_lokr_training_sync)
+
+            return _wrap_response({
+                "message": "LoKR training started",
+                "tensor_dir": request.tensor_dir,
+                "output_dir": request.output_dir,
+                "config": training_state["config"],
+            })
+
+        except Exception as e:
+            training_state["is_training"] = False
+            return _wrap_response(None, code=500, error=f"Failed to start LoKR training: {str(e)}")
 
     @app.post("/v1/training/stop")
     async def stop_training(_: None = Depends(verify_api_key)):
