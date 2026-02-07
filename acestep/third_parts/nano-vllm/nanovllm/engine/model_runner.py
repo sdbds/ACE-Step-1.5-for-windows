@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 import sys
 
 from nanovllm.config import Config
+from acestep.debug_utils import debug_start, debug_end
 
 # Debug logging - enable with NANOVLLM_DEBUG=1
 _DEBUG = os.environ.get("NANOVLLM_DEBUG", "0") == "1"
@@ -98,7 +99,9 @@ class ModelRunner:
         torch.set_default_dtype(config_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
+        _t0 = debug_start("load_model", prefix="tensor.vllm")
         load_model(self.model, config.model)
+        debug_end("load_model", _t0, prefix="tensor.vllm")
         self.sampler = Sampler()
         
         # Pre-allocate buffers for sampling (optimization: avoid repeated tensor creation)
@@ -124,6 +127,7 @@ class ModelRunner:
 
     def _allocate_sample_buffers(self):
         """Pre-allocate reusable buffers for sampling to avoid repeated tensor creation."""
+        _t0 = debug_start("_allocate_sample_buffers", prefix="tensor.vllm")
         max_bs = self.config.max_num_seqs
         max_tokens = self.config.max_num_batched_tokens
         max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
@@ -154,6 +158,7 @@ class ModelRunner:
         # Pre-allocate buffer for sequence token IDs (used in logits processor and sampler)
         # Max length is max_model_len since sequences can be that long
         self._seq_token_ids_buffer = torch.zeros(max_bs, self.config.max_model_len, dtype=torch.int64, device="cpu", pin_memory=True)
+        debug_end("_allocate_sample_buffers", _t0, prefix="tensor.vllm")
 
     def exit(self):
         if self.world_size > 1:
@@ -197,6 +202,7 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
+        _t0 = debug_start("warmup_model", prefix="tensor.vllm")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -204,8 +210,10 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
+        debug_end("warmup_model", _t0, prefix="tensor.vllm")
 
     def allocate_kv_cache(self):
+        _t0 = debug_start("allocate_kv_cache", prefix="tensor.vllm")
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -247,14 +255,18 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        debug_end("allocate_kv_cache", _t0, prefix="tensor.vllm")
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        _t0 = debug_start("prepare_block_tables", prefix="tensor.vllm")
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        debug_end("prepare_block_tables", _t0, prefix="tensor.vllm")
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        _t0 = debug_start("prepare_prefill", prefix="tensor.vllm")
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -290,10 +302,12 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        debug_end("prepare_prefill", _t0, prefix="tensor.vllm")
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         """Optimized decode preparation using pre-allocated buffers."""
+        _t0 = debug_start("prepare_decode", prefix="tensor.vllm")
         bs = len(seqs)
         
         # Use pre-allocated CPU buffers
@@ -310,10 +324,12 @@ class ModelRunner:
         context_lens = self._cpu_context_lens[:bs].cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        debug_end("prepare_decode", _t0, prefix="tensor.vllm")
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence], is_cfg_batch: bool = False):
         """Optimized sample preparation using pre-allocated buffers."""
+        _t0 = debug_start("prepare_sample", prefix="tensor.vllm")
         if is_cfg_batch:
             num_seqs = len(seqs) // 2
             target_seqs = seqs[:num_seqs]
@@ -345,13 +361,17 @@ class ModelRunner:
         top_ps = self._cpu_top_ps[:num_seqs].cuda(non_blocking=True) if not top_ps_is_one else None
         repetition_penalties = self._cpu_repetition_penalties[:num_seqs].cuda(non_blocking=True) if not repetition_penalties_is_one else None
         
+        debug_end("prepare_sample", _t0, prefix="tensor.vllm")
         return temperatures, cfg_scales, top_ks, top_ps, repetition_penalties
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        _t0 = debug_start("run_model", prefix="tensor.vllm")
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             _debug_log(f"run_model: eager mode, is_prefill={is_prefill}, bs={input_ids.size(0)}")
-            return self.model.compute_logits(self.model(input_ids, positions))
+            out = self.model.compute_logits(self.model(input_ids, positions))
+            debug_end("run_model", _t0, prefix="tensor.vllm")
+            return out
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -370,20 +390,26 @@ class ModelRunner:
             if context.block_tables.size(1) > max_num_blocks:
                 # Fall back to eager mode when block_tables is too large for CUDA graph
                 _debug_log(f"  fallback: block_tables cols {context.block_tables.size(1)} > max {max_num_blocks}")
-                return self.model.compute_logits(self.model(input_ids, positions))
+                out = self.model.compute_logits(self.model(input_ids, positions))
+                debug_end("run_model", _t0, prefix="tensor.vllm")
+                return out
             
             # Fix: Also check if block_tables row count matches batch size
             # Dimension mismatch can cause CUDA illegal memory access during graph replay
             if context.block_tables.size(0) != bs:
                 # Fall back to eager mode when block_tables row count doesn't match batch size
                 _debug_log(f"  fallback: block_tables rows {context.block_tables.size(0)} != bs {bs}")
-                return self.model.compute_logits(self.model(input_ids, positions))
+                out = self.model.compute_logits(self.model(input_ids, positions))
+                debug_end("run_model", _t0, prefix="tensor.vllm")
+                return out
             
             # Fix: Verify slot_mapping and context_lens dimensions match batch size
             if context.slot_mapping.size(0) != bs or context.context_lens.size(0) != bs:
                 # Fall back to eager mode when dimensions don't match
                 _debug_log(f"  fallback: slot_mapping/context_lens size mismatch")
-                return self.model.compute_logits(self.model(input_ids, positions))
+                out = self.model.compute_logits(self.model(input_ids, positions))
+                debug_end("run_model", _t0, prefix="tensor.vllm")
+                return out
             
             # Validate block_tables values
             if _DEBUG:
@@ -408,7 +434,9 @@ class ModelRunner:
             
             _debug_log(f"  executing CUDA graph replay for bs={bs}")
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            out = self.model.compute_logits(graph_vars["outputs"][:bs])
+            debug_end("run_model", _t0, prefix="tensor.vllm")
+            return out
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run model forward and sampling. For CFG sequences, batch is structured as:
@@ -574,6 +602,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        _t0 = debug_start("capture_cudagraph", prefix="tensor.vllm")
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -608,3 +637,4 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        debug_end("capture_cudagraph", _t0, prefix="tensor.vllm")
