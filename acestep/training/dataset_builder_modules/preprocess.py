@@ -57,12 +57,24 @@ class PreprocessMixin:
         device = dit_handler.device
         dtype = dit_handler.dtype
 
+        if getattr(next(vae.parameters(), None), "device", device) != device:
+            raise RuntimeError(f"VAE is on {next(vae.parameters()).device}, expected {device}")
+        if getattr(next(text_encoder.parameters(), None), "device", device) != device:
+            raise RuntimeError(
+                f"Text encoder is on {next(text_encoder.parameters()).device}, expected {device}"
+            )
+        if silence_latent.device != device:
+            raise RuntimeError(f"silence_latent is on {silence_latent.device}, expected {device}")
+
         target_sample_rate = 48000
 
         genre_indices = select_genre_indices(labeled_samples, self.metadata.genre_ratio)
         debug_log_verbose_for("dataset", f"selected genre indices: count={len(genre_indices)}")
 
-        for i, sample in enumerate(labeled_samples):
+        # Use inference_mode for the entire loop – faster than per-call no_grad
+        # because it also disables autograd view-tracking.
+        with torch.inference_mode():
+          for i, sample in enumerate(labeled_samples):
             try:
                 debug_log_verbose_for("dataset", f"sample[{i}] id={sample.id} file={sample.filename}")
                 if progress_callback:
@@ -74,17 +86,12 @@ class PreprocessMixin:
                 audio, _ = load_audio_stereo(sample.audio_path, target_sample_rate, max_duration)
                 debug_end_verbose_for("dataset", f"load_audio_stereo[{i}]", t0)
                 debug_log_verbose_for("dataset", f"audio shape={tuple(audio.shape)} dtype={audio.dtype}")
-                audio = audio.unsqueeze(0).to(device).to(vae.dtype)
-                debug_log_verbose_for(
-                    "dataset",
-                    f"vae device={next(vae.parameters()).device} vae dtype={vae.dtype} "
-                    f"audio device={audio.device} audio dtype={audio.dtype}",
-                )
+                audio = audio.unsqueeze(0).to(device, dtype=vae.dtype, non_blocking=True)
 
-                with torch.no_grad():
-                    t0 = debug_start_verbose_for("dataset", f"vae_encode[{i}]")
-                    target_latents = vae_encode(vae, audio, dtype)
-                    debug_end_verbose_for("dataset", f"vae_encode[{i}]", t0)
+                t0 = debug_start_verbose_for("dataset", f"vae_encode[{i}]")
+                target_latents = vae_encode(vae, audio, dtype)
+                debug_end_verbose_for("dataset", f"vae_encode[{i}]", t0)
+                del audio  # Free GPU memory before text encoding
 
                 latent_length = target_latents.shape[1]
                 attention_mask = torch.ones(1, latent_length, device=device, dtype=dtype)
@@ -98,7 +105,7 @@ class PreprocessMixin:
 
                 if i == 0:
                     logger.info(f"\n{'='*70}")
-                    logger.info("🔍 [DEBUG] DiT TEXT ENCODER INPUT (Training Preprocess)")
+                    logger.info("[DEBUG] DiT TEXT ENCODER INPUT (Training Preprocess)")
                     logger.info(f"{'='*70}")
                     logger.info(f"text_prompt:\n{text_prompt}")
                     logger.info(f"{'='*70}\n")
@@ -108,11 +115,6 @@ class PreprocessMixin:
                     text_encoder, text_tokenizer, text_prompt, device, dtype
                 )
                 debug_end_verbose_for("dataset", f"encode_text[{i}]", t0)
-                debug_log_verbose_for(
-                    "dataset",
-                    f"text_hidden_states shape={tuple(text_hidden_states.shape)} "
-                    f"text_attention_mask shape={tuple(text_attention_mask.shape)}",
-                )
 
                 lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
                 t0 = debug_start_verbose_for("dataset", f"encode_lyrics[{i}]")
@@ -120,11 +122,6 @@ class PreprocessMixin:
                     text_encoder, text_tokenizer, lyrics, device, dtype
                 )
                 debug_end_verbose_for("dataset", f"encode_lyrics[{i}]", t0)
-                debug_log_verbose_for(
-                    "dataset",
-                    f"lyric_hidden_states shape={tuple(lyric_hidden_states.shape)} "
-                    f"lyric_attention_mask shape={tuple(lyric_attention_mask.shape)}",
-                )
 
                 t0 = debug_start_verbose_for("dataset", f"run_encoder[{i}]")
                 encoder_hidden_states, encoder_attention_mask = run_encoder(
@@ -137,11 +134,6 @@ class PreprocessMixin:
                     dtype=dtype,
                 )
                 debug_end_verbose_for("dataset", f"run_encoder[{i}]", t0)
-                debug_log_verbose_for(
-                    "dataset",
-                    f"encoder_hidden_states shape={tuple(encoder_hidden_states.shape)} "
-                    f"encoder_attention_mask shape={tuple(encoder_attention_mask.shape)}",
-                )
 
                 t0 = debug_start_verbose_for("dataset", f"build_context_latents[{i}]")
                 context_latents = build_context_latents(silence_latent, latent_length, device, dtype)
@@ -178,7 +170,7 @@ class PreprocessMixin:
                 logger.exception(f"Error preprocessing {sample.filename}")
                 fail_count += 1
                 if progress_callback:
-                    progress_callback(f"❌ Failed: {sample.filename}: {str(e)}")
+                    progress_callback(f"Failed: {sample.filename}: {str(e)}")
 
         t0 = debug_start_verbose_for("dataset", "save_manifest")
         save_manifest(output_dir, self.metadata, output_paths)

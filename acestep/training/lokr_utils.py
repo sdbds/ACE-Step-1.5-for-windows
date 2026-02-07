@@ -58,7 +58,10 @@ def inject_lokr_into_dit(
 
     # Apply preset to filter target modules
     LycorisNetwork.apply_preset(
-        {"target_name": lokr_config.target_modules}
+        {
+            "unet_target_name": lokr_config.target_modules,
+            "target_name": lokr_config.target_modules,
+        }
     )
 
     # Create LyCORIS network with LoKR algorithm

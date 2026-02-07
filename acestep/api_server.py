@@ -395,27 +395,27 @@ PARAM_ALIASES = {
 def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
     """
     Parse a description string to extract language code and instrumental flag.
-    
+
     This function analyzes user descriptions like "Pop rock. English" or "piano solo"
     to detect:
     - Language: Maps language names to ISO codes (e.g., "English" -> "en")
     - Instrumental: Detects patterns indicating instrumental/no-vocal music
-    
+
     Args:
         description: User's natural language music description
-        
+
     Returns:
         (language_code, is_instrumental) tuple:
         - language_code: ISO language code (e.g., "en", "zh") or None if not detected
         - is_instrumental: True if description indicates instrumental music
     """
     import re
-    
+
     if not description:
         return None, False
-    
+
     description_lower = description.lower().strip()
-    
+
     # Language mapping: input patterns -> ISO code
     language_mapping = {
         'english': 'en', 'en': 'en',
@@ -438,7 +438,7 @@ def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
         'dutch': 'nl', 'nl': 'nl',
         'polish': 'pl', 'pl': 'pl',
     }
-    
+
     # Detect language
     detected_language = None
     for lang_name, lang_code in language_mapping.items():
@@ -446,11 +446,11 @@ def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
             pattern = r'(?:^|\s|[.,;:!?])' + re.escape(lang_name) + r'(?:$|\s|[.,;:!?])'
         else:
             pattern = r'\b' + re.escape(lang_name) + r'\b'
-        
+
         if re.search(pattern, description_lower):
             detected_language = lang_code
             break
-    
+
     # Detect instrumental
     is_instrumental = False
     if 'instrumental' in description_lower:
@@ -459,7 +459,7 @@ def _parse_description_hints(description: str) -> tuple[Optional[str], bool]:
         is_instrumental = True
     elif description_lower.endswith(' solo') or description_lower == 'solo':
         is_instrumental = True
-    
+
     return detected_language, is_instrumental
 
 
@@ -685,7 +685,7 @@ class CreateJobResponse(BaseModel):
     status: JobStatus
     queue_position: int = 0  # 1-based best-effort position when queued
     progress_text: Optional[str] = ""
-    
+
 
 class JobResult(BaseModel):
     first_audio_path: Optional[str] = None
@@ -702,7 +702,7 @@ class JobResult(BaseModel):
     genres: Optional[str] = None
     keyscale: Optional[str] = None
     timesignature: Optional[str] = None
-    
+
     # Model information
     lm_model: Optional[str] = None
     dit_model: Optional[str] = None
@@ -831,7 +831,7 @@ class _JobStore:
                 if rec.status in stats:
                     stats[rec.status] += 1
             return stats
-    
+
     def update_status_text(self, job_id: str, text: str) -> None:
         with self._lock:
             if job_id in self._jobs:
@@ -852,10 +852,10 @@ def _env_bool(name: str, default: bool) -> bool:
 def _get_model_name(config_path: str) -> str:
     """
     Extract model name from config_path.
-    
+
     Args:
         config_path: Path like "acestep-v15-turbo" or "/path/to/acestep-v15-turbo"
-        
+
     Returns:
         Model name (last directory name from config_path)
     """
@@ -1134,12 +1134,12 @@ def create_app() -> FastAPI:
         handler3 = None
         config_path2 = os.getenv("ACESTEP_CONFIG_PATH2", "").strip()
         config_path3 = os.getenv("ACESTEP_CONFIG_PATH3", "").strip()
-        
+
         if config_path2:
             handler2 = AceStepHandler()
         if config_path3:
             handler3 = AceStepHandler()
-        
+
         app.state.handler2 = handler2
         app.state.handler3 = handler3
         app.state._initialized2 = False
@@ -1171,11 +1171,11 @@ def create_app() -> FastAPI:
         app.state.executor = executor
         app.state.job_store = store
         app.state._python_executable = sys.executable
-        
+
         # Temporary directory for saving generated audio files
         app.state.temp_audio_dir = os.path.join(tmp_root, "api_audio")
         os.makedirs(app.state.temp_audio_dir, exist_ok=True)
-        
+
         # Dataset builder and training state
         app.state.dataset_builder = None  # Will be created on first use
         app.state.training_state = {"is_training": False, "should_stop": False}
@@ -1293,15 +1293,15 @@ def create_app() -> FastAPI:
 
             await _ensure_initialized()
             job_store.mark_running(job_id)
-            
+
             # Select DiT handler based on user's model choice
             # Default: use primary handler
             selected_handler: AceStepHandler = app.state.handler
             selected_model_name = _get_model_name(app.state._config_path)
-            
+
             if req.model and req.model != selected_model_name:
                 model_matched = False
-                
+
                 # Check pre-loaded secondary handlers first (fast path)
                 if app.state.handler2 and getattr(app.state, "_initialized2", False):
                     model2_name = _get_model_name(app.state._config_path2)
@@ -1310,7 +1310,7 @@ def create_app() -> FastAPI:
                         selected_model_name = model2_name
                         model_matched = True
                         print(f"[API Server] Job {job_id}: Using pre-loaded model: {model2_name}")
-                
+
                 if not model_matched and app.state.handler3 and getattr(app.state, "_initialized3", False):
                     model3_name = _get_model_name(app.state._config_path3)
                     if req.model == model3_name:
@@ -1318,7 +1318,7 @@ def create_app() -> FastAPI:
                         selected_model_name = model3_name
                         model_matched = True
                         print(f"[API Server] Job {job_id}: Using pre-loaded model: {model3_name}")
-                
+
                 # Dynamic switching: hot-swap the primary handler's DiT model
                 if not model_matched:
                     with app.state._model_switch_lock:
@@ -1338,7 +1338,7 @@ def create_app() -> FastAPI:
                             else:
                                 print(f"[API Server] Job {job_id}: Switch failed: {status_msg}, using {current_primary}")
                                 selected_model_name = current_primary
-            
+
             # Use selected handler for generation
             h: AceStepHandler = selected_handler
 
@@ -1465,7 +1465,7 @@ def create_app() -> FastAPI:
                 # Save original user input for metas
                 original_prompt = req.prompt or ""
                 original_lyrics = req.lyrics or ""
-                
+
                 if sample_mode or has_sample_query:
                     # Parse description hints from sample_query (if provided)
                     sample_query = req.sample_query if has_sample_query else "NO USER INPUT"
@@ -1509,7 +1509,7 @@ def create_app() -> FastAPI:
                     _ensure_llm_ready()
                     if getattr(app.state, "_llm_init_error", None):
                         raise RuntimeError(f"5Hz LM init failed (needed for format): {app.state._llm_init_error}")
-                    
+
                     # Build user_metadata from request params (matching bot.py behavior)
                     user_metadata_for_format = {}
                     if bpm is not None:
@@ -1522,7 +1522,7 @@ def create_app() -> FastAPI:
                         user_metadata_for_format['timesignature'] = time_signature
                     if req.vocal_language and req.vocal_language != "unknown":
                         user_metadata_for_format['language'] = req.vocal_language
-                    
+
                     format_result = format_sample(
                         llm_handler=llm,
                         caption=caption,
@@ -1533,7 +1533,7 @@ def create_app() -> FastAPI:
                         top_p=lm_top_p if lm_top_p < 1.0 else None,
                         use_constrained_decoding=True,
                     )
-                    
+
                     if format_result.success:
                         # Extract all formatted data (matching bot.py behavior)
                         caption = format_result.caption or caption
@@ -1626,7 +1626,7 @@ def create_app() -> FastAPI:
                     # Step A: Convert source audio to semantic codes
                     # We use params.src_audio which is the server-side path
                     audio_codes = h.convert_src_audio_to_codes(params.src_audio)
-                    
+
                     if not audio_codes or audio_codes.startswith("❌"):
                         raise RuntimeError(f"Audio encoding failed: {audio_codes}")
 
@@ -1638,7 +1638,7 @@ def create_app() -> FastAPI:
                         use_constrained_decoding=True,
                         constrained_decoding_debug=config.constrained_decoding_debug
                     )
-                    
+
                     if not metadata_dict:
                         raise RuntimeError(f"LLM Understanding failed: {status_string}")
 
@@ -1709,23 +1709,23 @@ def create_app() -> FastAPI:
                 # Get metadata from LM or CoT results
                 lm_metadata = result.extra_outputs.get("lm_metadata", {})
                 metas_out = _normalize_metas(lm_metadata)
-                
+
                 # Update metas with actual values used
                 if params.cot_bpm:
                     metas_out["bpm"] = params.cot_bpm
                 elif bpm:
                     metas_out["bpm"] = bpm
-                    
+
                 if params.cot_duration:
                     metas_out["duration"] = params.cot_duration
                 elif audio_duration:
                     metas_out["duration"] = audio_duration
-                    
+
                 if params.cot_keyscale:
                     metas_out["keyscale"] = params.cot_keyscale
                 elif key_scale:
                     metas_out["keyscale"] = key_scale
-                    
+
                 if params.cot_timesignature:
                     metas_out["timesignature"] = params.cot_timesignature
                 elif time_signature:
@@ -1766,7 +1766,7 @@ def create_app() -> FastAPI:
                 lm_model_name = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
                 # Use selected_model_name (set at the beginning of _run_one_job)
                 dit_model_name = selected_model_name
-                
+
                 return {
                     "first_audio_path": _path_to_audio_url(first_audio) if first_audio else None,
                     "second_audio_path": _path_to_audio_url(second_audio) if second_audio else None,
@@ -2437,20 +2437,20 @@ def create_app() -> FastAPI:
     async def list_models(_: None = Depends(verify_api_key)):
         """List available DiT models (includes all downloadable models)."""
         current_model = _get_model_name(app.state._config_path) if getattr(app.state, "_initialized", False) else None
-        
+
         # Scan checkpoints directory for installed models
         installed = set()
         h: AceStepHandler = app.state.handler
         if h:
             installed = set(h.get_available_acestep_v15_models())
-        
+
         # Pre-loaded secondary handlers
         preloaded = set()
         if getattr(app.state, "_initialized2", False) and app.state._config_path2:
             preloaded.add(_get_model_name(app.state._config_path2))
         if getattr(app.state, "_initialized3", False) and app.state._config_path3:
             preloaded.add(_get_model_name(app.state._config_path3))
-        
+
         models = []
         for name in sorted(installed):
             models.append({
@@ -2458,7 +2458,7 @@ def create_app() -> FastAPI:
                 "is_active": name == current_model,
                 "is_preloaded": name in preloaded or name == current_model,
             })
-        
+
         return _wrap_response({
             "models": models,
             "active_model": current_model,
@@ -2631,13 +2631,13 @@ def create_app() -> FastAPI:
     async def load_lora_endpoint(request: LoadLoRARequest, _: None = Depends(verify_api_key)):
         """Load LoRA adapter into the primary model."""
         handler: AceStepHandler = app.state.handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         try:
             result = handler.load_lora(request.lora_path)
-            
+
             if result.startswith("✅"):
                 return _wrap_response({"message": result, "lora_path": request.lora_path})
             else:
@@ -2651,13 +2651,13 @@ def create_app() -> FastAPI:
     async def unload_lora_endpoint(_: None = Depends(verify_api_key)):
         """Unload LoRA adapter and restore base model."""
         handler: AceStepHandler = app.state.handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         try:
             result = handler.unload_lora()
-            
+
             if result.startswith("✅") or result.startswith("⚠️"):
                 return _wrap_response({"message": result})
             else:
@@ -2671,13 +2671,13 @@ def create_app() -> FastAPI:
     async def toggle_lora_endpoint(request: ToggleLoRARequest, _: None = Depends(verify_api_key)):
         """Enable or disable LoRA adapter for inference."""
         handler: AceStepHandler = app.state.handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         try:
             result = handler.set_use_lora(request.use_lora)
-            
+
             if result.startswith("✅"):
                 return _wrap_response({"message": result, "use_lora": request.use_lora})
             else:
@@ -2689,13 +2689,13 @@ def create_app() -> FastAPI:
     async def set_lora_scale_endpoint(request: SetLoRAScaleRequest, _: None = Depends(verify_api_key)):
         """Set LoRA adapter scale/strength (0.0-1.0)."""
         handler: AceStepHandler = app.state.handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         try:
             result = handler.set_lora_scale(request.scale)
-            
+
             if result.startswith("✅") or result.startswith("⚠️"):
                 return _wrap_response({"message": result, "scale": request.scale})
             else:
@@ -2707,25 +2707,25 @@ def create_app() -> FastAPI:
     async def scan_dataset_directory(request: ScanDirectoryRequest, _: None = Depends(verify_api_key)):
         """Scan directory for audio files and create dataset."""
         from acestep.training.dataset_builder import DatasetBuilder
-        
+
         try:
             builder = DatasetBuilder()
             builder.metadata.name = request.dataset_name
             builder.metadata.custom_tag = request.custom_tag
             builder.metadata.tag_position = request.tag_position
             builder.metadata.all_instrumental = request.all_instrumental
-            
+
             samples, status = builder.scan_directory(request.audio_dir.strip())
-            
+
             if not samples:
                 return _wrap_response(None, code=400, error=status)
-            
+
             builder.set_all_instrumental(request.all_instrumental)
             if request.custom_tag:
                 builder.set_custom_tag(request.custom_tag, request.tag_position)
-            
+
             app.state.dataset_builder = builder
-            
+
             # Return full sample data with all metadata
             samples_data = [
                 {
@@ -2746,7 +2746,7 @@ def create_app() -> FastAPI:
                 }
                 for i, s in enumerate(builder.samples)
             ]
-            
+
             return _wrap_response({
                 "message": status,
                 "num_samples": len(samples),
@@ -2759,11 +2759,11 @@ def create_app() -> FastAPI:
     async def load_dataset(request: LoadDatasetRequest, _: None = Depends(verify_api_key)):
         """Load existing dataset from JSON file."""
         from acestep.training.dataset_builder import DatasetBuilder
-        
+
         try:
             builder = DatasetBuilder()
             samples, status = builder.load_dataset(request.dataset_path.strip())
-            
+
             if not samples:
                 return _wrap_response({
                     "message": status,
@@ -2772,9 +2772,9 @@ def create_app() -> FastAPI:
                     "labeled_count": 0,
                     "samples": []
                 }, code=400, error=status)
-            
+
             app.state.dataset_builder = builder
-            
+
             # Return full sample data with all metadata
             samples_data = [
                 {
@@ -2795,7 +2795,7 @@ def create_app() -> FastAPI:
                 }
                 for i, s in enumerate(builder.samples)
             ]
-            
+
             return _wrap_response({
                 "message": status,
                 "dataset_name": builder.metadata.name,
@@ -2819,16 +2819,16 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
-        
+
         handler: AceStepHandler = app.state.handler
         llm: LLMHandler = app.state.llm_handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         if llm is None or not llm.llm_initialized:
             raise HTTPException(status_code=500, detail="LLM not initialized")
-        
+
         # Offload decoder to CPU during labeling to save VRAM
         # Auto-labeling only needs: VAE + model.tokenize + LLM (no decoder required)
         decoder_on_gpu = False
@@ -2845,7 +2845,7 @@ def create_app() -> FastAPI:
                         torch.cuda.empty_cache()
             except Exception:
                 pass
-        
+
         try:
             samples, status = builder.label_all_samples(
                 dit_handler=handler,
@@ -2856,7 +2856,7 @@ def create_app() -> FastAPI:
                 only_unlabeled=request.only_unlabeled,
                 progress_callback=None,
             )
-            
+
             # Return full sample data with all metadata
             samples_data = [
                 {
@@ -2877,11 +2877,11 @@ def create_app() -> FastAPI:
                 }
                 for i, s in enumerate(builder.samples)
             ]
-            
+
             # Add note about decoder offloading
             if decoder_on_gpu:
                 status += "\n⚠️ Decoder offloaded to CPU to save VRAM. It will be automatically reloaded to GPU when training starts."
-            
+
             return _wrap_response({
                 "message": status,
                 "labeled_count": builder.get_labeled_count(),
@@ -2896,25 +2896,25 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
-        
+
         handler: AceStepHandler = app.state.handler
         llm: LLMHandler = app.state.llm_handler
-        
+
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         if llm is None or not llm.llm_initialized:
             raise HTTPException(status_code=500, detail="LLM not initialized")
-        
+
         # Generate task ID
         task_id = str(uuid4())
-        
+
         # Filter samples to label
         if request.only_unlabeled:
             samples_to_label = [s for s in builder.samples if not s.labeled or not s.caption]
         else:
             samples_to_label = builder.samples
-        
+
         total = len(samples_to_label)
         if total == 0:
             return _wrap_response({
@@ -2922,7 +2922,7 @@ def create_app() -> FastAPI:
                 "message": "All samples already labeled" if request.only_unlabeled else "No samples to label",
                 "total": 0
             })
-        
+
         # Create task
         with _auto_label_lock:
             _auto_label_tasks[task_id] = AutoLabelTask(
@@ -2933,7 +2933,7 @@ def create_app() -> FastAPI:
                 total=total,
                 created_at=time.time()
             )
-        
+
         # Background labeling function
         def run_labeling():
             try:
@@ -2951,7 +2951,7 @@ def create_app() -> FastAPI:
                                 torch.cuda.empty_cache()
                     except Exception:
                         pass
-                
+
                 # Progress callback
                 def progress_callback(msg: str):
                     with _auto_label_lock:
@@ -2963,7 +2963,7 @@ def create_app() -> FastAPI:
                             if match:
                                 task.current = int(match.group(1))
                                 task.progress = msg
-                
+
                 # Run labeling
                 samples, status = builder.label_all_samples(
                     dit_handler=handler,
@@ -2974,7 +2974,7 @@ def create_app() -> FastAPI:
                     only_unlabeled=request.only_unlabeled,
                     progress_callback=progress_callback,
                 )
-                
+
                 # Prepare result
                 samples_data = [
                     {
@@ -2995,10 +2995,10 @@ def create_app() -> FastAPI:
                     }
                     for i, s in enumerate(builder.samples)
                 ]
-                
+
                 if decoder_on_gpu:
                     status += "\n⚠️ Decoder offloaded to CPU to save VRAM."
-                
+
                 # Update task status
                 with _auto_label_lock:
                     task = _auto_label_tasks.get(task_id)
@@ -3018,12 +3018,12 @@ def create_app() -> FastAPI:
                         task.status = "failed"
                         task.error = str(e)
                         task.progress = f"Failed: {str(e)}"
-        
+
         # Start background task
         import threading
         thread = threading.Thread(target=run_labeling, daemon=True)
         thread.start()
-        
+
         return _wrap_response({
             "task_id": task_id,
             "message": "Auto-labeling task started",
@@ -3037,7 +3037,7 @@ def create_app() -> FastAPI:
             task = _auto_label_tasks.get(task_id)
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
-            
+
             response_data = {
                 "task_id": task.task_id,
                 "status": task.status,
@@ -3045,12 +3045,12 @@ def create_app() -> FastAPI:
                 "current": task.current,
                 "total": task.total,
             }
-            
+
             if task.status == "completed" and task.result:
                 response_data["result"] = task.result
             elif task.status == "failed" and task.error:
                 response_data["error"] = task.error
-            
+
             return _wrap_response(response_data)
 
     @app.post("/v1/dataset/save")
@@ -3059,7 +3059,7 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset to save")
-        
+
         try:
             # Update metadata fields if provided
             if request.custom_tag is not None:
@@ -3070,9 +3070,9 @@ def create_app() -> FastAPI:
                 builder.metadata.all_instrumental = request.all_instrumental
             if request.genre_ratio is not None:
                 builder.metadata.genre_ratio = request.genre_ratio
-            
+
             status = builder.save_dataset(request.save_path.strip(), request.dataset_name)
-            
+
             if status.startswith("✅"):
                 return _wrap_response({"message": status, "save_path": request.save_path})
             else:
@@ -3086,20 +3086,18 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded")
-        
+
         handler: AceStepHandler = app.state.handler
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         # Unload LLM before preprocessing to free VRAM (preprocessing doesn't need LLM)
         llm: LLMHandler = app.state.llm_handler
         llm_was_loaded = False
         if llm and llm.llm_initialized:
             llm_was_loaded = True
             try:
-                llm.llm = None
-                llm.llm_tokenizer = None
-                llm.llm_initialized = False
+                llm.unload()
                 import gc
                 gc.collect()
                 if torch.cuda.is_available():
@@ -3107,7 +3105,7 @@ def create_app() -> FastAPI:
             except Exception:
                 # Silently continue if unload fails
                 pass
-        
+
         try:
             # Run preprocessing in thread pool to avoid blocking event loop
             output_paths, status = await asyncio.to_thread(
@@ -3116,26 +3114,26 @@ def create_app() -> FastAPI:
                 output_dir=request.output_dir.strip(),
                 progress_callback=None,
             )
-            
+
             if status.startswith("✅"):
                 # Unload VAE, text encoder, and model encoder after preprocessing
                 # Training only needs the decoder since all latents are pre-computed
                 components_unloaded = []
-                
+
                 try:
                     if handler.vae is not None:
                         handler.vae = None
                         components_unloaded.append("VAE")
-                    
+
                     if handler.text_encoder is not None:
                         handler.text_encoder = None
                         handler.text_tokenizer = None
                         components_unloaded.append("Text Encoder")
-                    
+
                     if handler.model is not None and handler.model.encoder is not None:
                         handler.model.encoder = None
                         components_unloaded.append("Model Encoder")
-                    
+
                     if components_unloaded:
                         import gc
                         gc.collect()
@@ -3143,13 +3141,13 @@ def create_app() -> FastAPI:
                             torch.cuda.empty_cache()
                 except Exception:
                     pass
-                
+
                 # Add notes about unloading
                 if llm_was_loaded:
                     status += "\n⚠️ LLM has been unloaded."
                 if components_unloaded:
                     status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
-                
+
                 return _wrap_response({
                     "message": status,
                     "output_dir": request.output_dir,
@@ -3166,25 +3164,25 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded")
-        
+
         handler: AceStepHandler = app.state.handler
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         # Generate task ID
         task_id = str(uuid4())
-        
+
         # Count labeled samples
         labeled_samples = [s for s in builder.samples if s.labeled]
         total = len(labeled_samples)
-        
+
         if total == 0:
             return _wrap_response({
                 "task_id": task_id,
                 "message": "No labeled samples to preprocess",
                 "total": 0
             })
-        
+
         # Create task
         with _preprocess_lock:
             _preprocess_tasks[task_id] = PreprocessTask(
@@ -3195,7 +3193,7 @@ def create_app() -> FastAPI:
                 total=total,
                 created_at=time.time()
             )
-        
+
         # Background preprocessing function
         def run_preprocessing():
             try:
@@ -3205,16 +3203,14 @@ def create_app() -> FastAPI:
                 if llm and llm.llm_initialized:
                     llm_was_loaded = True
                     try:
-                        llm.llm = None
-                        llm.llm_tokenizer = None
-                        llm.llm_initialized = False
+                        llm.unload()
                         import gc
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     except Exception:
                         pass
-                
+
                 # Progress callback
                 def progress_callback(msg: str):
                     with _preprocess_lock:
@@ -3226,30 +3222,30 @@ def create_app() -> FastAPI:
                             if match:
                                 task.current = int(match.group(1))
                                 task.progress = msg
-                
+
                 # Run preprocessing
                 output_paths, status = builder.preprocess_to_tensors(
                     dit_handler=handler,
                     output_dir=request.output_dir.strip(),
                     progress_callback=progress_callback,
                 )
-                
+
                 # Unload VAE, text encoder, and model encoder after preprocessing
                 components_unloaded = []
                 try:
                     if handler.vae is not None:
                         handler.vae = None
                         components_unloaded.append("VAE")
-                    
+
                     if handler.text_encoder is not None:
                         handler.text_encoder = None
                         handler.text_tokenizer = None
                         components_unloaded.append("Text Encoder")
-                    
+
                     if handler.model is not None and handler.model.encoder is not None:
                         handler.model.encoder = None
                         components_unloaded.append("Model Encoder")
-                    
+
                     if components_unloaded:
                         import gc
                         gc.collect()
@@ -3257,13 +3253,13 @@ def create_app() -> FastAPI:
                             torch.cuda.empty_cache()
                 except Exception:
                     pass
-                
+
                 # Add notes about unloading
                 if llm_was_loaded:
                     status += "\n⚠️ LLM has been unloaded."
                 if components_unloaded:
                     status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
-                
+
                 # Update task status
                 with _preprocess_lock:
                     task = _preprocess_tasks.get(task_id)
@@ -3283,12 +3279,12 @@ def create_app() -> FastAPI:
                         task.status = "failed"
                         task.error = str(e)
                         task.progress = f"Failed: {str(e)}"
-        
+
         # Start background task
         import threading
         thread = threading.Thread(target=run_preprocessing, daemon=True)
         thread.start()
-        
+
         return _wrap_response({
             "task_id": task_id,
             "message": "Preprocessing task started",
@@ -3302,7 +3298,7 @@ def create_app() -> FastAPI:
             task = _preprocess_tasks.get(task_id)
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
-            
+
             response_data = {
                 "task_id": task.task_id,
                 "status": task.status,
@@ -3310,12 +3306,12 @@ def create_app() -> FastAPI:
                 "current": task.current,
                 "total": task.total,
             }
-            
+
             if task.status == "completed" and task.result:
                 response_data["result"] = task.result
             elif task.status == "failed" and task.error:
                 response_data["error"] = task.error
-            
+
             return _wrap_response(response_data)
 
     @app.get("/v1/dataset/samples")
@@ -3324,7 +3320,7 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded")
-        
+
         # Return full sample data with all metadata
         samples_data = [
             {
@@ -3345,7 +3341,7 @@ def create_app() -> FastAPI:
             }
             for i, s in enumerate(builder.samples)
         ]
-        
+
         return _wrap_response({
             "dataset_name": builder.metadata.name,
             "num_samples": len(builder.samples),
@@ -3359,10 +3355,10 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded")
-        
+
         if sample_idx < 0 or sample_idx >= len(builder.samples):
             raise HTTPException(status_code=404, detail=f"Sample index {sample_idx} out of range")
-        
+
         sample = builder.samples[sample_idx]
         return _wrap_response(sample.to_dict())
 
@@ -3372,7 +3368,7 @@ def create_app() -> FastAPI:
         builder = app.state.dataset_builder
         if builder is None:
             raise HTTPException(status_code=400, detail="No dataset loaded")
-        
+
         try:
             sample, status = builder.update_sample(
                 sample_idx,
@@ -3387,7 +3383,7 @@ def create_app() -> FastAPI:
                 is_instrumental=request.is_instrumental,
                 labeled=True,
             )
-            
+
             if status.startswith("✅"):
                 return _wrap_response({"message": status, "sample": sample.to_dict()})
             else:
@@ -3400,14 +3396,14 @@ def create_app() -> FastAPI:
         """Reinitialize components that were unloaded during training/preprocessing."""
         handler: AceStepHandler = app.state.handler
         llm: LLMHandler = app.state.llm_handler
-        
+
         if handler is None:
             raise HTTPException(status_code=500, detail="Service not initialized")
-        
+
         try:
             import gc
             reloaded = []
-            
+
             # Reload LLM if needed
             if llm and not llm.llm_initialized:
                 project_root = _get_project_root()
@@ -3416,7 +3412,7 @@ def create_app() -> FastAPI:
                 backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
                 lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
                 lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-                
+
                 status, ok = llm.initialize(
                     checkpoint_dir=checkpoint_dir,
                     lm_model_path=lm_model_path,
@@ -3427,7 +3423,7 @@ def create_app() -> FastAPI:
                 )
                 if ok:
                     reloaded.append("LLM")
-            
+
             # Reload model components if needed
             if handler.model is not None:
                 # Check if decoder is on CPU, move to GPU
@@ -3436,17 +3432,17 @@ def create_app() -> FastAPI:
                     if first_param is not None and first_param.device.type == "cpu":
                         handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
                         reloaded.append("Decoder (moved to GPU)")
-            
+
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            
+
             message = "✅ Service reinitialized"
             if reloaded:
                 message += f"\n🔄 Reloaded: {', '.join(reloaded)}"
-            
+
             return _wrap_response({"message": message, "reloaded": reloaded})
-            
+
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Reinitialization failed: {str(e)}")
 
@@ -3454,21 +3450,21 @@ def create_app() -> FastAPI:
     async def start_training(request: StartTrainingRequest, _: None = Depends(verify_api_key)):
         """Start LoRA training from preprocessed tensors."""
         training_state = app.state.training_state
-        
+
         if training_state.get("is_training", False):
             raise HTTPException(status_code=400, detail="Training already in progress")
-        
+
         handler: AceStepHandler = app.state.handler
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
-        
+
         # Check if decoder exists
         if not hasattr(handler.model, 'decoder') or handler.model.decoder is None:
             raise HTTPException(
-                status_code=500, 
+                status_code=500,
                 detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
             )
-        
+
         # If decoder is on CPU (e.g., after auto-labeling), move it back to GPU
         try:
             first_param = next(handler.model.decoder.parameters(), None)
@@ -3478,57 +3474,55 @@ def create_app() -> FastAPI:
                     torch.cuda.empty_cache()
         except Exception:
             pass
-        
+
         # Unload unnecessary components before training to free VRAM
         # Training only needs decoder - all inputs are pre-computed tensors
         try:
             import gc
             components_unloaded = []
-            
+
             # Unload LLM
             llm: LLMHandler = app.state.llm_handler
             if llm and llm.llm_initialized:
-                llm.llm = None
-                llm.llm_tokenizer = None
-                llm.llm_initialized = False
+                llm.unload()
                 components_unloaded.append("LLM")
-            
+
             # Unload VAE
             if handler.vae is not None:
                 handler.vae = None
                 components_unloaded.append("VAE")
-            
+
             # Unload text encoder
             if handler.text_encoder is not None:
                 handler.text_encoder = None
                 handler.text_tokenizer = None
                 components_unloaded.append("Text Encoder")
-            
+
             # Unload model encoder (training only uses decoder)
             if handler.model is not None and hasattr(handler.model, 'encoder') and handler.model.encoder is not None:
                 handler.model.encoder = None
                 components_unloaded.append("Model Encoder")
-            
+
             if components_unloaded:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         except Exception:
             pass
-        
+
         try:
             from acestep.training.trainer import LoRATrainer
             from acestep.training.configs import LoRAConfig as LoRAConfigClass, TrainingConfig
         except ImportError as e:
             raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
-        
+
         try:
             lora_config = LoRAConfigClass(
                 r=request.lora_rank,
                 alpha=request.lora_alpha,
                 dropout=request.lora_dropout,
             )
-            
+
             training_config = TrainingConfig(
                 shift=request.training_shift,
                 learning_rate=request.learning_rate,
@@ -3540,7 +3534,7 @@ def create_app() -> FastAPI:
                 output_dir=request.lora_output_dir,
                 use_fp8=request.use_fp8,
             )
-            
+
             fp8_status = ""
             if request.use_fp8:
                 try:
@@ -3555,17 +3549,17 @@ def create_app() -> FastAPI:
                     fp8_status = "⚠️ torchao not available, using bf16"
                 except Exception as e:
                     fp8_status = f"⚠️ FP8 failed ({e}), using bf16"
-            
+
             trainer = LoRATrainer(
                 dit_handler=handler,
                 lora_config=lora_config,
                 training_config=training_config,
             )
-            
+
             # TensorBoard log directory
             tensorboard_logdir = os.path.join(request.lora_output_dir, "logs")
             os.makedirs(tensorboard_logdir, exist_ok=True)
-            
+
             import time
             training_state["is_training"] = True
             training_state["should_stop"] = False
@@ -3585,7 +3579,7 @@ def create_app() -> FastAPI:
                 "learning_rate": request.learning_rate,
                 "epochs": request.train_epochs,
             }
-            
+
             # Start TensorBoard server if not already running
             if not hasattr(app.state, 'tensorboard_process') or app.state.tensorboard_process is None:
                 try:
@@ -3603,7 +3597,7 @@ def create_app() -> FastAPI:
             else:
                 tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
                 training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
-            
+
             def _run_training_sync():
                 """Run training synchronously in thread pool."""
                 try:
@@ -3611,27 +3605,27 @@ def create_app() -> FastAPI:
                         training_state["current_step"] = step
                         training_state["current_loss"] = loss
                         training_state["status"] = status
-                        
+
                         # Accumulate loss history (only valid values)
                         if step > 0 and loss is not None and loss == loss:  # Check for NaN
                             training_state["loss_history"].append({"step": step, "loss": float(loss)})
                             # Keep last 1000 points to avoid unbounded growth
                             if len(training_state["loss_history"]) > 1000:
                                 training_state["loss_history"] = training_state["loss_history"][-1000:]
-                            
+
                             # Extract epoch from status (e.g., "Epoch 1/1000, Step 5, Loss: 0.1234")
                             import re
                             epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
                             if epoch_match:
                                 training_state["current_epoch"] = int(epoch_match.group(1))
-                            
+
                             # Calculate training speed and ETA
                             current_time = time.time()
                             if step > 1:  # Skip first step for more accurate measurement
                                 elapsed_since_last = current_time - training_state["last_step_time"]
                                 if elapsed_since_last > 0:
                                     training_state["steps_per_second"] = 1.0 / elapsed_since_last
-                                    
+
                                     # Calculate ETA based on total steps
                                     total_epochs = training_state["config"]["epochs"]
                                     # Estimate total steps (rough estimate)
@@ -3640,9 +3634,9 @@ def create_app() -> FastAPI:
                                         total_steps = int(steps_per_epoch * total_epochs)
                                         remaining_steps = total_steps - step
                                         training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
-                            
+
                             training_state["last_step_time"] = current_time
-                            
+
                             # Accumulate training log
                             log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
                             if training_state["training_log"]:
@@ -3653,23 +3647,23 @@ def create_app() -> FastAPI:
                             log_lines = training_state["training_log"].split("\n")
                             if len(log_lines) > 100:
                                 training_state["training_log"] = "\n".join(log_lines[-100:])
-                        
+
                         if training_state.get("should_stop", False):
                             break
-                    
+
                     training_state["is_training"] = False
                 except Exception as e:
                     training_state["is_training"] = False
                     training_state["error"] = str(e)
-            
+
             # Run in thread pool to avoid blocking event loop
             executor: ThreadPoolExecutor = app.state.executor
             executor.submit(_run_training_sync)
-            
+
             message = "Training started"
             if fp8_status:
                 message += f"\n{fp8_status}"
-            
+
             return _wrap_response({
                 "message": message,
                 "tensor_dir": request.tensor_dir,
@@ -3677,7 +3671,7 @@ def create_app() -> FastAPI:
                 "config": training_state["config"],
                 "fp8_enabled": request.use_fp8
             })
-            
+
         except Exception as e:
             training_state["is_training"] = False
             return _wrap_response(None, code=500, error=f"Failed to start training: {str(e)}")
@@ -3717,9 +3711,7 @@ def create_app() -> FastAPI:
 
             llm: LLMHandler = app.state.llm_handler
             if llm and llm.llm_initialized:
-                llm.llm = None
-                llm.llm_tokenizer = None
-                llm.llm_initialized = False
+                llm.unload()
                 components_unloaded.append("LLM")
 
             if handler.vae is not None:
@@ -3885,28 +3877,28 @@ def create_app() -> FastAPI:
     async def stop_training(_: None = Depends(verify_api_key)):
         """Stop the current training process."""
         training_state = app.state.training_state
-        
+
         if not training_state.get("is_training", False):
             raise HTTPException(status_code=400, detail="No training in progress")
-        
+
         training_state["should_stop"] = True
-        
+
         return _wrap_response({"message": "Stopping training..."})
 
     @app.post("/v1/training/load_tensor_info")
     async def load_tensor_info(request: dict, _: None = Depends(verify_api_key)):
         """Load preprocessed tensor dataset info from directory."""
         tensor_dir = request.get("tensor_dir", "").strip()
-        
+
         if not tensor_dir:
             raise HTTPException(status_code=400, detail="Please enter a tensor directory path")
-        
+
         if not os.path.exists(tensor_dir):
             raise HTTPException(status_code=400, detail=f"Directory not found: {tensor_dir}")
-        
+
         if not os.path.isdir(tensor_dir):
             raise HTTPException(status_code=400, detail=f"Not a directory: {tensor_dir}")
-        
+
         try:
             # Check for manifest.json (created by preprocess_to_tensors)
             manifest_path = os.path.join(tensor_dir, "manifest.json")
@@ -3914,23 +3906,23 @@ def create_app() -> FastAPI:
             num_samples = 0
             custom_tag = ""
             has_manifest = False
-            
+
             if os.path.exists(manifest_path):
                 try:
                     with open(manifest_path, 'r', encoding='utf-8') as f:
                         manifest = json.load(f)
-                    
+
                     num_samples = manifest.get("num_samples", 0)
                     metadata = manifest.get("metadata", {})
                     dataset_name = metadata.get("name", "Unknown")
                     custom_tag = metadata.get("custom_tag", "")
                     has_manifest = True
-                    
+
                     message = f"✅ Loaded preprocessed dataset: {dataset_name}\n"
                     message += f"📊 Samples: {num_samples} preprocessed tensors"
                     if custom_tag:
                         message += f"\n🏷️ Custom Tag: {custom_tag}"
-                    
+
                     return _wrap_response({
                         "dataset_name": dataset_name,
                         "num_samples": num_samples,
@@ -3941,17 +3933,17 @@ def create_app() -> FastAPI:
                 except Exception as e:
                     # Manifest exists but failed to parse, continue to fallback
                     pass
-            
+
             # Fallback: count .pt files
             pt_files = [f for f in os.listdir(tensor_dir) if f.endswith('.pt')]
             num_samples = len(pt_files)
-            
+
             if num_samples == 0:
                 raise HTTPException(status_code=400, detail=f"No .pt tensor files found in {tensor_dir}")
-            
+
             message = f"✅ Found {num_samples} tensor files in {tensor_dir}\n"
             message += "⚠️ No manifest.json found - using all .pt files"
-            
+
             return _wrap_response({
                 "dataset_name": dataset_name,
                 "num_samples": num_samples,
@@ -3959,7 +3951,7 @@ def create_app() -> FastAPI:
                 "tensor_dir": tensor_dir,
                 "message": message
             })
-            
+
         except HTTPException:
             raise
         except Exception as e:
@@ -3969,14 +3961,14 @@ def create_app() -> FastAPI:
     async def get_training_status(_: None = Depends(verify_api_key)):
         """Get current training status."""
         training_state = app.state.training_state
-        
+
         is_training = training_state.get("is_training", False)
-        
+
         response = {
             "is_training": is_training,
             "should_stop": training_state.get("should_stop", False),
         }
-        
+
         if is_training:
             response.update({
                 "current_step": training_state.get("current_step", 0),
@@ -3993,48 +3985,48 @@ def create_app() -> FastAPI:
                 "steps_per_second": training_state.get("steps_per_second", 0.0),
                 "estimated_time_remaining": training_state.get("estimated_time_remaining", 0.0),
             })
-        
+
         if "error" in training_state:
             response["error"] = training_state["error"]
-        
+
         return _wrap_response(response)
 
     @app.post("/v1/training/export")
     async def export_lora(request: ExportLoRARequest, _: None = Depends(verify_api_key)):
         """Export trained LoRA weights."""
         import shutil
-        
+
         final_dir = os.path.join(request.lora_output_dir, "final")
         checkpoint_dir = os.path.join(request.lora_output_dir, "checkpoints")
-        
+
         if os.path.exists(final_dir):
             source_path = final_dir
         elif os.path.exists(checkpoint_dir):
             checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
             if not checkpoints:
                 raise HTTPException(status_code=404, detail="No checkpoints found")
-            
+
             checkpoints.sort(key=lambda x: int(x.split("_")[1]))
             latest = checkpoints[-1]
             source_path = os.path.join(checkpoint_dir, latest)
         else:
             raise HTTPException(status_code=404, detail=f"No trained model found in {request.lora_output_dir}")
-        
+
         try:
             export_path = request.export_path.strip()
             os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
-            
+
             if os.path.exists(export_path):
                 shutil.rmtree(export_path)
-            
+
             shutil.copytree(source_path, export_path)
-            
+
             return _wrap_response({
                 "message": f"LoRA exported successfully",
                 "export_path": export_path,
                 "source": source_path
             })
-            
+
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Export failed: {str(e)}")
 

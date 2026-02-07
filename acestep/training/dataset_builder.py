@@ -179,7 +179,7 @@ class DatasetMetadata:
     def __post_init__(self):
         if not self.created_at:
             self.created_at = datetime.now().isoformat()
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return asdict(self)
@@ -187,20 +187,20 @@ class DatasetMetadata:
 
 class DatasetBuilder:
     """Builder for creating training datasets from audio files.
-    
+
     This class handles:
     - Scanning directories for audio files
     - Auto-labeling using LLM
     - Managing sample metadata
     - Saving/loading datasets
     """
-    
+
     def __init__(self):
         """Initialize the dataset builder."""
         self.samples: List[AudioSample] = []
         self.metadata = DatasetMetadata()
         self._current_dir: str = ""
-    
+
     def scan_directory(self, directory: str) -> Tuple[List[AudioSample], str]:
         """Scan a directory for audio files.
 
@@ -423,13 +423,13 @@ class DatasetBuilder:
                 return "", False
 
         return "", False
-    
+
     def _get_audio_duration(self, audio_path: str) -> int:
         """Get the duration of an audio file in seconds.
-        
+
         Args:
             audio_path: Path to audio file
-            
+
         Returns:
             Duration in seconds (integer)
         """
@@ -448,7 +448,7 @@ class DatasetBuilder:
         except Exception as e:
             logger.warning(f"Failed to get duration for {audio_path}: {e}")
             return 0
-    
+
     def label_sample(
         self,
         sample_idx: int,
@@ -478,13 +478,6 @@ class DatasetBuilder:
 
         sample = self.samples[sample_idx]
 
-        # Check if sample has pre-loaded lyrics from .txt file
-        has_preloaded_lyrics = sample.has_raw_lyrics() and not sample.is_instrumental
-
-        # Remember if sample has pre-existing metadata from CSV (don't overwrite)
-        has_csv_bpm = sample.bpm is not None
-        has_csv_key = bool(sample.keyscale)
-
         try:
             if progress_callback:
                 progress_callback(f"Processing: {sample.filename}")
@@ -494,108 +487,117 @@ class DatasetBuilder:
 
             if not audio_codes:
                 return sample, f"❌ Failed to encode audio: {sample.filename}"
-
-            if progress_callback:
-                progress_callback(f"Generating metadata for: {sample.filename}")
-
-            # Step 2: Use LLM based on mode
-            if format_lyrics and has_preloaded_lyrics:
-                # Format mode: Use format_sample to format user-provided lyrics
-                from acestep.inference import format_sample
-
-                result = format_sample(
-                    llm_handler=llm_handler,
-                    caption="",  # Let LLM generate caption
-                    lyrics=sample.raw_lyrics,  # Pass user's raw lyrics
-                    user_metadata=None,
-                    temperature=0.85,
-                    use_constrained_decoding=True,
-                )
-
-                if not result.success:
-                    return sample, f"❌ LLM format failed: {result.error}"
-
-                # Update sample with formatted results (preserve CSV metadata)
-                sample.caption = result.caption or ""
-                if not skip_metas:
-                    if not has_csv_bpm:
-                        sample.bpm = result.bpm
-                    if not has_csv_key:
-                        sample.keyscale = result.keyscale or ""
-                    sample.timesignature = result.timesignature or ""
-                sample.language = result.language or "unknown"
-                sample.formatted_lyrics = result.lyrics or ""
-                sample.lyrics = sample.formatted_lyrics if sample.formatted_lyrics else sample.raw_lyrics
-
-                status_suffix = "(lyrics formatted by LM)"
-
-            else:
-                # Understand mode: Use understand_audio_from_codes to get metadata and optionally transcribe lyrics
-                metadata, status = llm_handler.understand_audio_from_codes(
-                    audio_codes=audio_codes,
-                    temperature=0.7,
-                    use_constrained_decoding=True,
-                )
-
-                if not metadata:
-                    return sample, f"❌ LLM labeling failed: {status}"
-
-                # Update sample with generated caption and genre (always)
-                sample.caption = metadata.get('caption', '')
-                sample.genre = metadata.get('genres', '')  # Extract genre from LLM output
-
-                # Update metas only if not skipped and not from CSV
-                if not skip_metas:
-                    if not has_csv_bpm:
-                        sample.bpm = self._parse_int(metadata.get('bpm'))
-                    if not has_csv_key:
-                        sample.keyscale = metadata.get('keyscale', '')
-                    sample.timesignature = metadata.get('timesignature', '')
-
-                sample.language = metadata.get('vocal_language', 'unknown')
-
-                # LLM-generated/transcribed lyrics
-                llm_lyrics = metadata.get('lyrics', '')
-
-                # Handle lyrics based on mode
-                if sample.is_instrumental:
-                    sample.lyrics = "[Instrumental]"
-                    sample.language = "unknown"
-                    sample.formatted_lyrics = ""
-                    status_suffix = "(instrumental)"
-                elif transcribe_lyrics:
-                    # Transcribe mode: Use LLM-generated lyrics, ignore user's .txt file
-                    sample.formatted_lyrics = llm_lyrics
-                    sample.lyrics = llm_lyrics
-                    status_suffix = "(lyrics transcribed by LM)"
-                elif has_preloaded_lyrics:
-                    # Keep raw lyrics from .txt file
-                    sample.lyrics = sample.raw_lyrics
-                    sample.formatted_lyrics = ""
-                    status_suffix = "(using raw lyrics)"
-                else:
-                    # No pre-loaded lyrics and not transcribing, use LLM lyrics
-                    sample.lyrics = llm_lyrics
-                    sample.formatted_lyrics = llm_lyrics
-                    status_suffix = ""
-
-            # NOTE: Duration is NOT overwritten from LM metadata.
-            # We keep the real audio duration obtained from torchaudio during scan.
-
-            sample.labeled = True
-            self.samples[sample_idx] = sample
-
-            status_msg = f"✅ Labeled: {sample.filename}"
-            if skip_metas:
-                status_msg += " (skip metas)"
-            if status_suffix:
-                status_msg += f" {status_suffix}"
-
-            return sample, status_msg
+            return self._label_sample_from_codes(
+                sample_idx=sample_idx,
+                audio_codes=audio_codes,
+                llm_handler=llm_handler,
+                format_lyrics=format_lyrics,
+                transcribe_lyrics=transcribe_lyrics,
+                skip_metas=skip_metas,
+                progress_callback=progress_callback,
+            )
 
         except Exception as e:
             logger.exception(f"Error labeling sample {sample.filename}")
             return sample, f"❌ Error: {str(e)}"
+
+    def _label_sample_from_codes(
+        self,
+        sample_idx: int,
+        audio_codes: str,
+        llm_handler,
+        format_lyrics: bool = False,
+        transcribe_lyrics: bool = False,
+        skip_metas: bool = False,
+        progress_callback=None,
+    ) -> Tuple[AudioSample, str]:
+        if sample_idx < 0 or sample_idx >= len(self.samples):
+            return None, f"❌ Invalid sample index: {sample_idx}"
+
+        sample = self.samples[sample_idx]
+        has_preloaded_lyrics = sample.has_raw_lyrics() and not sample.is_instrumental
+        has_csv_bpm = sample.bpm is not None
+        has_csv_key = bool(sample.keyscale)
+
+        if progress_callback:
+            progress_callback(f"Generating metadata for: {sample.filename}")
+
+        if format_lyrics and has_preloaded_lyrics:
+            from acestep.inference import format_sample
+
+            result = format_sample(
+                llm_handler=llm_handler,
+                caption="",
+                lyrics=sample.raw_lyrics,
+                user_metadata=None,
+                temperature=0.85,
+                use_constrained_decoding=True,
+            )
+
+            if not result.success:
+                return sample, f"❌ LLM format failed: {result.error}"
+
+            sample.caption = result.caption or ""
+            if not skip_metas:
+                if not has_csv_bpm:
+                    sample.bpm = result.bpm
+                if not has_csv_key:
+                    sample.keyscale = result.keyscale or ""
+                sample.timesignature = result.timesignature or ""
+            sample.language = result.language or "unknown"
+            sample.formatted_lyrics = result.lyrics or ""
+            sample.lyrics = sample.formatted_lyrics if sample.formatted_lyrics else sample.raw_lyrics
+            status_suffix = "(lyrics formatted by LM)"
+        else:
+            metadata, status = llm_handler.understand_audio_from_codes(
+                audio_codes=audio_codes,
+                temperature=0.7,
+                use_constrained_decoding=True,
+            )
+
+            if not metadata:
+                return sample, f"❌ LLM labeling failed: {status}"
+
+            sample.caption = metadata.get('caption', '')
+            sample.genre = metadata.get('genres', '')
+
+            if not skip_metas:
+                if not has_csv_bpm:
+                    sample.bpm = self._parse_int(metadata.get('bpm'))
+                if not has_csv_key:
+                    sample.keyscale = metadata.get('keyscale', '')
+                sample.timesignature = metadata.get('timesignature', '')
+
+            sample.language = metadata.get('vocal_language', 'unknown')
+            llm_lyrics = metadata.get('lyrics', '')
+
+            if sample.is_instrumental:
+                sample.lyrics = "[Instrumental]"
+                sample.language = "unknown"
+                sample.formatted_lyrics = ""
+                status_suffix = "(instrumental)"
+            elif transcribe_lyrics:
+                sample.formatted_lyrics = llm_lyrics
+                sample.lyrics = llm_lyrics
+                status_suffix = "(lyrics transcribed by LM)"
+            elif has_preloaded_lyrics:
+                sample.lyrics = sample.raw_lyrics
+                sample.formatted_lyrics = ""
+                status_suffix = "(using raw lyrics)"
+            else:
+                sample.lyrics = llm_lyrics
+                sample.formatted_lyrics = llm_lyrics
+                status_suffix = ""
+
+        sample.labeled = True
+        self.samples[sample_idx] = sample
+
+        status_msg = f"✅ Labeled: {sample.filename}"
+        if skip_metas:
+            status_msg += " (skip metas)"
+        if status_suffix:
+            status_msg += f" {status_suffix}"
+        return sample, status_msg
 
     def label_all_samples(
         self,
@@ -608,6 +610,13 @@ class DatasetBuilder:
         progress_callback=None,
     ) -> Tuple[List[AudioSample], str]:
         """Label all samples in the dataset.
+
+        Uses a two-phase approach for efficiency:
+        Phase 1 - Batch encode: Load VAE and tokenizer model ONCE, encode all
+                  audio files to codes strings, then offload.
+        Phase 2 - Batch label: Run LLM for each sample using cached codes.
+
+        This avoids the overhead of loading/offloading models per sample.
 
         Args:
             dit_handler: DiT handler for audio encoding
@@ -622,7 +631,7 @@ class DatasetBuilder:
             Tuple of (list of updated samples, status message)
         """
         if not self.samples:
-            return [], "❌ No samples to label. Please scan a directory first."
+            return [], "No samples to label. Please scan a directory first."
 
         # Filter samples if only_unlabeled
         if only_unlabeled:
@@ -634,18 +643,37 @@ class DatasetBuilder:
             samples_to_label = [(i, s) for i, s in enumerate(self.samples)]
 
         if not samples_to_label:
-            return self.samples, "✅ All samples already labeled"
+            return self.samples, "All samples already labeled"
+
+        total = len(samples_to_label)
+
+        # ── Phase 1: Batch-encode all audio to codes strings ──────────
+        # Keep VAE and tokenizer model loaded for the entire batch to avoid
+        # repeated CPU↔GPU model transfers (the main bottleneck).
+        if progress_callback:
+            progress_callback(f"Phase 1/{2}: Encoding audio for {total} samples...")
+
+        codes_cache: Dict[int, Optional[str]] = {}
+        codes_cache = self._batch_encode_audio_codes(
+            samples_to_label, dit_handler, progress_callback, total
+        )
+
+        # ── Phase 2: LLM labeling using cached codes ──────────────────
+        if progress_callback:
+            progress_callback(f"Phase 2/{2}: Labeling {total} samples with LLM...")
 
         success_count = 0
         fail_count = 0
-        total = len(samples_to_label)
 
         for idx, (i, sample) in enumerate(samples_to_label):
             if progress_callback:
                 progress_callback(f"Labeling {idx+1}/{total}: {sample.filename}")
 
-            _, status = self.label_sample(
-                i, dit_handler, llm_handler, format_lyrics, transcribe_lyrics, skip_metas, progress_callback
+            # Use cached codes instead of re-encoding
+            cached_codes = codes_cache.get(i)
+            _, status = self._label_sample_with_codes(
+                i, cached_codes, dit_handler, llm_handler,
+                format_lyrics, transcribe_lyrics, skip_metas, progress_callback,
             )
 
             if "✅" in status:
@@ -653,21 +681,193 @@ class DatasetBuilder:
             else:
                 fail_count += 1
 
-        status_msg = f"✅ Labeled {success_count}/{total} samples"
+        status_msg = f"Labeled {success_count}/{total} samples"
         if fail_count > 0:
             status_msg += f" ({fail_count} failed)"
         if only_unlabeled:
             status_msg += f" (unlabeled only, {len(self.samples)} total)"
 
         return self.samples, status_msg
-    
+
+    def _batch_encode_audio_codes(
+        self,
+        samples_to_label: list,
+        dit_handler,
+        progress_callback,
+        total: int,
+    ) -> Dict[int, Optional[str]]:
+        """Encode all audio files to codes strings in one batch.
+
+        Keeps VAE and tokenizer model loaded on GPU for the entire batch,
+        avoiding per-sample load/offload overhead.
+
+        Returns:
+            Dict mapping sample index → codes string (or None on failure)
+        """
+        import torch
+        codes_cache: Dict[int, Optional[str]] = {}
+
+        # Check if handler supports the required method
+        if not hasattr(dit_handler, 'convert_src_audio_to_codes'):
+            logger.error("DiT handler missing convert_src_audio_to_codes method")
+            for i, _ in samples_to_label:
+                codes_cache[i] = None
+            return codes_cache
+
+        # Check if handler uses model offloading
+        uses_offload = getattr(dit_handler, 'offload_to_cpu', False)
+
+        if uses_offload and hasattr(dit_handler, '_load_model_context'):
+            # Batch mode: manually load models once, encode all, then offload
+            codes_cache = self._batch_encode_with_offload(
+                samples_to_label, dit_handler, progress_callback, total
+            )
+        else:
+            # No offloading: models stay on GPU, just call per-sample
+            with torch.no_grad():
+                for idx, (i, sample) in enumerate(samples_to_label):
+                    if progress_callback and idx % 5 == 0:
+                        progress_callback(f"Encoding {idx+1}/{total}: {sample.filename}")
+                    codes_cache[i] = self._get_audio_codes(sample.audio_path, dit_handler)
+
+        return codes_cache
+
+    def _batch_encode_with_offload(
+        self,
+        samples_to_label: list,
+        dit_handler,
+        progress_callback,
+        total: int,
+    ) -> Dict[int, Optional[str]]:
+        """Batch encode when model offloading is active.
+
+        Instead of loading/offloading VAE and model for every sample,
+        we load each model once, process all samples, then offload.
+        """
+        import torch
+        codes_cache: Dict[int, Optional[str]] = {}
+
+        chunk_size = 16
+        for chunk_start in range(0, len(samples_to_label), chunk_size):
+            chunk = samples_to_label[chunk_start:chunk_start + chunk_size]
+            latents_cache: Dict[int, torch.Tensor] = {}
+
+            with dit_handler._load_model_context("vae"):
+                with torch.no_grad():
+                    for j, (i, sample) in enumerate(chunk):
+                        global_idx = chunk_start + j
+                        if progress_callback and global_idx % 5 == 0:
+                            progress_callback(f"VAE encoding {global_idx+1}/{total}: {sample.filename}")
+                        try:
+                            processed_audio = dit_handler.process_src_audio(sample.audio_path)
+                            if processed_audio is None:
+                                continue
+                            if dit_handler.is_silence(processed_audio.unsqueeze(0)):
+                                continue
+                            latents = dit_handler._encode_audio_to_latents(processed_audio)
+                            latents_cache[i] = latents.cpu()
+                        except Exception as e:
+                            logger.warning(f"VAE encode failed for {sample.filename}: {e}")
+
+            with dit_handler._load_model_context("model"):
+                try:
+                    model = getattr(dit_handler, "model", None)
+                    if model is None or not hasattr(model, "tokenize"):
+                        raise RuntimeError("dit_handler.model is missing or has no tokenize()")
+
+                    silence_latent = getattr(dit_handler, "silence_latent", None)
+                    if silence_latent is None:
+                        raise RuntimeError("dit_handler.silence_latent is missing")
+
+                    target_device = dit_handler.device
+                    if isinstance(target_device, str):
+                        target_device = torch.device(target_device)
+                    if silence_latent.device != target_device:
+                        raise RuntimeError(
+                            f"silence_latent on {silence_latent.device}, expected {target_device}"
+                        )
+                except Exception as e:
+                    logger.error(f"Tokenize precheck failed: {e}")
+                    for i, _ in chunk:
+                        codes_cache[i] = None
+                    continue
+
+                with torch.no_grad():
+                    for j, (i, sample) in enumerate(chunk):
+                        global_idx = chunk_start + j
+                        if i not in latents_cache:
+                            codes_cache[i] = None
+                            continue
+                        if progress_callback and global_idx % 5 == 0:
+                            progress_callback(f"Tokenizing {global_idx+1}/{total}: {sample.filename}")
+                        try:
+                            latents = latents_cache[i].to(device=dit_handler.device, dtype=dit_handler.dtype)
+                            attention_mask = torch.ones(latents.shape[0], dtype=torch.bool, device=dit_handler.device)
+                            hidden_states = latents.unsqueeze(0)
+                            _, indices, _ = model.tokenize(
+                                hidden_states, silence_latent, attention_mask.unsqueeze(0)
+                            )
+                            indices_flat = indices.flatten().cpu().tolist()
+                            codes_cache[i] = "".join(
+                                f"<|audio_code_{idx_val}|>" for idx_val in indices_flat
+                            )
+                        except Exception as e:
+                            logger.warning(f"Tokenize failed for {sample.filename}: {e}")
+                            codes_cache[i] = None
+
+            del latents_cache
+
+        return codes_cache
+
+    def _label_sample_with_codes(
+        self,
+        sample_idx: int,
+        audio_codes: Optional[str],
+        dit_handler,
+        llm_handler,
+        format_lyrics: bool = False,
+        transcribe_lyrics: bool = False,
+        skip_metas: bool = False,
+        progress_callback=None,
+    ) -> Tuple['AudioSample', str]:
+        """Label a single sample using pre-computed audio codes.
+
+        Same logic as label_sample() but skips the audio encoding step
+        since codes are already provided.
+        """
+        if sample_idx < 0 or sample_idx >= len(self.samples):
+            return None, f"Invalid sample index: {sample_idx}"
+
+        sample = self.samples[sample_idx]
+
+        try:
+            if audio_codes is None:
+                # Fallback: try encoding individually (for samples that failed batch encoding)
+                audio_codes = self._get_audio_codes(sample.audio_path, dit_handler)
+
+            if not audio_codes:
+                return sample, f"Failed to encode audio: {sample.filename}"
+            return self._label_sample_from_codes(
+                sample_idx=sample_idx,
+                audio_codes=audio_codes,
+                llm_handler=llm_handler,
+                format_lyrics=format_lyrics,
+                transcribe_lyrics=transcribe_lyrics,
+                skip_metas=skip_metas,
+                progress_callback=progress_callback,
+            )
+
+        except Exception as e:
+            logger.exception(f"Error labeling sample {sample.filename}")
+            return sample, f"Error: {str(e)}"
+
     def _get_audio_codes(self, audio_path: str, dit_handler) -> Optional[str]:
         """Encode audio to get semantic codes for LLM understanding.
-        
+
         Args:
             audio_path: Path to audio file
             dit_handler: DiT handler with VAE and tokenizer
-            
+
         Returns:
             Audio codes string or None if failed
         """
@@ -676,20 +876,20 @@ class DatasetBuilder:
             if not hasattr(dit_handler, 'convert_src_audio_to_codes'):
                 logger.error("DiT handler missing convert_src_audio_to_codes method")
                 return None
-            
+
             # Use handler's method to convert audio to codes
             codes_string = dit_handler.convert_src_audio_to_codes(audio_path)
-            
+
             if codes_string and not codes_string.startswith("❌"):
                 return codes_string
             else:
                 logger.warning(f"Failed to convert audio to codes: {codes_string}")
                 return None
-                
+
         except Exception as e:
             logger.exception(f"Error encoding audio {audio_path}")
             return None
-    
+
     def _parse_int(self, value: Any) -> Optional[int]:
         """Safely parse an integer value."""
         if value is None or value == "N/A" or value == "":
@@ -698,42 +898,42 @@ class DatasetBuilder:
             return int(value)
         except (ValueError, TypeError):
             return None
-    
+
     def update_sample(self, sample_idx: int, **kwargs) -> Tuple[AudioSample, str]:
         """Update a sample's metadata.
-        
+
         Args:
             sample_idx: Index of sample to update
             **kwargs: Fields to update
-            
+
         Returns:
             Tuple of (updated sample, status message)
         """
         if sample_idx < 0 or sample_idx >= len(self.samples):
             return None, f"❌ Invalid sample index: {sample_idx}"
-        
+
         sample = self.samples[sample_idx]
-        
+
         for key, value in kwargs.items():
             if hasattr(sample, key):
                 setattr(sample, key, value)
-        
+
         self.samples[sample_idx] = sample
         return sample, f"✅ Updated: {sample.filename}"
-    
+
     def set_custom_tag(self, custom_tag: str, tag_position: str = "prepend"):
         """Set the custom tag for all samples.
-        
+
         Args:
             custom_tag: Custom activation tag
             tag_position: Where to place tag ("prepend", "append", "replace")
         """
         self.metadata.custom_tag = custom_tag
         self.metadata.tag_position = tag_position
-        
+
         for sample in self.samples:
             sample.custom_tag = custom_tag
-    
+
     def set_all_instrumental(self, is_instrumental: bool):
         """Set instrumental flag for all samples.
 
@@ -758,68 +958,68 @@ class DatasetBuilder:
                 if is_instrumental:
                     sample.lyrics = "[Instrumental]"
                     sample.language = "unknown"
-    
+
     def get_sample_count(self) -> int:
         """Get the number of samples in the dataset."""
         return len(self.samples)
-    
+
     def get_labeled_count(self) -> int:
         """Get the number of labeled samples."""
         return sum(1 for s in self.samples if s.labeled)
-    
+
     def save_dataset(self, output_path: str, dataset_name: str = None) -> str:
         """Save the dataset to a JSON file.
-        
+
         Args:
             output_path: Path to save the dataset JSON
             dataset_name: Optional name for the dataset
-            
+
         Returns:
             Status message
         """
         if not self.samples:
             return "❌ No samples to save"
-        
+
         if dataset_name:
             self.metadata.name = dataset_name
-        
+
         self.metadata.num_samples = len(self.samples)
         self.metadata.created_at = datetime.now().isoformat()
-        
+
         # Build dataset (save raw values, custom tag is applied during preprocessing)
         dataset = {
             "metadata": self.metadata.to_dict(),
             "samples": [sample.to_dict() for sample in self.samples]
         }
-        
+
         try:
             # Ensure output directory exists
             os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-            
+
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(dataset, f, indent=2, ensure_ascii=False)
-            
+
             return f"✅ Dataset saved to {output_path}\n{len(self.samples)} samples, tag: '{self.metadata.custom_tag}'"
         except Exception as e:
             logger.exception("Error saving dataset")
             return f"❌ Failed to save dataset: {str(e)}"
-    
+
     def load_dataset(self, dataset_path: str) -> Tuple[List[AudioSample], str]:
         """Load a dataset from a JSON file.
-        
+
         Args:
             dataset_path: Path to the dataset JSON file
-            
+
         Returns:
             Tuple of (list of samples, status message)
         """
         if not os.path.exists(dataset_path):
             return [], f"❌ Dataset not found: {dataset_path}"
-        
+
         try:
             with open(dataset_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+
             # Load metadata
             if "metadata" in data:
                 meta_dict = data["metadata"]
@@ -831,19 +1031,19 @@ class DatasetBuilder:
                     num_samples=meta_dict.get("num_samples", 0),
                     all_instrumental=meta_dict.get("all_instrumental", True),
                 )
-            
+
             # Load samples
             self.samples = []
             for sample_dict in data.get("samples", []):
                 sample = AudioSample.from_dict(sample_dict)
                 self.samples.append(sample)
-            
+
             return self.samples, f"✅ Loaded {len(self.samples)} samples from {dataset_path}"
-            
+
         except Exception as e:
             logger.exception("Error loading dataset")
             return [], f"❌ Failed to load dataset: {str(e)}"
-    
+
     def get_samples_dataframe_data(self) -> List[List[Any]]:
         """Get samples data in a format suitable for Gradio DataFrame.
 
@@ -871,19 +1071,19 @@ class DatasetBuilder:
                 sample.caption[:50] + "..." if len(sample.caption) > 50 else sample.caption or "-",
             ])
         return rows
-    
+
     def to_training_format(self) -> List[Dict[str, Any]]:
         """Convert dataset to format suitable for training.
-        
+
         Returns:
             List of training sample dictionaries
         """
         training_samples = []
-        
+
         for sample in self.samples:
             if not sample.labeled:
                 continue
-            
+
             training_sample = {
                 "audio_path": sample.audio_path,
                 "caption": sample.get_full_caption(self.metadata.tag_position),
@@ -896,9 +1096,9 @@ class DatasetBuilder:
                 "is_instrumental": sample.is_instrumental,
             }
             training_samples.append(training_sample)
-        
+
         return training_samples
-    
+
     def preprocess_to_tensors(
         self,
         dit_handler,
@@ -907,39 +1107,39 @@ class DatasetBuilder:
         progress_callback=None,
     ) -> Tuple[List[str], str]:
         """Preprocess all labeled samples to tensor files for efficient training.
-        
+
         This method pre-computes all tensors needed by the DiT decoder:
         - target_latents: VAE-encoded audio
         - encoder_hidden_states: Condition encoder output
         - context_latents: Source context (silence_latent + zeros for text2music)
-        
+
         Args:
             dit_handler: Initialized DiT handler with model, VAE, and text encoder
             output_dir: Directory to save preprocessed .pt files
             max_duration: Maximum audio duration in seconds (default 240s = 4 min)
             progress_callback: Optional callback for progress updates
-            
+
         Returns:
             Tuple of (list of output paths, status message)
         """
         if not self.samples:
             return [], "❌ No samples to preprocess"
-        
+
         labeled_samples = [s for s in self.samples if s.labeled]
         if not labeled_samples:
             return [], "❌ No labeled samples to preprocess"
-        
+
         # Validate handler
         if dit_handler is None or dit_handler.model is None:
             return [], "❌ Model not initialized. Please initialize the service first."
-        
+
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        
+
         output_paths = []
         success_count = 0
         fail_count = 0
-        
+
         # Get model and components
         model = dit_handler.model
         vae = dit_handler.vae
@@ -963,64 +1163,60 @@ class DatasetBuilder:
         random.shuffle(all_indices)
         genre_indices = set(all_indices[:num_genre_samples])
 
-        for i, sample in enumerate(labeled_samples):
+        # Pre-allocate refer_audio placeholders once (reused for every sample)
+        refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=dtype)
+        refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
+
+        # Cache Resamplers to avoid re-building filter kernels per sample
+        _resamplers: Dict[int, torchaudio.transforms.Resample] = {}
+
+        # Use inference_mode for the entire loop – faster than per-call no_grad
+        with torch.inference_mode():
+          for i, sample in enumerate(labeled_samples):
             try:
                 if progress_callback:
                     progress_callback(f"Preprocessing {i+1}/{len(labeled_samples)}: {sample.filename}")
 
-                # Determine if this sample uses genre (per-sample override > global ratio)
                 use_genre = i in genre_indices
 
                 # Step 1: Load and preprocess audio to stereo @ 48kHz
                 audio_cpu, sr = torchaudio.load(sample.audio_path)
-                
-                # Resample if needed
+
+                # Resample if needed (reuse cached Resampler)
                 if sr != target_sample_rate:
-                    resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
-                    audio_resampled = resampler(audio_cpu)
-                    del audio_cpu, resampler  # Free original audio and resampler
-                    audio_cpu = audio_resampled
-                
+                    if sr not in _resamplers:
+                        _resamplers[sr] = torchaudio.transforms.Resample(sr, target_sample_rate)
+                    audio_cpu = _resamplers[sr](audio_cpu)
+
                 # Convert to stereo
                 if audio_cpu.shape[0] == 1:
-                    audio_stereo = audio_cpu.repeat(2, 1)
-                    del audio_cpu
-                    audio_cpu = audio_stereo
+                    audio_cpu = audio_cpu.repeat(2, 1)
                 elif audio_cpu.shape[0] > 2:
-                    audio_stereo = audio_cpu[:2, :]
-                    del audio_cpu
-                    audio_cpu = audio_stereo
-                
+                    audio_cpu = audio_cpu[:2, :]
+
                 # Truncate to max duration
                 max_samples = int(max_duration * target_sample_rate)
                 if audio_cpu.shape[1] > max_samples:
-                    audio_truncated = audio_cpu[:, :max_samples]
-                    del audio_cpu
-                    audio_cpu = audio_truncated
-                
+                    audio_cpu = audio_cpu[:, :max_samples]
+
                 # Add batch dimension and move to GPU: [2, T] -> [1, 2, T]
-                audio = audio_cpu.unsqueeze(0).to(device).to(vae.dtype)
-                del audio_cpu  # Free CPU tensor before GPU operations
-                
+                audio = audio_cpu.unsqueeze(0).to(device, dtype=vae.dtype, non_blocking=True)
+                del audio_cpu
+
                 # Step 2: VAE encode audio to get target_latents
-                with torch.no_grad():
-                    latent_dist = vae.encode(audio).latent_dist
-                    latent = latent_dist.sample()
-                    del latent_dist  # Free distribution object
-                    # [1, 64, T_latent] -> [1, T_latent, 64]
-                    target_latents = latent.transpose(1, 2).to(dtype)
-                    del latent  # Free intermediate latent
-                
+                latent = vae.encode(audio).latent_dist.sample()
+                # [1, 64, T_latent] -> [1, T_latent, 64]
+                target_latents = latent.transpose(1, 2).to(dtype)
+                del audio, latent
+
                 latent_length = target_latents.shape[1]
-                
+
                 # Step 3: Create attention mask (all ones for valid audio)
                 attention_mask = torch.ones(1, latent_length, device=device, dtype=dtype)
 
-                # Step 4: Encode caption/genre text (per-sample override > global ratio)
-                # Use SFT_GEN_PROMPT format to match inference (handler.py)
+                # Step 4: Encode caption/genre text
                 caption = sample.get_training_prompt(self.metadata.tag_position, use_genre=use_genre)
 
-                # Construct metas string (matches handler.py _dict_to_meta_string format)
                 metas_str = (
                     f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
                     f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
@@ -1028,13 +1224,11 @@ class DatasetBuilder:
                     f"- duration: {sample.duration} seconds\n"
                 )
 
-                # Use SFT_GEN_PROMPT format (same as inference)
                 text_prompt = SFT_GEN_PROMPT.format(DEFAULT_DIT_INSTRUCTION, caption, metas_str)
 
-                # Debug: Print first sample's text_prompt for verification
                 if i == 0:
                     logger.info(f"\n{'='*70}")
-                    logger.info("🔍 [DEBUG] DiT TEXT ENCODER INPUT (Training Preprocess)")
+                    logger.info("[DEBUG] DiT TEXT ENCODER INPUT (Training Preprocess)")
                     logger.info(f"{'='*70}")
                     logger.info(f"text_prompt:\n{text_prompt}")
                     logger.info(f"{'='*70}\n")
@@ -1049,10 +1243,9 @@ class DatasetBuilder:
                 text_input_ids = text_inputs.input_ids.to(device)
                 text_attention_mask = text_inputs.attention_mask.to(device).to(dtype)
 
-                with torch.no_grad():
-                    text_outputs = text_encoder(text_input_ids)
-                    text_hidden_states = text_outputs.last_hidden_state.to(dtype)
-                
+                text_outputs = text_encoder(text_input_ids)
+                text_hidden_states = text_outputs.last_hidden_state.to(dtype)
+
                 # Step 5: Encode lyrics
                 lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
                 lyric_inputs = text_tokenizer(
@@ -1064,36 +1257,24 @@ class DatasetBuilder:
                 )
                 lyric_input_ids = lyric_inputs.input_ids.to(device)
                 lyric_attention_mask = lyric_inputs.attention_mask.to(device).to(dtype)
-                
-                with torch.no_grad():
-                    lyric_hidden_states = text_encoder.embed_tokens(lyric_input_ids).to(dtype)
-                
-                # Step 6: Prepare refer_audio (empty for text2music)
-                # Create minimal refer_audio placeholder
-                refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=dtype)
-                refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
-                
+
+                lyric_hidden_states = text_encoder.embed_tokens(lyric_input_ids).to(dtype)
+
                 # Step 7: Run model.encoder to get encoder_hidden_states
-                with torch.no_grad():
-                    encoder_hidden_states, encoder_attention_mask = model.encoder(
-                        text_hidden_states=text_hidden_states,
-                        text_attention_mask=text_attention_mask,
-                        lyric_hidden_states=lyric_hidden_states,
-                        lyric_attention_mask=lyric_attention_mask,
-                        refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
-                        refer_audio_order_mask=refer_audio_order_mask,
-                    )
-                
+                encoder_hidden_states, encoder_attention_mask = model.encoder(
+                    text_hidden_states=text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    lyric_hidden_states=lyric_hidden_states,
+                    lyric_attention_mask=lyric_attention_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                    refer_audio_order_mask=refer_audio_order_mask,
+                )
+
                 # Step 8: Build context_latents for text2music
-                # For text2music: src_latents = silence_latent, is_covers = 0
-                # chunk_masks: 1 = generate, 0 = keep original
-                # IMPORTANT: chunk_masks must have same shape as src_latents [B, T, 64]
-                # For text2music, we want to generate the entire audio, so chunk_masks = all 1s
                 src_latents = silence_latent[:, :latent_length, :].to(dtype)
                 if src_latents.shape[0] < 1:
                     src_latents = src_latents.expand(1, -1, -1)
-                
-                # Pad or truncate silence_latent to match latent_length
+
                 if src_latents.shape[1] < latent_length:
                     pad_len = latent_length - src_latents.shape[1]
                     src_latents = torch.cat([
@@ -1102,21 +1283,17 @@ class DatasetBuilder:
                     ], dim=1)
                 elif src_latents.shape[1] > latent_length:
                     src_latents = src_latents[:, :latent_length, :]
-                
-                # chunk_masks = 1 means "generate this region", 0 = keep original
-                # Shape must match src_latents: [B, T, 64] (NOT [B, T, 1])
-                # For text2music, generate everything -> all 1s with shape [1, T, 64]
+
                 chunk_masks = torch.ones(1, latent_length, 64, device=device, dtype=dtype)
-                # context_latents = [src_latents, chunk_masks] -> [B, T, 128]
                 context_latents = torch.cat([src_latents, chunk_masks], dim=-1)
-                
-                # Step 9: Save all tensors to .pt file (squeeze batch dimension for storage)
+
+                # Step 9: Save all tensors to .pt file (squeeze batch dimension)
                 output_data = {
-                    "target_latents": target_latents.squeeze(0).cpu(),  # [T, 64]
-                    "attention_mask": attention_mask.squeeze(0).cpu(),  # [T]
-                    "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),  # [L, D]
-                    "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),  # [L]
-                    "context_latents": context_latents.squeeze(0).cpu(),  # [T, 65]
+                    "target_latents": target_latents.squeeze(0).cpu(),
+                    "attention_mask": attention_mask.squeeze(0).cpu(),
+                    "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),
+                    "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),
+                    "context_latents": context_latents.squeeze(0).cpu(),
                     "metadata": {
                         "audio_path": sample.audio_path,
                         "filename": sample.filename,
@@ -1130,36 +1307,18 @@ class DatasetBuilder:
                         "is_instrumental": sample.is_instrumental,
                     }
                 }
-                
-                # Save with sample ID as filename
+
                 output_path = os.path.join(output_dir, f"{sample.id}.pt")
                 torch.save(output_data, output_path)
                 output_paths.append(output_path)
                 success_count += 1
-                
-                # Free VRAM: Delete intermediate tensors
-                del audio, target_latents, attention_mask
-                del text_inputs, text_input_ids, text_attention_mask, text_outputs, text_hidden_states
-                del lyric_inputs, lyric_input_ids, lyric_attention_mask, lyric_hidden_states
-                del refer_audio_hidden, refer_audio_order_mask
-                del encoder_hidden_states, encoder_attention_mask
-                del src_latents, chunk_masks, context_latents
-                del output_data
-                
-                # Aggressive cache clearing every sample
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
+
             except Exception as e:
                 logger.exception(f"Error preprocessing {sample.filename}")
                 fail_count += 1
                 if progress_callback:
-                    progress_callback(f"❌ Failed: {sample.filename}: {str(e)}")
-                
-                # Clean up even on failure
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
+                    progress_callback(f"Failed: {sample.filename}: {str(e)}")
+
         # Save manifest file listing all preprocessed samples
         manifest = {
             "metadata": self.metadata.to_dict(),
@@ -1169,11 +1328,11 @@ class DatasetBuilder:
         manifest_path = os.path.join(output_dir, "manifest.json")
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
-        
+
         status = f"✅ Preprocessed {success_count}/{len(labeled_samples)} samples to {output_dir}"
         if fail_count > 0:
             status += f" ({fail_count} failed)"
-        
+
         return output_paths, status
 from .dataset_builder_modules import AudioSample, DatasetBuilder, DatasetMetadata, SUPPORTED_AUDIO_FORMATS
 
