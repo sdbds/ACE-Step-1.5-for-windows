@@ -40,7 +40,8 @@ dependencies = [
     "peft>=0.7.0",
     "lightning>=2.0.0",
     # Local third-party packages
-    "nano-vllm; sys_platform != 'darwin'",
+    # nano-vllm is a local package - install separately: pip install -e acestep/third_parts/nano-vllm
+    # For uv users: automatically handled via [tool.uv.sources]
     "modelscope"
 ]
 
