@@ -81,6 +81,7 @@ class AceStepHandler:
         self.custom_layers_config = {2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}
         self.offload_to_cpu = False
         self.offload_dit_to_cpu = False
+        self.compiled = False
         self.current_offload_cost = 0.0
         
         # LoRA state
@@ -356,6 +357,7 @@ class AceStepHandler:
             self.device = device
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
+            self.compiled = compile_model
             # Set dtype based on device: bfloat16 for cuda/xpu/mps, float32 for cpu
             # Models are trained in bfloat16; MPS supports bfloat16 natively since PyTorch 2.3+
             if device in ["cuda", "xpu", "mps"]:
@@ -3111,6 +3113,12 @@ class AceStepHandler:
                     # Cast output to float32 for audio processing/saving (in-place if possible)
                     if pred_wavs.dtype != torch.float32:
                         pred_wavs = pred_wavs.float()
+                    
+                    # Anti-clipping normalization: scale down audio that exceeds [-1, 1] range
+                    # Uses 5*std as an estimate of peak amplitude; if already within range, leave unchanged
+                    std = torch.std(pred_wavs, dim=[1, 2], keepdim=True) * 5.0
+                    std[std < 1.0] = 1.0
+                    pred_wavs /= std
                     
                     self._empty_cache()
             end_time = time.time()

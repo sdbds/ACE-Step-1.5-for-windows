@@ -141,6 +141,12 @@ def get_gpu_memory_gb() -> float:
             # Get total memory of the first GPU in GB
             total_memory = torch.cuda.get_device_properties(0).total_memory
             memory_gb = total_memory / (1024**3)  # Convert bytes to GB
+            device_name = torch.cuda.get_device_name(0)
+            is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+            if is_rocm:
+                logger.info(f"ROCm GPU detected: {device_name} ({memory_gb:.1f} GB, HIP {torch.version.hip})")
+            else:
+                logger.info(f"CUDA GPU detected: {device_name} ({memory_gb:.1f} GB)")
             return memory_gb
         elif hasattr(torch, 'xpu') and torch.xpu.is_available():
             # Get total memory of the first XPU in GB

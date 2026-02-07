@@ -345,12 +345,12 @@ def load_existing_dataset_for_preprocess(
 
     # Create info text
     labeled_count = builder.get_labeled_count()
-    info = f"❌ Loaded dataset: {builder.metadata.name}\n"
-    info += f"❌ Samples: {len(samples)} ({labeled_count} labeled)\n"
-    info += f"❌ Custom Tag: {builder.metadata.custom_tag or '(none)'}\n"
-    info += "❌ Ready for preprocessing! You can also edit samples below."
+    info = f"✅ Loaded dataset: {builder.metadata.name}\n"
+    info += f"✅ Samples: {len(samples)} ({labeled_count} labeled)\n"
+    info += f"✅ Custom Tag: {builder.metadata.custom_tag or '(none)'}\n"
+    info += "✅ Ready for preprocessing! You can also edit samples below."
     if any((s.formatted_lyrics and not s.lyrics) for s in builder.samples):
-        info += "\n❌ Showing formatted lyrics where lyrics are empty."
+        info += "\nℹ️ Showing formatted lyrics where lyrics are empty."
 
     # Get first sample preview
     first_sample = builder.samples[0]
@@ -471,9 +471,9 @@ def load_training_dataset(
             name = metadata.get("name", "Unknown")
             custom_tag = metadata.get("custom_tag", "")
             
-            info = f"❌ Loaded preprocessed dataset: {name}\n"
-            info += f"❌ Samples: {num_samples} preprocessed tensors\n"
-            info += f"❌ Custom Tag: {custom_tag or '(none)'}"
+            info = f"✅ Loaded preprocessed dataset: {name}\n"
+            info += f"✅ Samples: {num_samples} preprocessed tensors\n"
+            info += f"✅ Custom Tag: {custom_tag or '(none)'}"
             
             return info
         except Exception as e:
@@ -485,8 +485,8 @@ def load_training_dataset(
     if not pt_files:
         return f"❌ No .pt tensor files found in {tensor_dir}"
     
-    info = f"❌ Found {len(pt_files)} tensor files in {tensor_dir}\n"
-    info += "❌ No manifest.json found - using all .pt files"
+    info = f"✅ Found {len(pt_files)} tensor files in {tensor_dir}\n"
+    info += "⚠️ No manifest.json found - using all .pt files"
     
     return info
 
@@ -511,6 +511,7 @@ def _format_duration(seconds):
 def start_training(
     tensor_dir: str,
     dit_handler,
+    llm_handler,
     lora_rank: int,
     lora_alpha: int,
     lora_dropout: float,
@@ -541,6 +542,26 @@ def start_training(
     
     if dit_handler is None or dit_handler.model is None:
         yield "❌ Model not initialized. Please initialize the service first.", "", None, training_state
+        return
+    
+    # Check for training-incompatible settings
+    incompatible = []
+    if getattr(dit_handler, 'offload_to_cpu', False):
+        incompatible.append('⚠️ "Offload to CPU" is enabled — this will slow down training. Please uncheck it.')
+    if getattr(dit_handler, 'offload_dit_to_cpu', False):
+        incompatible.append('⚠️ "Offload DiT to CPU" is enabled — this will slow down training. Please uncheck it.')
+    if getattr(dit_handler, 'compiled', False):
+        incompatible.append('⚠️ "Compile Model" is enabled — this is incompatible with LoRA training. Please uncheck it.')
+    if getattr(dit_handler, 'quantization', None) is not None:
+        incompatible.append('⚠️ "INT8 Quantization" is enabled — this is incompatible with LoRA training. Please uncheck it.')
+    if llm_handler is not None and getattr(llm_handler, 'llm_initialized', False):
+        incompatible.append('⚠️ "5Hz LM" is initialized — it occupies GPU memory needed for training. Please uncheck "Initialize 5Hz LM".')
+    
+    if incompatible:
+        msg = "❌ Training cannot start due to incompatible settings:\n\n"
+        msg += "\n".join(incompatible)
+        msg += "\n\nPlease fix the above settings and re-initialize the DiT model before training."
+        yield msg, "", None, training_state
         return
     
     # Check for required training dependencies

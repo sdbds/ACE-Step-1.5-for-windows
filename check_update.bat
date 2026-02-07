@@ -247,7 +247,7 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
         REM Show commits behind
         echo   New commits:
-        "!GIT_PATH!" log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
+        "!GIT_PATH!" --no-pager log --oneline --graph --decorate HEAD..origin/%CURRENT_BRANCH% 2>nul
         echo.
 
         REM Ask if user wants to update
@@ -255,6 +255,9 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
         if /i "!UPDATE_CHOICE!"=="Y" (
             echo.
             echo Updating...
+
+            REM First, refresh the index to avoid false positives from line ending changes
+            "!GIT_PATH!" update-index --refresh >nul 2>&1
 
             REM Check for uncommitted changes
             "!GIT_PATH!" diff-index --quiet HEAD -- 2>nul
@@ -331,12 +334,8 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
                     if /i "!CONFLICT_CHOICE!"=="Y" (
                         echo.
-                        echo [Restore] Restoring conflicting files to remote version...
-
-                        REM Restore files to HEAD (discard local changes)
-                        "!GIT_PATH!" reset --hard HEAD >nul 2>&1
-
-                        echo [Restore] Files restored. Proceeding with update...
+                        echo [Restore] Proceeding with update...
+                        echo [Restore] Files will be updated to remote version.
                     ) else (
                         echo.
                         echo Update cancelled.
@@ -371,7 +370,8 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
             REM Pull changes
             echo Pulling latest changes...
-            "!GIT_PATH!" pull origin %CURRENT_BRANCH%
+            REM Force update by resetting to remote branch (discards any remaining local changes)
+            "!GIT_PATH!" reset --hard origin/%CURRENT_BRANCH% >nul 2>&1
 
             if !ERRORLEVEL! EQU 0 (
                 echo.

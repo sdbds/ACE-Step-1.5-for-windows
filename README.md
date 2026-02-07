@@ -110,6 +110,13 @@ ACE-Step works with AMD GPUs via PyTorch ROCm builds.
 
 This avoids CUDA wheel replacement and has been confirmed to work on ROCm systems. On Windows, use `.venv\Scripts\activate` and the same steps.
 
+### AMD / ROCM Linux Specific (cachy-os tested)
+Date of the program this worked:
+07.02.2026 - 10:40 am UTC +1
+
+ACE-Step1.5 Rocm Manual for cachy-os and tested with RDNA4.
+Look into docs\en\ACE-Step1.5-Rocm-Manual-Linux.md
+
 ### 🪟 Windows Portable Package (Recommended for Windows)
 
 For Windows users, we provide a portable package with pre-installed dependencies:

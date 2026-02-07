@@ -190,6 +190,13 @@ def main():
         print(f"  LM model: {args.lm_model_path}")
         print(f"  Backend: {args.backend}")
     
+    # Auto-enable CPU offload for tier6 GPUs (16-24GB) when using the 4B LM model
+    # The 4B LM (~8GB) + DiT (~4.7GB) + VAE + text encoder exceeds 16-20GB with activations
+    if not args.offload_to_cpu and args.lm_model_path and "4B" in args.lm_model_path:
+        if 0 < gpu_memory_gb <= 24:
+            args.offload_to_cpu = True
+            print(f"Auto-enabling CPU offload (4B LM model requires offloading on {gpu_memory_gb:.0f}GB GPU)")
+
     try:
         init_params = None
         dit_handler = None

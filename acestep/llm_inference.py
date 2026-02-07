@@ -399,6 +399,11 @@ class LLMHandler:
             )
             logger.info(f"Constrained processor initialized in {time.time() - processor_start:.2f} seconds")
             
+            # Disable CUDA/HIP graph capture on ROCm (unverified on RDNA3 Windows)
+            is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+            if is_rocm:
+                disable_cuda_graphs = True
+
             # Initialize based on user-selected backend
             if backend == "vllm":
                 # Try to initialize with vllm (LM always uses CUDA graphs for best performance)
@@ -430,8 +435,8 @@ class LLMHandler:
         capture is disabled (required when LoRA training may run in the same process)."""
         if not torch.cuda.is_available():
             self.llm_initialized = False
-            logger.error("CUDA is not available. Please check your GPU setup.")
-            return "❌ CUDA is not available. Please check your GPU setup."
+            logger.error("CUDA/ROCm is not available. Please check your GPU setup.")
+            return "❌ CUDA/ROCm is not available. Please check your GPU setup."
         try:
             from nanovllm import LLM, SamplingParams
         except ImportError:

@@ -1183,7 +1183,7 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
     def training_wrapper(tensor_dir, r, a, d, lr, ep, bs, ga, se, sh, sd, od, ts):
         try:
             for progress, log, plot, state in train_h.start_training(
-                tensor_dir, dit_handler, r, a, d, lr, ep, bs, ga, se, sh, sd, od, ts
+                tensor_dir, dit_handler, llm_handler, r, a, d, lr, ep, bs, ga, se, sh, sd, od, ts
             ):
                 yield progress, log, plot, state
         except Exception as e:
