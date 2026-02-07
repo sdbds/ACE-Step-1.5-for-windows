@@ -30,6 +30,14 @@ def load_lyrics_file(audio_path: str) -> Tuple[str, bool]:
 def get_audio_duration(audio_path: str) -> int:
     """Get the duration of an audio file in seconds."""
     try:
+        try:
+            import torchcodec
+
+            info = torchcodec.info(audio_path)
+            return int(info.num_frames / info.sample_rate)
+        except Exception:
+            pass
+
         waveform, sample_rate = torchaudio.load(audio_path)
         num_frames = waveform.shape[1]
         return int(num_frames / sample_rate)

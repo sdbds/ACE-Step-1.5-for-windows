@@ -434,6 +434,13 @@ class DatasetBuilder:
             Duration in seconds (integer)
         """
         try:
+            try:
+                import torchcodec
+
+                info = torchcodec.info(audio_path)
+                return int(info.num_frames / info.sample_rate)
+            except Exception:
+                pass
             # torchaudio 2.x removed top-level info(), use load() instead
             waveform, sample_rate = torchaudio.load(audio_path)
             num_frames = waveform.shape[1]
