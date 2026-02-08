@@ -26,6 +26,16 @@ from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INST
 from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
 
 
+def _is_tty(stream: object) -> bool:
+    try:
+        isatty = getattr(stream, "isatty", None)
+        if isatty is None:
+            return False
+        return bool(isatty())
+    except Exception:
+        return False
+
+
 def _warn_if_prerelease_python():
     v = sys.version_info
     if getattr(v, "releaselevel", "final") != "final" and sys.platform.startswith("linux"):
@@ -56,7 +66,7 @@ class LLMHandler:
         self.device = "cpu"
         self.dtype = torch.float32
         self.offload_to_cpu = False
-        self.disable_tqdm = os.environ.get("ACESTEP_DISABLE_TQDM", "").lower() in ("1", "true", "yes") or not sys.stderr.isatty()
+        self.disable_tqdm = os.environ.get("ACESTEP_DISABLE_TQDM", "").lower() in ("1", "true", "yes") or not _is_tty(sys.stderr)
 
         # HuggingFace Space persistent storage support
         if persistent_storage_path is None and self.IS_HUGGINGFACE_SPACE:
@@ -2268,7 +2278,7 @@ class LLMHandler:
 
         # Build logits processor for repetition penalty
         logits_processor = self._build_logits_processor(repetition_penalty)
-        
+
         with torch.inference_mode():
             for step in tqdm(range(max_new_tokens), desc="LLM Constrained Decoding", unit="token", disable=self.disable_tqdm):
                 # Forward pass
@@ -2373,7 +2383,7 @@ class LLMHandler:
 
         # Build logits processor for non-CFG operations (repetition penalty, top_k, top_p)
         logits_processor = self._build_logits_processor(repetition_penalty)
-        
+
         with torch.inference_mode():
             for step in tqdm(range(max_new_tokens), desc="LLM CFG Generation", unit="token", disable=self.disable_tqdm):
                 # Forward pass for the entire batch (conditional + unconditional)
@@ -2560,7 +2570,7 @@ class LLMHandler:
             save_current_field()
 
         return metadata, audio_codes
-    
+
     # =========================================================================
     # MLX Backend Methods (Apple Silicon native acceleration)
     # =========================================================================
@@ -2578,10 +2588,10 @@ class LLMHandler:
     def _load_mlx_model(self, model_path: str) -> Tuple[bool, str]:
         """
         Load the 5Hz LM model using mlx-lm for native Apple Silicon acceleration.
-        
+
         Args:
             model_path: Path to the HuggingFace model directory
-            
+
         Returns:
             Tuple of (success, status_message)
         """
@@ -2658,7 +2668,7 @@ class LLMHandler:
     ) -> str:
         """
         MLX-accelerated single-item generation.
-        
+
         Uses MLX for the model forward pass (fast on Apple Silicon) and bridges
         to PyTorch for logits processing and sampling (reuses existing tested code).
         This hybrid approach maximizes performance while ensuring correctness.
@@ -2947,7 +2957,7 @@ class LLMHandler:
         if not self.offload_to_cpu:
             yield
             return
-        
+
         # If using nanovllm or MLX, do not offload (managed differently)
         if self.llm_backend in ("vllm", "mlx"):
             yield
@@ -2991,7 +3001,7 @@ class LLMHandler:
         For vllm backend, loads HuggingFace model from disk (weights are cached by transformers).
         For pt backend, returns the existing model.
         For mlx backend, loads HuggingFace model from disk (MLX model can't be used for torch scoring).
-        
+
         Returns:
             HuggingFace model instance
         """
@@ -3029,17 +3039,17 @@ class LLMHandler:
                 logger.info(f"HuggingFace model for scoring ready on {device}")
 
             return self._hf_model_for_scoring
-        
+
         elif self.llm_backend == "mlx":
             # For MLX backend, load HuggingFace model from disk for PyTorch scoring
             if self._hf_model_for_scoring is None:
                 logger.info("Loading HuggingFace model for scoring (MLX backend, need PyTorch model)")
-                
+
                 # Get model path from stored path
                 model_path = getattr(self, '_mlx_model_path', None)
                 if model_path is None:
                     raise ValueError("MLX model path not stored. Cannot load HuggingFace model for scoring.")
-                
+
                 import time
                 start_time = time.time()
                 self._hf_model_for_scoring = AutoModelForCausalLM.from_pretrained(
@@ -3049,15 +3059,15 @@ class LLMHandler:
                 )
                 load_time = time.time() - start_time
                 logger.info(f"HuggingFace model loaded in {load_time:.2f}s")
-                
+
                 # Keep on CPU for MPS (scoring is not perf-critical)
                 device = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
                 self._hf_model_for_scoring = self._hf_model_for_scoring.to(device)
                 self._hf_model_for_scoring.eval()
-                
+
                 logger.info(f"HuggingFace model for scoring ready on {device}")
-            
+
             return self._hf_model_for_scoring
-        
+
         else:
             raise ValueError(f"Unknown backend: {self.llm_backend}")
