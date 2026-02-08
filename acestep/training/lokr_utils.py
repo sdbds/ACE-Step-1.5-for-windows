@@ -242,7 +242,10 @@ def save_lokr_training_checkpoint(
     os.makedirs(output_dir, exist_ok=True)
 
     # Save LoKR weights
-    save_lokr_weights(lycoris_net, output_dir)
+    metadata = None
+    if lokr_config is not None:
+        metadata = {"lokr_config": lokr_config.to_dict()}
+    save_lokr_weights(lycoris_net, output_dir, metadata=metadata)
 
     # Save training state
     training_state = {

@@ -135,38 +135,21 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     for i, sample in enumerate(batch):
         tl = sample["target_latents"]
-        if tl.shape[0] < max_latent_len:
-            pad = tl.new_zeros(max_latent_len - tl.shape[0], tl.shape[1])
-            tl = torch.cat([tl, pad], dim=0)
-        target_latents.append(tl)
+        tl_len = int(tl.shape[0])
+        target_latents[i, :tl_len] = tl
 
-        # Pad attention_mask [T] -> [max_T]
         am = sample["attention_mask"]
-        if am.shape[0] < max_latent_len:
-            pad = am.new_zeros(max_latent_len - am.shape[0])
-            am = torch.cat([am, pad], dim=0)
-        attention_masks.append(am)
+        attention_masks[i, :tl_len] = am
 
-        # Pad context_latents [T, 65] -> [max_T, 65]
         cl = sample["context_latents"]
-        if cl.shape[0] < max_latent_len:
-            pad = cl.new_zeros(max_latent_len - cl.shape[0], cl.shape[1])
-            cl = torch.cat([cl, pad], dim=0)
-        context_latents.append(cl)
+        context_latents[i, :tl_len] = cl
 
-        # Pad encoder_hidden_states [L, D] -> [max_L, D]
         ehs = sample["encoder_hidden_states"]
-        if ehs.shape[0] < max_encoder_len:
-            pad = ehs.new_zeros(max_encoder_len - ehs.shape[0], ehs.shape[1])
-            ehs = torch.cat([ehs, pad], dim=0)
-        encoder_hidden_states.append(ehs)
+        ehs_len = int(ehs.shape[0])
+        encoder_hidden_states[i, :ehs_len] = ehs
 
-        # Pad encoder_attention_mask [L] -> [max_L]
         eam = sample["encoder_attention_mask"]
-        if eam.shape[0] < max_encoder_len:
-            pad = eam.new_zeros(max_encoder_len - eam.shape[0])
-            eam = torch.cat([eam, pad], dim=0)
-        encoder_attention_masks.append(eam)
+        encoder_attention_masks[i, :ehs_len] = eam
 
     return {
         "target_latents": target_latents,           # [B, T, 64]

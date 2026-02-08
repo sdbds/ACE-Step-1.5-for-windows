@@ -326,6 +326,7 @@ class PreprocessedLoKRModule(nn.Module):
         self.training_config = training_config
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.dtype = dtype
+        self.timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=self.device, dtype=self.dtype)
         self.lycoris_net = None
         self.lokr_info = {}
 
@@ -362,7 +363,7 @@ class PreprocessedLoKRModule(nn.Module):
             x1 = torch.randn_like(target_latents)
             x0 = target_latents
 
-            t, r = sample_discrete_timestep(bsz, self.device, target_latents.dtype)
+            t, r = sample_discrete_timestep(bsz, self.timesteps_tensor)
             t_ = t.unsqueeze(-1).unsqueeze(-1)
             xt = t_ * x1 + (1.0 - t_) * x0
 
@@ -687,7 +688,11 @@ class LoRATrainer:
                 # Accumulate loss as a detached tensor to avoid CPU-GPU sync on
                 # every micro-batch.  We only call .item() at the optimizer step
                 # boundary when we actually need the scalar for logging.
-                accumulated_loss += loss.detach()
+                loss_detached = loss.detach()
+                if isinstance(accumulated_loss, torch.Tensor):
+                    accumulated_loss.add_(loss_detached)
+                else:
+                    accumulated_loss = loss_detached
                 accumulation_step += 1
 
                 # Optimizer step
@@ -818,7 +823,11 @@ class LoRATrainer:
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
-                accumulated_loss += loss.detach()
+                loss_detached = loss.detach()
+                if isinstance(accumulated_loss, torch.Tensor):
+                    accumulated_loss.add_(loss_detached)
+                else:
+                    accumulated_loss = loss_detached
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
@@ -1027,7 +1036,11 @@ class LoKRTrainer:
                 loss = loss / self.training_config.gradient_accumulation_steps
 
                 self.fabric.backward(loss)
-                accumulated_loss += loss.detach()
+                loss_detached = loss.detach()
+                if isinstance(accumulated_loss, torch.Tensor):
+                    accumulated_loss.add_(loss_detached)
+                else:
+                    accumulated_loss = loss_detached
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
@@ -1139,7 +1152,11 @@ class LoKRTrainer:
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
-                accumulated_loss += loss.detach()
+                loss_detached = loss.detach()
+                if isinstance(accumulated_loss, torch.Tensor):
+                    accumulated_loss.add_(loss_detached)
+                else:
+                    accumulated_loss = loss_detached
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
