@@ -5,10 +5,10 @@ Centralized GPU memory detection and adaptive configuration management
     Debug Mode:
         Set environment variable MAX_CUDA_VRAM to simulate different GPU memory sizes.
         Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
-        
+
         For MPS testing, use MAX_MPS_VRAM to simulate MPS memory.
         Example: MAX_MPS_VRAM=16 python acestep  # Simulates 16GB MPS
-    
+
     This is useful for testing GPU tier configurations on high-end hardware.
 """
 
@@ -17,6 +17,9 @@ import sys
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from loguru import logger
+
+
+_GPU_DETECT_LOGGED = False
 
 
 # Environment variable for debugging/testing different GPU memory configurations
@@ -38,19 +41,19 @@ class GPUConfig:
     """GPU configuration based on available memory"""
     tier: str  # "tier1", "tier2", etc. or "unlimited"
     gpu_memory_gb: float
-    
+
     # Duration limits (in seconds)
     max_duration_with_lm: int  # When LM is initialized
     max_duration_without_lm: int  # When LM is not initialized
-    
+
     # Batch size limits
     max_batch_size_with_lm: int
     max_batch_size_without_lm: int
-    
+
     # LM configuration
     init_lm_default: bool  # Whether to initialize LM by default
     available_lm_models: List[str]  # Available LM models for this tier
-    
+
     # LM memory allocation (GB) for each model size
     lm_memory_gb: Dict[str, float]  # e.g., {"0.6B": 3, "1.7B": 8, "4B": 12}
 
@@ -126,14 +129,14 @@ GPU_TIER_CONFIGS = {
 def get_gpu_memory_gb() -> float:
     """
     Get GPU memory in GB. Returns 0 if no GPU is available.
-    
+
     Debug Mode:
         Set environment variable MAX_CUDA_VRAM to override the detected GPU memory.
         Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
-        
+
         For MPS testing, set MAX_MPS_VRAM to override MPS memory detection.
         Example: MAX_MPS_VRAM=16 python acestep  # Simulates 16GB MPS
-        
+
         This allows testing different GPU tier configurations on high-end hardware.
     """
     # Check for debug override first
@@ -153,7 +156,7 @@ def get_gpu_memory_gb() -> float:
             return simulated_gb
         except ValueError:
             logger.warning(f"Invalid {DEBUG_MAX_MPS_VRAM_ENV} value: {debug_mps_vram}, ignoring")
-    
+
     try:
         import torch
         if torch.cuda.is_available():
@@ -162,10 +165,14 @@ def get_gpu_memory_gb() -> float:
             memory_gb = total_memory / (1024**3)  # Convert bytes to GB
             device_name = torch.cuda.get_device_name(0)
             is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
-            if is_rocm:
-                logger.info(f"ROCm GPU detected: {device_name} ({memory_gb:.1f} GB, HIP {torch.version.hip})")
-            else:
-                logger.info(f"CUDA GPU detected: {device_name} ({memory_gb:.1f} GB)")
+
+            global _GPU_DETECT_LOGGED
+            if not _GPU_DETECT_LOGGED:
+                if is_rocm:
+                    logger.info(f"ROCm GPU detected: {device_name} ({memory_gb:.1f} GB, HIP {torch.version.hip})")
+                else:
+                    logger.info(f"CUDA GPU detected: {device_name} ({memory_gb:.1f} GB)")
+                _GPU_DETECT_LOGGED = True
             return memory_gb
         elif hasattr(torch, 'xpu') and torch.xpu.is_available():
             # Get total memory of the first XPU in GB
@@ -215,18 +222,18 @@ def get_gpu_memory_gb() -> float:
 def _log_gpu_diagnostic_info(torch_module):
     """
     Log diagnostic information when GPU is not detected to help users troubleshoot.
-    
+
     Args:
         torch_module: The torch module to inspect for build information
     """
     logger.warning("=" * 80)
     logger.warning("⚠️ GPU NOT DETECTED - DIAGNOSTIC INFORMATION")
     logger.warning("=" * 80)
-    
+
     # Check PyTorch build type
     is_rocm_build = hasattr(torch_module.version, 'hip') and torch_module.version.hip is not None
     is_cuda_build = hasattr(torch_module.version, 'cuda') and torch_module.version.cuda is not None
-    
+
     if is_rocm_build:
         logger.warning("✓ PyTorch ROCm build detected")
         logger.warning(f"  HIP version: {torch_module.version.hip}")
@@ -239,7 +246,7 @@ def _log_gpu_diagnostic_info(torch_module):
         logger.warning("  3. Missing or incorrect HSA_OVERRIDE_GFX_VERSION environment variable")
         logger.warning("  4. ROCm runtime libraries not in system path")
         logger.warning("")
-        
+
         # Check for common environment variables
         hsa_override = os.environ.get('HSA_OVERRIDE_GFX_VERSION')
         if hsa_override:
@@ -250,7 +257,7 @@ def _log_gpu_diagnostic_info(torch_module):
             logger.warning("       - RX 7900 XT/XTX, RX 9070 XT: set HSA_OVERRIDE_GFX_VERSION=11.0.0")
             logger.warning("       - RX 7800 XT, RX 7700 XT: set HSA_OVERRIDE_GFX_VERSION=11.0.1")
             logger.warning("       - RX 7600: set HSA_OVERRIDE_GFX_VERSION=11.0.2")
-        
+
         logger.warning("")
         logger.warning("Troubleshooting steps:")
         logger.warning("  1. Verify ROCm installation:")
@@ -261,7 +268,7 @@ def _log_gpu_diagnostic_info(torch_module):
         logger.warning("  4. On Windows: Use start_gradio_ui_rocm.bat which sets required env vars")
         logger.warning("  5. See docs/en/ACE-Step1.5-Rocm-Manual-Linux.md for Linux setup")
         logger.warning("  6. See requirements-rocm.txt for Windows ROCm setup instructions")
-        
+
     elif is_cuda_build:
         logger.warning("✓ PyTorch CUDA build detected")
         logger.warning(f"  CUDA version: {torch_module.version.cuda}")
@@ -279,7 +286,7 @@ def _log_gpu_diagnostic_info(torch_module):
         logger.warning("  2. Check CUDA version compatibility")
         logger.warning("  3. Reinstall PyTorch with CUDA support:")
         logger.warning(f"     pip install torch --index-url {PYTORCH_CUDA_INSTALL_URL}")
-        
+
     else:
         logger.warning("⚠️ PyTorch build type: CPU-only")
         logger.warning("")
@@ -293,17 +300,17 @@ def _log_gpu_diagnostic_info(torch_module):
         logger.warning(f"  Linux: pip install torch --index-url {PYTORCH_ROCM_INSTALL_URL}")
         logger.warning("")
         logger.warning("For more information, see README.md section 'AMD / ROCm GPUs'")
-    
+
     logger.warning("=" * 80)
 
 
 def get_gpu_tier(gpu_memory_gb: float) -> str:
     """
     Determine GPU tier based on available memory.
-    
+
     Args:
         gpu_memory_gb: GPU memory in GB
-        
+
     Returns:
         Tier string: "tier1", "tier2", "tier3", "tier4", "tier5", "tier6", or "unlimited"
     """
@@ -331,19 +338,19 @@ def get_gpu_tier(gpu_memory_gb: float) -> str:
 def get_gpu_config(gpu_memory_gb: Optional[float] = None) -> GPUConfig:
     """
     Get GPU configuration based on detected or provided GPU memory.
-    
+
     Args:
         gpu_memory_gb: GPU memory in GB. If None, will be auto-detected.
-        
+
     Returns:
         GPUConfig object with all configuration parameters
     """
     if gpu_memory_gb is None:
         gpu_memory_gb = get_gpu_memory_gb()
-    
+
     tier = get_gpu_tier(gpu_memory_gb)
     config = GPU_TIER_CONFIGS[tier]
-    
+
     return GPUConfig(
         tier=tier,
         gpu_memory_gb=gpu_memory_gb,
@@ -360,10 +367,10 @@ def get_gpu_config(gpu_memory_gb: Optional[float] = None) -> GPUConfig:
 def get_lm_model_size(model_path: str) -> str:
     """
     Extract LM model size from model path.
-    
+
     Args:
         model_path: Model path string (e.g., "acestep-5Hz-lm-0.6B")
-        
+
     Returns:
         Model size string: "0.6B", "1.7B", or "4B"
     """
@@ -381,25 +388,25 @@ def get_lm_model_size(model_path: str) -> str:
 def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tuple[float, float]:
     """
     Calculate GPU memory utilization ratio for LM model.
-    
+
     Args:
         model_path: LM model path (e.g., "acestep-5Hz-lm-0.6B")
         total_gpu_memory_gb: Total GPU memory in GB
-        
+
     Returns:
         Tuple of (gpu_memory_utilization_ratio, target_memory_gb)
     """
     model_size = get_lm_model_size(model_path)
-    
+
     # Target memory allocation for each model size
     target_memory = {
         "0.6B": 3.0,
         "1.7B": 8.0,
         "4B": 12.0,
     }
-    
+
     target_gb = target_memory.get(model_size, 3.0)
-    
+
     # For large GPUs (>=24GB), don't restrict memory too much
     if total_gpu_memory_gb >= 24:
         # Use a reasonable ratio that allows the model to run efficiently
@@ -407,7 +414,7 @@ def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tupl
     else:
         # For smaller GPUs, strictly limit memory usage
         ratio = min(0.9, max(0.1, target_gb / total_gpu_memory_gb))
-    
+
     return ratio, target_gb
 
 
@@ -418,17 +425,17 @@ def check_duration_limit(
 ) -> Tuple[bool, str]:
     """
     Check if requested duration is within limits for current GPU configuration.
-    
+
     Args:
         duration: Requested duration in seconds
         gpu_config: Current GPU configuration
         lm_initialized: Whether LM is initialized
-        
+
     Returns:
         Tuple of (is_valid, warning_message)
     """
     max_duration = gpu_config.max_duration_with_lm if lm_initialized else gpu_config.max_duration_without_lm
-    
+
     if duration > max_duration:
         warning_msg = (
             f"⚠️ Requested duration ({duration:.0f}s) exceeds the limit for your GPU "
@@ -437,7 +444,7 @@ def check_duration_limit(
             f"Duration will be clamped to {max_duration}s."
         )
         return False, warning_msg
-    
+
     return True, ""
 
 
@@ -448,17 +455,17 @@ def check_batch_size_limit(
 ) -> Tuple[bool, str]:
     """
     Check if requested batch size is within limits for current GPU configuration.
-    
+
     Args:
         batch_size: Requested batch size
         gpu_config: Current GPU configuration
         lm_initialized: Whether LM is initialized
-        
+
     Returns:
         Tuple of (is_valid, warning_message)
     """
     max_batch_size = gpu_config.max_batch_size_with_lm if lm_initialized else gpu_config.max_batch_size_without_lm
-    
+
     if batch_size > max_batch_size:
         warning_msg = (
             f"⚠️ Requested batch size ({batch_size}) exceeds the limit for your GPU "
@@ -467,18 +474,18 @@ def check_batch_size_limit(
             f"Batch size will be clamped to {max_batch_size}."
         )
         return False, warning_msg
-    
+
     return True, ""
 
 
 def is_lm_model_supported(model_path: str, gpu_config: GPUConfig) -> Tuple[bool, str]:
     """
     Check if the specified LM model is supported for current GPU configuration.
-    
+
     Args:
         model_path: LM model path
         gpu_config: Current GPU configuration
-        
+
     Returns:
         Tuple of (is_supported, warning_message)
     """
@@ -487,14 +494,14 @@ def is_lm_model_supported(model_path: str, gpu_config: GPUConfig) -> Tuple[bool,
             f"⚠️ Your GPU ({gpu_config.gpu_memory_gb:.1f}GB) does not have enough memory "
             f"to run any LM model. Please disable LM initialization."
         )
-    
+
     model_size = get_lm_model_size(model_path)
-    
+
     # Check if model size is in available models
     for available_model in gpu_config.available_lm_models:
         if model_size in available_model:
             return True, ""
-    
+
     return False, (
         f"⚠️ LM model {model_path} ({model_size}) is not supported for your GPU "
         f"({gpu_config.gpu_memory_gb:.1f}GB). Available models: {', '.join(gpu_config.available_lm_models)}"
@@ -504,16 +511,16 @@ def is_lm_model_supported(model_path: str, gpu_config: GPUConfig) -> Tuple[bool,
 def get_recommended_lm_model(gpu_config: GPUConfig) -> Optional[str]:
     """
     Get recommended LM model for current GPU configuration.
-    
+
     Args:
         gpu_config: Current GPU configuration
-        
+
     Returns:
         Recommended LM model path, or None if LM is not supported
     """
     if not gpu_config.available_lm_models:
         return None
-    
+
     # Return the largest available model (last in the list)
     return gpu_config.available_lm_models[-1]
 

@@ -477,6 +477,8 @@ class AutoLabelTask:
     current: int
     total: int
     save_path: Optional[str] = None
+    last_updated_index: Optional[int] = None
+    last_updated_sample: Optional[Dict[str, Any]] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     created_at: float = 0.0
@@ -527,6 +529,7 @@ class PreprocessTask:
 
 _preprocess_tasks: Dict[str, PreprocessTask] = {}
 _preprocess_lock = Lock()
+_preprocess_latest_task_id: Optional[str] = None
 
 
 class GenerateMusicRequest(BaseModel):
@@ -3096,7 +3099,18 @@ def create_app() -> FastAPI:
 
         try:
             resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
+            resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
             resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
+
+            if resolved_save_path:
+                try:
+                    dataset = {
+                        "metadata": builder.metadata.to_dict(),
+                        "samples": [s.to_dict() for s in builder.samples],
+                    }
+                    _atomic_write_json(resolved_save_path, dataset)
+                except Exception:
+                    logger.exception("Auto-label initial save failed")
 
             def sample_labeled_callback(sample_idx: int, sample, status: str):
                 if resolved_save_path is None:
@@ -3203,11 +3217,12 @@ def create_app() -> FastAPI:
 
         # Create task
         resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
+        resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
         with _auto_label_lock:
             _auto_label_tasks[task_id] = AutoLabelTask(
                 task_id=task_id,
                 status="running",
-                progress="Starting...",
+                progress=(f"Starting... (save_path={resolved_save_path})" if resolved_save_path else "Starting..."),
                 current=0,
                 total=total,
                 save_path=resolved_save_path,
@@ -3216,6 +3231,22 @@ def create_app() -> FastAPI:
             )
             global _auto_label_latest_task_id
             _auto_label_latest_task_id = task_id
+
+        # Create initial dataset JSON immediately so users can see the file path is valid.
+        if resolved_save_path:
+            try:
+                dataset = {
+                    "metadata": builder.metadata.to_dict(),
+                    "samples": [s.to_dict() for s in builder.samples],
+                }
+                _atomic_write_json(resolved_save_path, dataset)
+            except Exception as e:
+                logger.exception("Auto-label initial save failed")
+                with _auto_label_lock:
+                    task = _auto_label_tasks.get(task_id)
+                    if task:
+                        task.progress = f"⚠️ Initial save failed: {str(e)}"
+                        task.updated_at = time.time()
 
         # Background labeling function
         def run_labeling():
@@ -3271,8 +3302,21 @@ def create_app() -> FastAPI:
                             "samples": [s.to_dict() for s in builder.samples],
                         }
                         _atomic_write_json(resolved_save_path, dataset)
+
+                        with _auto_label_lock:
+                            task = _auto_label_tasks.get(task_id)
+                            if task:
+                                task.progress = status
+                                task.last_updated_index = sample_idx
+                                task.last_updated_sample = sample.to_dict()
+                                task.updated_at = time.time()
                     except Exception:
                         logger.exception("Auto-label incremental save failed")
+                        with _auto_label_lock:
+                            task = _auto_label_tasks.get(task_id)
+                            if task:
+                                task.progress = "⚠️ Auto-label incremental save failed (see server logs)"
+                                task.updated_at = time.time()
 
                 # Run labeling
                 samples, status = builder.label_all_samples(
@@ -3359,6 +3403,9 @@ def create_app() -> FastAPI:
                 "progress": task.progress,
                 "current": task.current,
                 "total": task.total,
+                "save_path": task.save_path,
+                "last_updated_index": task.last_updated_index,
+                "last_updated_sample": task.last_updated_sample,
             }
 
             if task.status == "completed" and task.result:
@@ -3366,6 +3413,42 @@ def create_app() -> FastAPI:
             elif task.status == "failed" and task.error:
                 response_data["error"] = task.error
 
+            return _wrap_response(response_data)
+
+    @app.get("/v1/dataset/preprocess_status")
+    async def get_preprocess_status_latest(_: None = Depends(verify_api_key)):
+        with _preprocess_lock:
+            if _preprocess_latest_task_id is None:
+                return _wrap_response({
+                    "task_id": None,
+                    "status": "idle",
+                    "progress": "",
+                    "current": 0,
+                    "total": 0,
+                })
+
+            task = _preprocess_tasks.get(_preprocess_latest_task_id)
+            if task is None:
+                return _wrap_response({
+                    "task_id": _preprocess_latest_task_id,
+                    "status": "idle",
+                    "progress": "",
+                    "current": 0,
+                    "total": 0,
+                })
+
+            response_data = {
+                "task_id": task.task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "current": task.current,
+                "total": task.total,
+            }
+
+            if task.status == "completed" and task.result:
+                response_data["result"] = task.result
+            elif task.status == "failed" and task.error:
+                response_data["error"] = task.error
             return _wrap_response(response_data)
 
     @app.get("/v1/dataset/auto_label_status")
@@ -3395,6 +3478,9 @@ def create_app() -> FastAPI:
                 "progress": task.progress,
                 "current": task.current,
                 "total": task.total,
+                "save_path": task.save_path,
+                "last_updated_index": task.last_updated_index,
+                "last_updated_sample": task.last_updated_sample,
             }
             if task.status == "completed" and task.result:
                 response_data["result"] = task.result
@@ -3542,8 +3628,10 @@ def create_app() -> FastAPI:
                 progress="Starting preprocessing...",
                 current=0,
                 total=total,
-                created_at=time.time()
+                created_at=time.time(),
             )
+            global _preprocess_latest_task_id
+            _preprocess_latest_task_id = task_id
 
         # Background preprocessing function
         def run_preprocessing():

@@ -173,7 +173,7 @@ class LabelAllMixin:
 
                         global_idx = chunk_start + micro[0][0]
                         if progress_callback and global_idx % 5 == 0:
-                            progress_callback(f"Tokenizing {global_idx+1}/{total}: {samples[0].filename}")
+                            progress_callback(f"Tokenizing {global_idx+1}/{total} (bs={len(micro)}): {samples[0].filename}")
 
                         try:
                             _, indices, pooled_mask = model.tokenize(
