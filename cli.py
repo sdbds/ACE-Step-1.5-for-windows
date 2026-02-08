@@ -1012,6 +1012,13 @@ def main():
     parser.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file to load.")
     parser.add_argument("--configure", action="store_true", help="Run wizard to save configuration without generating.")
     parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        choices=["vllm", "pt", "mlx"],
+        help="5Hz LM backend. Auto-detected if not specified: 'mlx' on Apple Silicon, 'vllm' on CUDA, 'pt' otherwise.",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -1112,6 +1119,10 @@ def main():
         for key, value in config_from_file.items():
             setattr(args, key, value)
         args.config = cli_args.config
+
+    # CLI --backend overrides config file and auto-detection
+    if cli_args.backend is not None:
+        args.backend = cli_args.backend
 
     if cli_args.configure:
         args, _ = run_wizard(
