@@ -59,7 +59,7 @@ except ImportError:  # Optional dependency
     load_dotenv = None  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from acestep.handler import AceStepHandler
@@ -612,6 +612,28 @@ class AutoLabelRequest(BaseModel):
     format_lyrics: bool = Field(default=False, description="Format user lyrics via LLM")
     transcribe_lyrics: bool = Field(default=False, description="Transcribe lyrics from audio")
     only_unlabeled: bool = Field(default=False, description="Only label unlabeled samples")
+
+    chunk_size: int = Field(default=16, ge=1, description="Chunk size for batch audio encoding")
+    batch_size: int = Field(default=1, ge=1, description="Batch size for batch audio encoding")
+
+    @root_validator(pre=True)
+    def _backward_compatible_field_names(cls, values: Dict[str, Any]):
+        if values is None:
+            return values
+
+        if "chunk_size" not in values or values.get("chunk_size") is None:
+            for k in ("hunk_size", "hunksize"):
+                if k in values and values.get(k) is not None:
+                    values["chunk_size"] = values[k]
+                    break
+
+        if "batch_size" not in values or values.get("batch_size") is None:
+            for k in ("batchsize",):
+                if k in values and values.get(k) is not None:
+                    values["batch_size"] = values[k]
+                    break
+
+        return values
 
 
 class SaveDatasetRequest(BaseModel):
@@ -1360,7 +1382,7 @@ def create_app() -> FastAPI:
             await _ensure_initialized()
             job_store.mark_running(job_id)
             _update_local_cache_progress(job_id, 0.01, "running")
-            
+
             # Select DiT handler based on user's model choice
             # Default: use primary handler
             selected_handler: AceStepHandler = app.state.handler
@@ -3987,6 +4009,11 @@ def create_app() -> FastAPI:
                 "adapter_type": "lokr",
                 "lokr_linear_dim": request.lokr_linear_dim,
                 "lokr_linear_alpha": request.lokr_linear_alpha,
+                "lokr_factor": request.lokr_factor,
+                "lokr_decompose_both": request.lokr_decompose_both,
+                "lokr_use_tucker": request.lokr_use_tucker,
+                "lokr_use_scalar": request.lokr_use_scalar,
+                "lokr_weight_decompose": request.lokr_weight_decompose,
                 "learning_rate": request.learning_rate,
                 "epochs": request.train_epochs,
             }
