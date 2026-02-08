@@ -3049,6 +3049,8 @@ def create_app() -> FastAPI:
                 transcribe_lyrics=request.transcribe_lyrics,
                 skip_metas=request.skip_metas,
                 only_unlabeled=request.only_unlabeled,
+                chunk_size=request.chunk_size,
+                batch_size=request.batch_size,
                 progress_callback=None,
             )
 
@@ -3167,6 +3169,8 @@ def create_app() -> FastAPI:
                     transcribe_lyrics=request.transcribe_lyrics,
                     skip_metas=request.skip_metas,
                     only_unlabeled=request.only_unlabeled,
+                    chunk_size=request.chunk_size,
+                    batch_size=request.batch_size,
                     progress_callback=progress_callback,
                 )
 
