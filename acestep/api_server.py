@@ -3282,9 +3282,18 @@ def create_app() -> FastAPI:
                 resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
 
                 def sample_labeled_callback(sample_idx: int, sample, status: str):
-                    if resolved_save_path is None:
-                        return
                     if "✅" not in status:
+                        return
+
+                    with _auto_label_lock:
+                        task = _auto_label_tasks.get(task_id)
+                        if task:
+                            task.progress = status
+                            task.last_updated_index = sample_idx
+                            task.last_updated_sample = sample.to_dict()
+                            task.updated_at = time.time()
+
+                    if resolved_save_path is None:
                         return
                     try:
                         if resolved_jsonl_path is not None:
@@ -3302,14 +3311,6 @@ def create_app() -> FastAPI:
                             "samples": [s.to_dict() for s in builder.samples],
                         }
                         _atomic_write_json(resolved_save_path, dataset)
-
-                        with _auto_label_lock:
-                            task = _auto_label_tasks.get(task_id)
-                            if task:
-                                task.progress = status
-                                task.last_updated_index = sample_idx
-                                task.last_updated_sample = sample.to_dict()
-                                task.updated_at = time.time()
                     except Exception:
                         logger.exception("Auto-label incremental save failed")
                         with _auto_label_lock:

@@ -48,6 +48,7 @@ dependencies = [
     # For uv users: automatically handled via [tool.uv.sources]
     "modelscope",
     "tensorboard>=2.20.0",
+    "mutagen",
 ]
 
 [[tool.uv.index]]

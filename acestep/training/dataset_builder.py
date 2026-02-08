@@ -435,6 +435,16 @@ class DatasetBuilder:
         """
         try:
             try:
+                from mutagen import File as MutagenFile
+
+                audio = MutagenFile(audio_path)
+                if audio is not None and getattr(audio, "info", None) is not None:
+                    length = getattr(audio.info, "length", None)
+                    if length is not None:
+                        return int(length)
+            except Exception:
+                pass
+            try:
                 import torchcodec
 
                 info = torchcodec.info(audio_path)
