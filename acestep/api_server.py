@@ -708,6 +708,7 @@ class StartTrainingRequest(BaseModel):
     training_seed: int = Field(default=42, description="Random seed")
     lora_output_dir: str = Field(default="./lora_output", description="Output directory")
     use_fp8: bool = Field(default=False, description="Use FP8 quantization for decoder weights (reduces VRAM, requires Ada/Hopper GPU)")
+    gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
 
 
 class StartLoKRTrainingRequest(BaseModel):
@@ -727,6 +728,7 @@ class StartLoKRTrainingRequest(BaseModel):
     training_shift: float = Field(default=3.0, ge=0.0, description="Training timestep shift")
     training_seed: int = Field(default=42, description="Random seed")
     output_dir: str = Field(default="./lokr_output", description="Output directory")
+    gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
 
 
 class ExportLoRARequest(BaseModel):
@@ -3973,6 +3975,7 @@ def create_app() -> FastAPI:
                 seed=request.training_seed,
                 output_dir=request.lora_output_dir,
                 use_fp8=request.use_fp8,
+                gradient_checkpointing=request.gradient_checkpointing,
             )
 
             fp8_status = ""
@@ -4200,6 +4203,7 @@ def create_app() -> FastAPI:
                 save_every_n_epochs=request.save_every_n_epochs,
                 seed=request.training_seed,
                 output_dir=request.output_dir,
+                gradient_checkpointing=request.gradient_checkpointing,
             )
 
             trainer = LoKRTrainer(

@@ -60,6 +60,42 @@ def _normalize_device_type(device: Any) -> str:
     return str(device)
 
 
+def _maybe_enable_gradient_checkpointing(module: Any) -> bool:
+    target = module
+    if hasattr(target, "get_base_model"):
+        try:
+            target = target.get_base_model()
+        except Exception:
+            target = module
+
+    if not hasattr(target, "gradient_checkpointing_enable"):
+        return False
+
+    if not hasattr(target, "supports_gradient_checkpointing"):
+        try:
+            setattr(target, "supports_gradient_checkpointing", True)
+        except Exception:
+            return False
+
+    if not hasattr(target, "_set_gradient_checkpointing"):
+        try:
+            import types
+
+            def _set_gradient_checkpointing(self, submodule, value: bool = False):
+                if hasattr(submodule, "gradient_checkpointing"):
+                    submodule.gradient_checkpointing = value
+
+            target._set_gradient_checkpointing = types.MethodType(_set_gradient_checkpointing, target)
+        except Exception:
+            return False
+
+    try:
+        target.gradient_checkpointing_enable()
+    except Exception:
+        return False
+    return True
+
+
 def _select_compute_dtype(device_type: str) -> torch.dtype:
     """Pick the compute dtype for each accelerator."""
     if device_type in ("cuda", "xpu"):
@@ -185,6 +221,12 @@ class PreprocessedLoRAModule(nn.Module):
             self.model = model
             self.lora_info = {}
             logger.warning("PEFT not available, training without LoRA adapters")
+
+        if self.training_config.gradient_checkpointing:
+            if _maybe_enable_gradient_checkpointing(self.model.decoder):
+                logger.info("Gradient checkpointing enabled for decoder")
+            else:
+                logger.warning("Gradient checkpointing requested but could not be enabled for decoder")
 
         # Model config for flow matching
         self.config = model.config
@@ -337,6 +379,12 @@ class PreprocessedLoKRModule(nn.Module):
             self.model = model
             self.lokr_info = {}
             logger.warning("LyCORIS not available, cannot train LoKR adapters")
+
+        if self.training_config.gradient_checkpointing:
+            if _maybe_enable_gradient_checkpointing(self.model.decoder):
+                logger.info("Gradient checkpointing enabled for decoder")
+            else:
+                logger.warning("Gradient checkpointing requested but could not be enabled for decoder")
 
         self.config = model.config
         self.training_losses = []

@@ -57,13 +57,49 @@ class PreprocessMixin:
         device = dit_handler.device
         dtype = dit_handler.dtype
 
-        if getattr(next(vae.parameters(), None), "device", device) != device:
-            raise RuntimeError(f"VAE is on {next(vae.parameters()).device}, expected {device}")
-        if getattr(next(text_encoder.parameters(), None), "device", device) != device:
-            raise RuntimeError(
-                f"Text encoder is on {next(text_encoder.parameters()).device}, expected {device}"
-            )
-        if silence_latent.device != device:
+        missing = []
+        if vae is None:
+            missing.append("vae")
+        if text_encoder is None:
+            missing.append("text_encoder")
+        if text_tokenizer is None:
+            missing.append("text_tokenizer")
+        if silence_latent is None:
+            missing.append("silence_latent")
+        if device is None:
+            missing.append("device")
+        if dtype is None:
+            missing.append("dtype")
+        if missing:
+            return [], f"❌ Model components not initialized: {', '.join(missing)}. Please initialize the service first."
+
+        if not hasattr(vae, "parameters"):
+            return [], "❌ Invalid VAE object. Please re-initialize the service."
+        if not hasattr(text_encoder, "parameters"):
+            return [], "❌ Invalid text encoder object. Please re-initialize the service."
+        if not hasattr(model, "parameters"):
+            return [], "❌ Invalid model object. Please re-initialize the service."
+
+        device = device if isinstance(device, torch.device) else torch.device(device)
+
+        def _device_compatible(actual: torch.device, expected: torch.device) -> bool:
+            if actual.type != expected.type:
+                return False
+            if expected.index is None:
+                return True
+            return actual.index == expected.index
+
+        vae_param = next(vae.parameters(), None)
+        vae_device = getattr(vae_param, "device", device)
+        if not _device_compatible(vae_device, device):
+            raise RuntimeError(f"VAE is on {vae_device}, expected {device}")
+
+        text_param = next(text_encoder.parameters(), None)
+        text_device = getattr(text_param, "device", device)
+        if not _device_compatible(text_device, device):
+            raise RuntimeError(f"Text encoder is on {text_device}, expected {device}")
+
+        if not _device_compatible(silence_latent.device, device):
             raise RuntimeError(f"silence_latent is on {silence_latent.device}, expected {device}")
 
         target_sample_rate = 48000

@@ -112,7 +112,8 @@ class TrainingConfig:
     seed: int = 42
     output_dir: str = "./lora_output"
     use_fp8: bool = False  # Use FP8 quantization for decoder weights
-    
+    gradient_checkpointing: bool = False  # Trade compute for memory savings
+
     # Data loading
     num_workers: int = 4
     pin_memory: bool = True
@@ -140,6 +141,7 @@ class TrainingConfig:
             "seed": self.seed,
             "output_dir": self.output_dir,
             "use_fp8": self.use_fp8,
+            "gradient_checkpointing": self.gradient_checkpointing,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "prefetch_factor": self.prefetch_factor,
