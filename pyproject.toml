@@ -36,13 +36,18 @@ dependencies = [
     "torchcodec<=0.9.1; sys_platform != 'darwin'",
     "torchao===0.15.0",
     "toml",
+    # MLX dependencies (Apple Silicon native acceleration - macOS only)
+    "mlx>=0.25.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # Training dependencies
     "peft>=0.7.0",
     "lightning>=2.0.0",
+    "tensorboard>=2.0.0",
     # Local third-party packages
     # nano-vllm is a local package - install separately: pip install -e acestep/third_parts/nano-vllm
     # For uv users: automatically handled via [tool.uv.sources]
-    "modelscope"
+    "modelscope",
+    "tensorboard>=2.20.0",
 ]
 
 [[tool.uv.index]]

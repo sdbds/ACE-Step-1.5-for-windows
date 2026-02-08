@@ -75,6 +75,20 @@ Star ACE-Step on GitHub and be instantly notified of new releases
 
 > **Requirements:** Python 3.11, CUDA GPU recommended (works on CPU/MPS but slower)
 
+### CPU Support (Limited)
+
+ACE-Step can run on CPU for **inference only**, but performance will be significantly slower.
+
+- CPU inference is supported for testing and experimentation.
+- **Training (including LoRA) on CPU is not recommended** due to extremely long runtimes.
+- For low-VRAM systems, DiT-only mode (LLM disabled) is supported.
+- While CPU training may technically run, it is not practically usable due to extremely long runtimes; **for any practical training workflow, a CUDA-capable GPU or cloud GPU instance is required.**
+
+If you do not have a CUDA GPU, consider:
+- Using cloud GPU providers
+- Running inference-only workflows
+- Using DiT-only mode with `ACESTEP_INIT_LLM=false`
+
 ### AMD / ROCm GPUs
 
 ACE-Step works with AMD GPUs via PyTorch ROCm builds.
@@ -110,12 +124,42 @@ ACE-Step works with AMD GPUs via PyTorch ROCm builds.
 
 This avoids CUDA wheel replacement and has been confirmed to work on ROCm systems. On Windows, use `.venv\Scripts\activate` and the same steps.
 
+#### Troubleshooting GPU Detection
+
+If you see "No GPU detected, running on CPU" with an AMD GPU:
+
+1. Run the GPU diagnostic tool:
+   ```bash
+   python scripts/check_gpu.py
+   ```
+
+2. For RDNA3 GPUs (RX 7000/9000 series), set `HSA_OVERRIDE_GFX_VERSION`:
+   - RX 7900 XT/XTX, RX 9070 XT: `export HSA_OVERRIDE_GFX_VERSION=11.0.0` (Linux) or `set HSA_OVERRIDE_GFX_VERSION=11.0.0` (Windows)
+   - RX 7800 XT, RX 7700 XT: `export HSA_OVERRIDE_GFX_VERSION=11.0.1`
+   - RX 7600: `export HSA_OVERRIDE_GFX_VERSION=11.0.2`
+
+3. On Windows, use `start_gradio_ui_rocm.bat` which automatically sets required environment variables.
+
+4. Verify ROCm installation: `rocm-smi` should list your GPU.
+
 ### AMD / ROCM Linux Specific (cachy-os tested)
 Date of the program this worked:
 07.02.2026 - 10:40 am UTC +1
 
 ACE-Step1.5 Rocm Manual for cachy-os and tested with RDNA4.
 Look into docs\en\ACE-Step1.5-Rocm-Manual-Linux.md
+
+### Linux + Python 3.11 note
+
+Some Linux distributions (including Ubuntu) ship Python 3.11.0rc1, which is a **pre-release** build. This version is known to cause segmentation faults when using the vLLM backend due to C-extension incompatibilities.
+
+**Recommendation:** Use a stable Python release (≥ 3.11.12). On Ubuntu, this can be installed via the deadsnakes PPA.
+
+If upgrading Python is not possible, use the PyTorch backend:
+
+```bash
+uv run acestep --backend pt
+```
 
 ### 🪟 Windows Portable Package (Recommended for Windows)
 
@@ -149,7 +193,7 @@ Both scripts support:
 - ✅ Auto install `uv` if needed (via winget or PowerShell)
 - ✅ Configurable download source (HuggingFace/ModelScope)
 - ✅ Optional Git update check before startup
-- ✅ Customizable language, models, and parameters
+- ✅ Customizable , models, and parameters
 
 #### 📝 Configuration
 
@@ -157,7 +201,7 @@ Edit the scripts to customize settings:
 
 **start_gradio_ui.bat:**
 ```batch
-REM UI language (en, zh, ja)
+REM UI language (en, zh, he, ja)
 set LANGUAGE=zh
 
 REM Download source (auto, huggingface, modelscope)
@@ -344,7 +388,7 @@ API runs at http://localhost:8001. See [API Documentation](./docs/en/API.md) for
 | `--port` | 7860 | Server port |
 | `--server-name` | 127.0.0.1 | Server address (use `0.0.0.0` for network access) |
 | `--share` | false | Create public Gradio link |
-| `--language` | en | UI language: `en`, `zh`, `ja` |
+| `--language` | en | UI language: `en`, `zh`, `he`, `ja` |
 | `--init_service` | false | Auto-initialize models on startup |
 | `--init_llm` | auto | LLM initialization: `true` (force), `false` (disable), omit for auto |
 | `--config_path` | auto | DiT model (e.g., `acestep-v15-turbo`, `acestep-v15-turbo-shift3`) |
@@ -472,67 +516,6 @@ Currently, we support Intel GPUs.
 
 Models are automatically downloaded from [HuggingFace](https://huggingface.co/ACE-Step/Ace-Step1.5) or [ModelScope](https://modelscope.cn/organization/ACE-Step) on first run. You can also manually download models using the CLI or `huggingface-cli`.
 
-### Download Source Configuration
-
-ACE-Step supports multiple download sources with automatic fallback:
-
-| Source | Description | Configuration |
-|--------|-------------|---------------|
-| **auto** (default) | Automatic detection based on network, selects best source | `--download-source auto` or omit |
-| **modelscope** | Use ModelScope as download source | `--download-source modelscope` |
-| **huggingface** | Use HuggingFace Hub as download source | `--download-source huggingface` |
-
-**How it works:**
-- **Auto mode** (default): Tests Google connectivity. If accessible → HuggingFace Hub; if not → ModelScope
-- **Manual mode**: Uses your specified source, with automatic fallback to alternate source on failure
-- **Fallback protection**: If primary source fails, automatically tries the other source
-
-**Examples:**
-
-> **Note for Python users:** Replace `python` with your environment's Python executable (see note in Launch section above).
-
-```bash
-# Use ModelScope
-uv run acestep --download-source modelscope
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py --download-source modelscope
-
-# Use HuggingFace Hub
-uv run acestep --download-source huggingface
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py --download-source huggingface
-
-# Auto-detect (default, no configuration needed)
-uv run acestep
-# Or using Python directly:
-python acestep/acestep_v15_pipeline.py
-```
-
-**For Windows portable package users**, edit `start_gradio_ui.bat` or `start_api_server.bat`:
-
-```batch
-REM Use ModelScope
-set DOWNLOAD_SOURCE=--download-source modelscope
-
-REM Use HuggingFace Hub
-set DOWNLOAD_SOURCE=--download-source huggingface
-
-REM Auto-detect (default)
-set DOWNLOAD_SOURCE=
-```
-
-**For command line users:**
-
-> **Note for Python users:** Replace `python` with your environment's Python executable (see note in Launch section above).
-
-```bash
-# Using uv
-uv run acestep --download-source modelscope
-
-# Using Python directly
-python acestep/acestep_v15_pipeline.py --download-source modelscope
-```
-
 ### Automatic Download
 
 When you run `acestep` or `acestep-api`, the system will:
@@ -648,6 +631,7 @@ We provide multiple ways to use ACE-Step:
 | 🎚️ **Studio UI (Experimental)** | Optional HTML frontend for REST API (DAW-like) | [Studio UI](./docs/en/studio.md) |
 | 🐍 **Python API** | Programmatic access for integration | [Inference API](./docs/en/INFERENCE.md) |
 | 🌐 **REST API** | HTTP-based async API for services | [REST API](./docs/en/API.md) |
+| ⌨️ **CLI** | Interactive wizard and configuration for commandline interface | [CLI Guide](./docs/en/CLI.md) |
 
 **📚 Documentation available in:** [English](./docs/en/) | [中文](./docs/zh/) | [日本語](./docs/ja/)
 

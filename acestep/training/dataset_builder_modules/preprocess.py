@@ -124,15 +124,33 @@ class PreprocessMixin:
                 debug_end_verbose_for("dataset", f"encode_lyrics[{i}]", t0)
 
                 t0 = debug_start_verbose_for("dataset", f"run_encoder[{i}]")
-                encoder_hidden_states, encoder_attention_mask = run_encoder(
-                    model,
-                    text_hidden_states=text_hidden_states,
-                    text_attention_mask=text_attention_mask,
-                    lyric_hidden_states=lyric_hidden_states,
-                    lyric_attention_mask=lyric_attention_mask,
-                    device=device,
-                    dtype=dtype,
-                )
+                # Ensure DiT encoder runs on the active residency device (GPU when loaded via
+                # offload context). This prevents flash-attn CPU backend crashes.
+                with dit_handler._load_model_context("model"):
+                    model_device = next(model.parameters()).device
+                    model_dtype = next(model.parameters()).dtype
+                    if text_hidden_states.device != model_device:
+                        text_hidden_states = text_hidden_states.to(model_device)
+                    if text_attention_mask.device != model_device:
+                        text_attention_mask = text_attention_mask.to(model_device)
+                    if lyric_hidden_states.device != model_device:
+                        lyric_hidden_states = lyric_hidden_states.to(model_device)
+                    if lyric_attention_mask.device != model_device:
+                        lyric_attention_mask = lyric_attention_mask.to(model_device)
+                    if text_hidden_states.dtype != model_dtype:
+                        text_hidden_states = text_hidden_states.to(model_dtype)
+                    if lyric_hidden_states.dtype != model_dtype:
+                        lyric_hidden_states = lyric_hidden_states.to(model_dtype)
+
+                    encoder_hidden_states, encoder_attention_mask = run_encoder(
+                        model,
+                        text_hidden_states=text_hidden_states,
+                        text_attention_mask=text_attention_mask,
+                        lyric_hidden_states=lyric_hidden_states,
+                        lyric_attention_mask=lyric_attention_mask,
+                        device=model_device,
+                        dtype=model_dtype,
+                    )
                 debug_end_verbose_for("dataset", f"run_encoder[{i}]", t0)
 
                 t0 = debug_start_verbose_for("dataset", f"build_context_latents[{i}]")

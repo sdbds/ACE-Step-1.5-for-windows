@@ -128,6 +128,12 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--server-name", type=str, default="127.0.0.1", help="Server name (default: 127.0.0.1, use 0.0.0.0 for all interfaces)")
     parser.add_argument("--language", type=str, default="en", choices=["en", "zh", "he", "ja"], help="UI language: en (English), zh (中文), he (עברית), ja (日本語)")
+    parser.add_argument(
+        "--allowed-path",
+        action="append",
+        default=[],
+        help="Additional allowed file paths for Gradio (repeatable).",
+    )
     
     # Service mode argument
     parser.add_argument("--service_mode", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, 
@@ -137,10 +143,10 @@ def main():
     parser.add_argument("--init_service", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Initialize service on startup (default: False)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file path (optional, for display purposes)")
     parser.add_argument("--config_path", type=str, default=None, help="Main model path (e.g., 'acestep-v15-turbo')")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "xpu", "mps"], help="Processing device (default: auto)")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "mps", "xpu", "cpu"], help="Processing device (default: auto)")
     parser.add_argument("--init_llm", type=lambda x: x.lower() in ['true', '1', 'yes'], default=None, help="Initialize 5Hz LM (default: auto based on GPU memory)")
     parser.add_argument("--lm_model_path", type=str, default=None, help="5Hz LM model path (e.g., 'acestep-5Hz-lm-0.6B')")
-    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "pt"], help="5Hz LM backend (default: vllm)")
+    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "pt", "mlx"], help="5Hz LM backend (default: vllm, use 'mlx' for native Apple Silicon acceleration)")
     parser.add_argument("--use_flash_attention", type=lambda x: x.lower() in ['true', '1', 'yes'], default=None, help="Use flash attention (default: auto-detect)")
     parser.add_argument("--offload_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=auto_offload, help=f"Offload models to CPU (default: {'True' if auto_offload else 'False'}, auto-detected based on GPU VRAM)")
     parser.add_argument("--offload_dit_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Offload DiT to CPU (default: False)")
@@ -227,7 +233,7 @@ def main():
             # Determine flash attention setting
             use_flash_attention = args.use_flash_attention
             if use_flash_attention is None:
-                use_flash_attention = dit_handler.is_flash_attention_available()
+                use_flash_attention = dit_handler.is_flash_attention_available(args.device)
 
             # Determine download source preference
             prefer_source = None
@@ -281,7 +287,7 @@ def main():
                         backend=args.backend,
                         device=args.device,
                         offload_to_cpu=args.offload_to_cpu,
-                        dtype=dit_handler.dtype,
+                        dtype=None,
                     )
                     
                     if lm_success:
@@ -345,6 +351,11 @@ def main():
             auth = (args.auth_username, args.auth_password)
             print("Authentication enabled")
 
+        allowed_paths = [output_dir]
+        for p in args.allowed_path:
+            if p and p not in allowed_paths:
+                allowed_paths.append(p)
+
         # Enable API endpoints if requested
         if args.enable_api:
             print("Enabling API endpoints...")
@@ -360,7 +371,7 @@ def main():
                 prevent_thread_lock=True,  # Don't block, so we can add routes
                 inbrowser=False,
                 auth=auth,
-                allowed_paths=[output_dir],  # Fix audio loading on Windows
+                allowed_paths=allowed_paths,  # include output_dir + user-provided
             )
 
             # Now add API routes to Gradio's FastAPI app (app is available after launch)
@@ -387,7 +398,7 @@ def main():
                 prevent_thread_lock=False,
                 inbrowser=False,
                 auth=auth,
-                allowed_paths=[output_dir],  # Fix audio loading on Windows
+                allowed_paths=allowed_paths,  # include output_dir + user-provided
             )
     except Exception as e:
         print(f"Error launching Gradio: {e}", file=sys.stderr)

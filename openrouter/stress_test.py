@@ -245,8 +245,11 @@ class StressTester:
             "messages": [
                 {"role": "user", "content": "Generate an upbeat pop song about summer"}
             ],
-            "vocal_language": "en",
-            "duration": 30,
+            "sample_mode": True,
+            "audio_config": {
+                "vocal_language": "en",
+                "duration": 30,
+            },
         }
 
     def _get_instrumental_payload(self) -> dict:
@@ -255,8 +258,10 @@ class StressTester:
             "messages": [
                 {"role": "user", "content": "<prompt>Epic orchestral cinematic score</prompt>"}
             ],
-            "instrumental": True,
-            "duration": 30,
+            "audio_config": {
+                "instrumental": True,
+                "duration": 30,
+            },
         }
 
     def run_fixed_requests(

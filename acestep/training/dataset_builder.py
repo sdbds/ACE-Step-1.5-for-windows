@@ -1,4 +1,4 @@
-﻿"""
+"""
 Dataset Builder for LoRA Training (facade).
 
 This module preserves the public API while delegating to smaller modules.

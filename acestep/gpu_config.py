@@ -2,9 +2,12 @@
 GPU Configuration Module
 Centralized GPU memory detection and adaptive configuration management
 
-Debug Mode:
-    Set environment variable MAX_CUDA_VRAM to simulate different GPU memory sizes.
-    Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
+    Debug Mode:
+        Set environment variable MAX_CUDA_VRAM to simulate different GPU memory sizes.
+        Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
+        
+        For MPS testing, use MAX_MPS_VRAM to simulate MPS memory.
+        Example: MAX_MPS_VRAM=16 python acestep  # Simulates 16GB MPS
     
     This is useful for testing GPU tier configurations on high-end hardware.
 """
@@ -18,11 +21,16 @@ from loguru import logger
 
 # Environment variable for debugging/testing different GPU memory configurations
 DEBUG_MAX_CUDA_VRAM_ENV = "MAX_CUDA_VRAM"
+DEBUG_MAX_MPS_VRAM_ENV = "MAX_MPS_VRAM"
 
 # Tolerance for 16GB detection: reported VRAM like 15.5GB is effectively 16GB hardware
 # Real-world 16GB GPUs often report 15.7-15.9GB due to system/driver reservations
 VRAM_16GB_TOLERANCE_GB = 0.5
 VRAM_16GB_MIN_GB = 16.0 - VRAM_16GB_TOLERANCE_GB  # treat as 16GB class if >= this
+
+# PyTorch installation URLs for diagnostics
+PYTORCH_CUDA_INSTALL_URL = "https://download.pytorch.org/whl/cu121"
+PYTORCH_ROCM_INSTALL_URL = "https://download.pytorch.org/whl/rocm6.0"
 
 
 @dataclass
@@ -123,6 +131,9 @@ def get_gpu_memory_gb() -> float:
         Set environment variable MAX_CUDA_VRAM to override the detected GPU memory.
         Example: MAX_CUDA_VRAM=8 python acestep  # Simulates 8GB GPU
         
+        For MPS testing, set MAX_MPS_VRAM to override MPS memory detection.
+        Example: MAX_MPS_VRAM=16 python acestep  # Simulates 16GB MPS
+        
         This allows testing different GPU tier configurations on high-end hardware.
     """
     # Check for debug override first
@@ -134,6 +145,14 @@ def get_gpu_memory_gb() -> float:
             return simulated_gb
         except ValueError:
             logger.warning(f"Invalid {DEBUG_MAX_CUDA_VRAM_ENV} value: {debug_vram}, ignoring")
+    debug_mps_vram = os.environ.get(DEBUG_MAX_MPS_VRAM_ENV)
+    if debug_mps_vram is not None:
+        try:
+            simulated_gb = float(debug_mps_vram)
+            logger.warning(f"⚠️ DEBUG MODE: Simulating MPS memory as {simulated_gb:.1f}GB (set via {DEBUG_MAX_MPS_VRAM_ENV} environment variable)")
+            return simulated_gb
+        except ValueError:
+            logger.warning(f"Invalid {DEBUG_MAX_MPS_VRAM_ENV} value: {debug_mps_vram}, ignoring")
     
     try:
         import torch
@@ -154,8 +173,22 @@ def get_gpu_memory_gb() -> float:
             memory_gb = total_memory / (1024**3)  # Convert bytes to GB
             return memory_gb
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            # MPS (Apple Silicon) - estimate from system unified memory
-            # Apple Silicon shares memory between CPU and GPU; report recommended allocation
+            mps_module = getattr(torch, "mps", None)
+            try:
+                if mps_module is not None and hasattr(mps_module, "recommended_max_memory"):
+                    total_memory = mps_module.recommended_max_memory()
+                    memory_gb = total_memory / (1024**3)  # Convert bytes to GB
+                    return memory_gb
+                if mps_module is not None and hasattr(mps_module, "get_device_properties"):
+                    props = mps_module.get_device_properties(0)
+                    total_memory = getattr(props, "total_memory", None)
+                    if total_memory:
+                        memory_gb = total_memory / (1024**3)
+                        return memory_gb
+            except Exception as e:
+                logger.warning(f"Failed to detect MPS memory: {e}")
+
+            # Fallback: estimate from system unified memory (Apple Silicon shares CPU/GPU RAM)
             try:
                 import subprocess
                 result = subprocess.run(
@@ -167,13 +200,101 @@ def get_gpu_memory_gb() -> float:
                 memory_gb = (total_system_bytes / (1024**3)) * 0.75
                 return memory_gb
             except Exception:
-                # Fallback: assume 8GB usable for GPU (conservative for M1/M2)
+                logger.warning(f"MPS available but total memory not exposed. Set {DEBUG_MAX_MPS_VRAM_ENV} to enable tiering.")
+                # Conservative fallback for M1/M2
                 return 8.0
         else:
+            # No GPU detected - provide diagnostic information
+            _log_gpu_diagnostic_info(torch)
             return 0
     except Exception as e:
         logger.warning(f"Failed to detect GPU memory: {e}")
         return 0
+
+
+def _log_gpu_diagnostic_info(torch_module):
+    """
+    Log diagnostic information when GPU is not detected to help users troubleshoot.
+    
+    Args:
+        torch_module: The torch module to inspect for build information
+    """
+    logger.warning("=" * 80)
+    logger.warning("⚠️ GPU NOT DETECTED - DIAGNOSTIC INFORMATION")
+    logger.warning("=" * 80)
+    
+    # Check PyTorch build type
+    is_rocm_build = hasattr(torch_module.version, 'hip') and torch_module.version.hip is not None
+    is_cuda_build = hasattr(torch_module.version, 'cuda') and torch_module.version.cuda is not None
+    
+    if is_rocm_build:
+        logger.warning("✓ PyTorch ROCm build detected")
+        logger.warning(f"  HIP version: {torch_module.version.hip}")
+        logger.warning("")
+        logger.warning("❌ torch.cuda.is_available() returned False")
+        logger.warning("")
+        logger.warning("Common causes for AMD/ROCm GPUs:")
+        logger.warning("  1. ROCm drivers not installed or not properly configured")
+        logger.warning("  2. GPU not supported by installed ROCm version")
+        logger.warning("  3. Missing or incorrect HSA_OVERRIDE_GFX_VERSION environment variable")
+        logger.warning("  4. ROCm runtime libraries not in system path")
+        logger.warning("")
+        
+        # Check for common environment variables
+        hsa_override = os.environ.get('HSA_OVERRIDE_GFX_VERSION')
+        if hsa_override:
+            logger.warning(f"  HSA_OVERRIDE_GFX_VERSION is set to: {hsa_override}")
+        else:
+            logger.warning("  ⚠️ HSA_OVERRIDE_GFX_VERSION is not set")
+            logger.warning("     For RDNA3 GPUs (RX 7000 series, RX 9000 series):")
+            logger.warning("       - RX 7900 XT/XTX, RX 9070 XT: set HSA_OVERRIDE_GFX_VERSION=11.0.0")
+            logger.warning("       - RX 7800 XT, RX 7700 XT: set HSA_OVERRIDE_GFX_VERSION=11.0.1")
+            logger.warning("       - RX 7600: set HSA_OVERRIDE_GFX_VERSION=11.0.2")
+        
+        logger.warning("")
+        logger.warning("Troubleshooting steps:")
+        logger.warning("  1. Verify ROCm installation:")
+        logger.warning("     rocm-smi  # Should list your GPU")
+        logger.warning("  2. Check PyTorch ROCm build:")
+        logger.warning("     python -c \"import torch; print(f'ROCm: {torch.version.hip}')\"")
+        logger.warning("  3. Set HSA_OVERRIDE_GFX_VERSION for your GPU (see above)")
+        logger.warning("  4. On Windows: Use start_gradio_ui_rocm.bat which sets required env vars")
+        logger.warning("  5. See docs/en/ACE-Step1.5-Rocm-Manual-Linux.md for Linux setup")
+        logger.warning("  6. See requirements-rocm.txt for Windows ROCm setup instructions")
+        
+    elif is_cuda_build:
+        logger.warning("✓ PyTorch CUDA build detected")
+        logger.warning(f"  CUDA version: {torch_module.version.cuda}")
+        logger.warning("")
+        logger.warning("❌ torch.cuda.is_available() returned False")
+        logger.warning("")
+        logger.warning("Common causes for NVIDIA GPUs:")
+        logger.warning("  1. NVIDIA drivers not installed")
+        logger.warning("  2. CUDA runtime not installed or version mismatch")
+        logger.warning("  3. GPU not supported by installed CUDA version")
+        logger.warning("")
+        logger.warning("Troubleshooting steps:")
+        logger.warning("  1. Verify NVIDIA driver installation:")
+        logger.warning("     nvidia-smi  # Should list your GPU")
+        logger.warning("  2. Check CUDA version compatibility")
+        logger.warning("  3. Reinstall PyTorch with CUDA support:")
+        logger.warning(f"     pip install torch --index-url {PYTORCH_CUDA_INSTALL_URL}")
+        
+    else:
+        logger.warning("⚠️ PyTorch build type: CPU-only")
+        logger.warning("")
+        logger.warning("You have installed a CPU-only version of PyTorch!")
+        logger.warning("")
+        logger.warning("For NVIDIA GPUs:")
+        logger.warning(f"  pip install torch --index-url {PYTORCH_CUDA_INSTALL_URL}")
+        logger.warning("")
+        logger.warning("For AMD GPUs with ROCm:")
+        logger.warning("  Windows: See requirements-rocm.txt for detailed instructions")
+        logger.warning(f"  Linux: pip install torch --index-url {PYTORCH_ROCM_INSTALL_URL}")
+        logger.warning("")
+        logger.warning("For more information, see README.md section 'AMD / ROCm GPUs'")
+    
+    logger.warning("=" * 80)
 
 
 def get_gpu_tier(gpu_memory_gb: float) -> str:

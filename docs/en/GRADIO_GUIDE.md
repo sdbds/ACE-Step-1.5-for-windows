@@ -464,6 +464,17 @@ After training, export the final adapter:
 1. Enter the export path
 2. Click **Export LoRA**
 
+#### Performance notes (Windows / low VRAM)
+
+On Windows or systems with limited VRAM, training and preprocessing can stall or use more memory than expected. The following can help:
+
+- **Persistent workers** – Epoch-boundary worker reinitialization on Windows can cause long pauses; the default behavior has been improved (see related fixes) so stalls are less common out of the box.
+- **Offload unused models** – During preprocessing, offloading models that are not needed for the current step (e.g. via **Offload to CPU** in Service Configuration) can greatly reduce VRAM use and avoid spikes that slow or block preprocessing.
+- **Tiled encode** – Using tiled encoding for preprocessing reduces peak VRAM and can turn multi-minute preprocessing into much shorter runs when VRAM is tight.
+- **Batch size** – Lower batch size during training reduces memory use at the cost of longer training; gradient accumulation can keep effective batch size while staying within VRAM limits.
+
+These options are especially useful when preprocessing takes a long time or you see out-of-memory or long pauses between epochs.
+
 ---
 
 ## Tips and Best Practices

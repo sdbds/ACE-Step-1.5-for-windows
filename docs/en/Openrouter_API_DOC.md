@@ -11,9 +11,10 @@
 - [Authentication](#authentication)
 - [Endpoints](#endpoints)
   - [POST /v1/chat/completions - Generate Music](#1-generate-music)
-  - [GET /api/v1/models - List Models](#2-list-models)
+  - [GET /v1/models - List Models](#2-list-models)
   - [GET /health - Health Check](#3-health-check)
 - [Input Modes](#input-modes)
+- [Audio Input](#audio-input)
 - [Streaming Responses](#streaming-responses)
 - [Examples](#examples)
 - [Error Codes](#error-codes)
@@ -44,38 +45,78 @@ Generates music from chat messages and returns audio data along with LM-generate
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `model` | string | No | `"acemusic/acestep-v1.5-turbo"` | Model ID |
+| `model` | string | No | auto | Model ID (obtain from `/v1/models`) |
 | `messages` | array | **Yes** | - | Chat message list. See [Input Modes](#input-modes) |
 | `stream` | boolean | No | `false` | Enable streaming response. See [Streaming Responses](#streaming-responses) |
+| `audio_config` | object | No | `null` | Audio generation configuration. See below |
 | `temperature` | float | No | `0.85` | LM sampling temperature |
 | `top_p` | float | No | `0.9` | LM nucleus sampling parameter |
-| `lyrics` | string | No | `""` | Lyrics passed directly (takes priority over lyrics parsed from messages) |
-| `duration` | float | No | `null` | Audio duration in seconds. If omitted, determined automatically by the LM |
-| `bpm` | integer | No | `null` | Beats per minute. If omitted, determined automatically by the LM |
-| `vocal_language` | string | No | `"en"` | Vocal language code (e.g. `"zh"`, `"en"`, `"ja"`) |
-| `instrumental` | boolean | No | `false` | Whether to generate instrumental-only music (no vocals) |
+| `seed` | int \| string | No | `null` | Random seed. When `batch_size > 1`, use comma-separated values, e.g. `"42,123,456"` |
+| `lyrics` | string | No | `""` | Lyrics passed directly (takes priority over lyrics parsed from messages). When set, messages text becomes the prompt |
+| `sample_mode` | boolean | No | `false` | Enable LLM sample mode. Messages text becomes sample_query for LLM to auto-generate prompt/lyrics |
 | `thinking` | boolean | No | `false` | Enable LLM thinking mode for deeper reasoning |
-| `use_cot_metas` | boolean | No | `true` | Auto-generate BPM, duration, key, time signature via Chain-of-Thought |
+| `use_format` | boolean | No | `false` | When user provides prompt/lyrics, enhance them via LLM formatting |
 | `use_cot_caption` | boolean | No | `true` | Rewrite/enhance the music description via Chain-of-Thought |
 | `use_cot_language` | boolean | No | `true` | Auto-detect vocal language via Chain-of-Thought |
-| `use_format` | boolean | No | `true` | When prompt/lyrics are provided directly, enhance them via LLM formatting |
+| `guidance_scale` | float | No | `7.0` | Classifier-free guidance scale |
+| `batch_size` | int | No | `1` | Number of audio samples to generate |
+| `task_type` | string | No | `"text2music"` | Task type. See [Audio Input](#audio-input) |
+| `repainting_start` | float | No | `0.0` | Repaint region start position (seconds) |
+| `repainting_end` | float | No | `null` | Repaint region end position (seconds) |
+| `audio_cover_strength` | float | No | `1.0` | Cover strength (0.0~1.0) |
 
-> **Note on LM parameters:** `use_format` applies when the user provides explicit prompt/lyrics (tagged or lyrics mode) and enhances the description and lyrics formatting via LLM. The `use_cot_*` parameters control Phase 1 CoT reasoning during the audio generation stage. When `use_format` or sample mode has already generated a duration, `use_cot_metas` is automatically skipped to avoid redundancy.
+#### audio_config Object
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `duration` | float | `null` | Audio duration in seconds. If omitted, determined automatically by the LM |
+| `bpm` | integer | `null` | Beats per minute. If omitted, determined automatically by the LM |
+| `vocal_language` | string | `"en"` | Vocal language code (e.g. `"zh"`, `"en"`, `"ja"`) |
+| `instrumental` | boolean | `null` | Whether to generate instrumental-only (no vocals). If omitted, auto-determined from lyrics |
+| `format` | string | `"mp3"` | Output audio format |
+| `key_scale` | string | `null` | Musical key (e.g. `"C major"`) |
+| `time_signature` | string | `null` | Time signature (e.g. `"4/4"`) |
+
+> **Messages text meaning depends on the mode:**
+> - If `lyrics` is set → messages text = prompt (music description)
+> - If `sample_mode: true` is set → messages text = sample_query (let LLM generate everything)
+> - Neither set → auto-detect: tags → tag mode, lyrics-like → lyrics mode, otherwise → sample mode
 
 #### messages Format
+
+Supports both plain text and multimodal (text + audio) formats:
+
+**Plain text:**
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Your input content"}
+  ]
+}
+```
+
+**Multimodal (with audio input):**
 
 ```json
 {
   "messages": [
     {
       "role": "user",
-      "content": "Your input content"
+      "content": [
+        {"type": "text", "text": "Cover this song"},
+        {
+          "type": "input_audio",
+          "input_audio": {
+            "data": "<base64 audio data>",
+            "format": "mp3"
+          }
+        }
+      ]
     }
   ]
 }
 ```
-
-Set `role` to `"user"` and `content` to the text input. The system automatically determines the input mode based on the content. See [Input Modes](#input-modes) for details.
 
 ---
 
@@ -86,7 +127,7 @@ Set `role` to `"user"` and `content` to the text input. The system automatically
   "id": "chatcmpl-a1b2c3d4e5f6g7h8",
   "object": "chat.completion",
   "created": 1706688000,
-  "model": "acemusic/acestep-v1.5-turbo",
+  "model": "acestep/acestep-v15-turbo",
   "choices": [
     {
       "index": 0,
@@ -117,7 +158,7 @@ Set `role` to `"user"` and `content` to the text input. The system automatically
 
 | Field | Description |
 |---|---|
-| `choices[0].message.content` | Text information generated by the LM, including Metadata (Caption, BPM, Duration, Key, Time Signature, Language) and Lyrics. Returns `"Music generated successfully."` if LM was not involved |
+| `choices[0].message.content` | Text information generated by the LM, including Metadata (Caption/BPM/Duration/Key/Time Signature/Language) and Lyrics. Returns `"Music generated successfully."` if LM was not involved |
 | `choices[0].message.audio` | Audio data array. Each item contains `type` (`"audio_url"`) and `audio_url.url` (Base64 Data URL in format `data:audio/mpeg;base64,...`) |
 | `choices[0].finish_reason` | `"stop"` indicates normal completion |
 
@@ -152,7 +193,7 @@ audio.play();
 
 ### 2. List Models
 
-**GET** `/api/v1/models`
+**GET** `/v1/models`
 
 Returns available model information.
 
@@ -160,21 +201,18 @@ Returns available model information.
 
 ```json
 {
+  "object": "list",
   "data": [
     {
-      "id": "acemusic/acestep-v1.5-turbo",
-      "name": "ACE-Step",
+      "id": "acestep/acestep-v15-turbo",
+      "name": "ACE-Step acestep-v15-turbo",
       "created": 1706688000,
-      "description": "High-performance text-to-music generation model...",
-      "input_modalities": ["text"],
-      "output_modalities": ["audio"],
+      "input_modalities": ["text", "audio"],
+      "output_modalities": ["audio", "text"],
       "context_length": 4096,
-      "pricing": {
-        "prompt": "0",
-        "completion": "0",
-        "request": "0"
-      },
-      "supported_sampling_parameters": ["temperature", "top_p"]
+      "max_output_length": 300,
+      "pricing": {"prompt": "0", "completion": "0", "request": "0"},
+      "description": "AI music generation model"
     }
   ]
 }
@@ -200,7 +238,7 @@ Returns available model information.
 
 ## Input Modes
 
-The system automatically selects the input mode based on the content of the last `user` message:
+The system automatically selects the input mode based on the content of the last `user` message. You can also explicitly specify via the `lyrics` or `sample_mode` fields.
 
 ### Mode 1: Tagged Mode (Recommended)
 
@@ -211,16 +249,20 @@ Use `<prompt>` and `<lyrics>` tags to explicitly specify the music description a
   "messages": [
     {
       "role": "user",
-      "content": "<prompt>A gentle acoustic ballad in C major, 80 BPM, female vocal</prompt>\n<lyrics>[Verse 1]\nSunlight through the window\nA brand new day begins\n\n[Chorus]\nWe are the dreamers\nWe are the light</lyrics>"
+      "content": "<prompt>A gentle acoustic ballad in C major, female vocal</prompt>\n<lyrics>[Verse 1]\nSunlight through the window\nA brand new day begins\n\n[Chorus]\nWe are the dreamers\nWe are the light</lyrics>"
     }
-  ]
+  ],
+  "audio_config": {
+    "duration": 30,
+    "vocal_language": "en"
+  }
 }
 ```
 
-- `<prompt>...</prompt>` - Music style/scene description (caption)
-- `<lyrics>...</lyrics>` - Lyrics content
+- `<prompt>...</prompt>` — Music style/scene description (caption)
+- `<lyrics>...</lyrics>` — Lyrics content
 - Either tag can be used alone
-- When `use_format=true`, the LLM automatically enhances both prompt and lyrics
+- When `use_format: true`, the LLM automatically enhances both prompt and lyrics
 
 ### Mode 2: Natural Language Mode (Sample Mode)
 
@@ -229,15 +271,16 @@ Describe the desired music in natural language. The system uses LLM to generate 
 ```json
 {
   "messages": [
-    {
-      "role": "user",
-      "content": "Generate an upbeat pop song about summer and travel"
-    }
-  ]
+    {"role": "user", "content": "Generate an upbeat pop song about summer and travel"}
+  ],
+  "sample_mode": true,
+  "audio_config": {
+    "vocal_language": "en"
+  }
 }
 ```
 
-**Trigger condition:** Message content contains no tags and does not resemble lyrics (no `[Verse]`/`[Chorus]` markers, few lines, or long single lines).
+Trigger condition: `sample_mode: true`, or message content contains no tags and does not resemble lyrics.
 
 ### Mode 3: Lyrics-Only Mode
 
@@ -250,25 +293,116 @@ Pass in lyrics with structural markers directly. The system identifies them auto
       "role": "user",
       "content": "[Verse 1]\nWalking down the street\nFeeling the beat\n\n[Chorus]\nDance with me tonight\nUnder the moonlight"
     }
-  ]
+  ],
+  "audio_config": {"duration": 30}
 }
 ```
 
-**Trigger condition:** Message content contains `[Verse]`, `[Chorus]`, or similar markers, or has a multi-line short-text structure.
+Trigger condition: Message content contains `[Verse]`, `[Chorus]`, or similar markers, or has a multi-line short-text structure.
 
-### Instrumental Mode
+### Mode 4: Lyrics + Prompt Separation
 
-Set `instrumental: true` or use `[inst]` as the lyrics:
+Use the `lyrics` field to pass lyrics directly, and messages text automatically becomes the prompt:
 
 ```json
 {
-  "instrumental": true,
+  "messages": [
+    {"role": "user", "content": "Energetic EDM with heavy bass drops"}
+  ],
+  "lyrics": "[Verse 1]\nFeel the rhythm in your soul\nLet the music take control\n\n[Drop]\n(instrumental break)",
+  "audio_config": {
+    "bpm": 128,
+    "duration": 60
+  }
+}
+```
+
+### Instrumental Mode
+
+Set `audio_config.instrumental: true`:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "<prompt>Epic orchestral cinematic score, dramatic and powerful</prompt>"}
+  ],
+  "audio_config": {
+    "instrumental": true,
+    "duration": 30
+  }
+}
+```
+
+---
+
+## Audio Input
+
+Audio files can be passed via multimodal messages (base64 encoded) for cover, repaint, and other tasks.
+
+### task_type Types
+
+| task_type | Description | Audio Input Required |
+|---|---|---|
+| `text2music` | Text to music (default) | Optional (as reference) |
+| `cover` | Cover/style transfer | Requires src_audio |
+| `repaint` | Partial repaint | Requires src_audio |
+| `lego` | Audio splicing | Requires src_audio |
+| `extract` | Audio extraction | Requires src_audio |
+| `complete` | Audio continuation | Requires src_audio |
+
+### Audio Routing Rules
+
+Multiple `input_audio` blocks are routed to different parameters in order (similar to multi-image upload):
+
+| task_type | audio[0] | audio[1] |
+|---|---|---|
+| `text2music` | reference_audio (style reference) | - |
+| `cover/repaint/lego/extract/complete` | src_audio (audio to edit) | reference_audio (optional style reference) |
+
+### Audio Input Examples
+
+**Cover Task:**
+
+```json
+{
   "messages": [
     {
       "role": "user",
-      "content": "<prompt>Epic orchestral cinematic score, dramatic and powerful</prompt>"
+      "content": [
+        {"type": "text", "text": "<prompt>Jazz style cover with saxophone</prompt>"},
+        {
+          "type": "input_audio",
+          "input_audio": {"data": "<base64 source audio>", "format": "mp3"}
+        }
+      ]
     }
-  ]
+  ],
+  "task_type": "cover",
+  "audio_cover_strength": 0.8,
+  "audio_config": {"duration": 30}
+}
+```
+
+**Repaint Task:**
+
+```json
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "<prompt>Replace with guitar solo</prompt>"},
+        {
+          "type": "input_audio",
+          "input_audio": {"data": "<base64 source audio>", "format": "mp3"}
+        }
+      ]
+    }
+  ],
+  "task_type": "repaint",
+  "repainting_start": 10.0,
+  "repainting_end": 20.0,
+  "audio_config": {"duration": 30}
 }
 ```
 
@@ -283,7 +417,7 @@ Set `"stream": true` to enable SSE (Server-Sent Events) streaming.
 Each event starts with `data: `, followed by JSON, ending with a double newline `\n\n`:
 
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acestep/acestep-v15-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
 
 ```
 
@@ -291,10 +425,10 @@ data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000
 
 | Phase | Delta Content | Description |
 |---|---|---|
-| 1. Initialization | `{"role":"assistant","content":""}` | Establishes the connection |
-| 2. LM Content (optional) | `{"content":"## Metadata\n..."}` | Metadata and lyrics generated by the LM |
-| 3. Heartbeat | `{"content":"."}` | Sent every 2 seconds during audio generation to keep the connection alive |
-| 4. Audio Data | `{"audio":[{"type":"audio_url","audio_url":{"url":"data:..."}}]}` | The generated audio |
+| 1. Initialization | `{"role":"assistant","content":"Generating music"}` | Establishes the connection |
+| 2. Heartbeat | `{"content":"."}` | Sent every 2 seconds during generation to keep the connection alive |
+| 3. LM Content | `{"content":"## Metadata\n..."}` | Metadata and lyrics pushed after generation completes |
+| 4. Audio Data | `{"audio":[{"type":"audio_url","audio_url":{"url":"data:..."}}]}` | Audio base64 data |
 | 5. Finish | `finish_reason: "stop"` | Generation complete |
 | 6. Termination | `data: [DONE]` | End-of-stream marker |
 
@@ -323,7 +457,9 @@ import httpx
 
 with httpx.stream("POST", "http://127.0.0.1:8002/v1/chat/completions", json={
     "messages": [{"role": "user", "content": "Generate a cheerful guitar piece"}],
-    "stream": True
+    "sample_mode": True,
+    "stream": True,
+    "audio_config": {"instrumental": True}
 }) as response:
     content_parts = []
     audio_url = None
@@ -360,7 +496,9 @@ const response = await fetch("http://127.0.0.1:8002/v1/chat/completions", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     messages: [{ role: "user", content: "Generate a cheerful guitar piece" }],
-    stream: true
+    sample_mode: true,
+    stream: true,
+    audio_config: { instrumental: true }
   })
 });
 
@@ -401,7 +539,8 @@ curl -X POST http://127.0.0.1:8002/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "A soft folk song about hometown and memories"}
     ],
-    "vocal_language": "en"
+    "sample_mode": true,
+    "audio_config": {"vocal_language": "en"}
   }'
 ```
 
@@ -417,9 +556,11 @@ curl -X POST http://127.0.0.1:8002/v1/chat/completions \
         "content": "<prompt>Energetic EDM track with heavy bass drops and synth leads</prompt><lyrics>[Verse 1]\nFeel the rhythm in your soul\nLet the music take control\n\n[Drop]\n(instrumental break)</lyrics>"
       }
     ],
-    "bpm": 128,
-    "duration": 60,
-    "vocal_language": "en"
+    "audio_config": {
+      "bpm": 128,
+      "duration": 60,
+      "vocal_language": "en"
+    }
   }'
 ```
 
@@ -435,10 +576,11 @@ curl -X POST http://127.0.0.1:8002/v1/chat/completions \
         "content": "<prompt>Peaceful piano solo, slow tempo, jazz harmony</prompt>"
       }
     ],
-    "instrumental": true,
-    "use_format": false,
     "use_cot_caption": false,
-    "duration": 45
+    "audio_config": {
+      "instrumental": true,
+      "duration": 45
+    }
   }'
 ```
 
@@ -452,32 +594,26 @@ curl -X POST http://127.0.0.1:8002/v1/chat/completions \
     "messages": [
       {"role": "user", "content": "Generate a happy birthday song"}
     ],
+    "sample_mode": true,
     "stream": true
   }'
 ```
 
-### Example 5: Full Control with All Parameters
+### Example 5: Multi-Seed Batch Generation
 
 ```bash
 curl -X POST http://127.0.0.1:8002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
-      {
-        "role": "user",
-        "content": "<prompt>Dreamy lo-fi hip hop beat with vinyl crackle</prompt><lyrics>[inst]</lyrics>"
-      }
+      {"role": "user", "content": "<prompt>Lo-fi hip hop beat</prompt>"}
     ],
-    "temperature": 0.9,
-    "top_p": 0.95,
-    "bpm": 85,
-    "duration": 30,
-    "instrumental": true,
-    "thinking": false,
-    "use_cot_metas": true,
-    "use_cot_caption": true,
-    "use_cot_language": false,
-    "use_format": true
+    "batch_size": 3,
+    "seed": "42,123,456",
+    "audio_config": {
+      "instrumental": true,
+      "duration": 30
+    }
   }'
 ```
 
@@ -489,8 +625,10 @@ curl -X POST http://127.0.0.1:8002/v1/chat/completions \
 |---|---|
 | 400 | Invalid request format or missing valid input |
 | 401 | Missing or invalid API key |
+| 429 | Service busy, queue full |
 | 500 | Internal error during music generation |
 | 503 | Model not yet initialized |
+| 504 | Generation timeout |
 
 Error response format:
 
@@ -515,3 +653,5 @@ The following environment variables can be used to configure the server (for ope
 | `ACESTEP_DEVICE` | `auto` | Inference device |
 | `ACESTEP_LM_MODEL_PATH` | `acestep-5Hz-lm-0.6B` | LLM model path |
 | `ACESTEP_LM_BACKEND` | `vllm` | LLM inference backend |
+| `ACESTEP_QUEUE_MAXSIZE` | `200` | Task queue max capacity |
+| `ACESTEP_GENERATION_TIMEOUT` | `600` | Non-streaming request timeout (seconds) |

@@ -135,15 +135,38 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     for i, sample in enumerate(batch):
         tl = sample["target_latents"]
-        t_len = tl.shape[0]
-        target_latents[i, :t_len] = tl
-        attention_masks[i, :t_len] = sample["attention_mask"][:t_len]
-        context_latents[i, :t_len] = sample["context_latents"][:t_len]
+        if tl.shape[0] < max_latent_len:
+            pad = tl.new_zeros(max_latent_len - tl.shape[0], tl.shape[1])
+            tl = torch.cat([tl, pad], dim=0)
+        target_latents.append(tl)
 
+        # Pad attention_mask [T] -> [max_T]
+        am = sample["attention_mask"]
+        if am.shape[0] < max_latent_len:
+            pad = am.new_zeros(max_latent_len - am.shape[0])
+            am = torch.cat([am, pad], dim=0)
+        attention_masks.append(am)
+
+        # Pad context_latents [T, 65] -> [max_T, 65]
+        cl = sample["context_latents"]
+        if cl.shape[0] < max_latent_len:
+            pad = cl.new_zeros(max_latent_len - cl.shape[0], cl.shape[1])
+            cl = torch.cat([cl, pad], dim=0)
+        context_latents.append(cl)
+
+        # Pad encoder_hidden_states [L, D] -> [max_L, D]
         ehs = sample["encoder_hidden_states"]
-        e_len = ehs.shape[0]
-        encoder_hidden_states[i, :e_len] = ehs
-        encoder_attention_masks[i, :e_len] = sample["encoder_attention_mask"][:e_len]
+        if ehs.shape[0] < max_encoder_len:
+            pad = ehs.new_zeros(max_encoder_len - ehs.shape[0], ehs.shape[1])
+            ehs = torch.cat([ehs, pad], dim=0)
+        encoder_hidden_states.append(ehs)
+
+        # Pad encoder_attention_mask [L] -> [max_L]
+        eam = sample["encoder_attention_mask"]
+        if eam.shape[0] < max_encoder_len:
+            pad = eam.new_zeros(max_encoder_len - eam.shape[0])
+            eam = torch.cat([eam, pad], dim=0)
+        encoder_attention_masks.append(eam)
 
     return {
         "target_latents": target_latents,           # [B, T, 64]
@@ -168,6 +191,9 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         batch_size: int = 1,
         num_workers: int = 4,
         pin_memory: bool = True,
+        prefetch_factor: int = 2,
+        persistent_workers: bool = True,
+        pin_memory_device: Optional[str] = None,
         val_split: float = 0.0,
     ):
         """Initialize the data module.
@@ -186,6 +212,9 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+        self.pin_memory_device = pin_memory_device
         self.val_split = val_split
 
         self.train_dataset = None
@@ -211,39 +240,40 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
 
     def train_dataloader(self) -> DataLoader:
         """Create training dataloader."""
-        use_workers = self.num_workers > 0
-        loader_kwargs = dict(
+        prefetch_factor = None if self.num_workers == 0 else self.prefetch_factor
+        persistent_workers = False if self.num_workers == 0 else self.persistent_workers
+        pin_memory_device = self.pin_memory_device if self.pin_memory else None
+        return DataLoader(
+            self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            pin_memory_device=pin_memory_device,
             collate_fn=collate_preprocessed_batch,
-            drop_last=True,
+            drop_last=False,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
-        if use_workers:
-            # Keep worker processes alive between epochs to avoid respawn overhead
-            loader_kwargs["persistent_workers"] = True
-            # Prefetch more batches per worker for .pt file loading
-            loader_kwargs["prefetch_factor"] = 4
-        return DataLoader(self.train_dataset, **loader_kwargs)
 
     def val_dataloader(self) -> Optional[DataLoader]:
         """Create validation dataloader."""
         if self.val_dataset is None:
             return None
-
-        use_workers = self.num_workers > 0
-        loader_kwargs = dict(
+        prefetch_factor = None if self.num_workers == 0 else self.prefetch_factor
+        persistent_workers = False if self.num_workers == 0 else self.persistent_workers
+        pin_memory_device = self.pin_memory_device if self.pin_memory else None
+        return DataLoader(
+            self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            pin_memory_device=pin_memory_device,
             collate_fn=collate_preprocessed_batch,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
-        if use_workers:
-            loader_kwargs["persistent_workers"] = True
-            loader_kwargs["prefetch_factor"] = 4
-        return DataLoader(self.val_dataset, **loader_kwargs)
 
 
 # ============================================================================

@@ -30,6 +30,11 @@ DEFAULT_RESULTS_DIR = os.path.join(PROJECT_ROOT, "gradio_outputs").replace("\\",
 os.makedirs(DEFAULT_RESULTS_DIR, exist_ok=True)
 
 
+def clear_audio_outputs_for_new_generation():
+    """Return None for all 9 audio outputs so Gradio clears them and stops playback when a new generation starts."""
+    return (None,) * 9
+
+
 def parse_lrc_to_subtitles(lrc_text: str, total_duration: Optional[float] = None) -> List[Dict[str, Any]]:
     """
     Parse LRC lyrics text to Gradio subtitles format with SMART POST-PROCESSING.
@@ -686,25 +691,29 @@ def generate_with_progress(
     )
     time_module.sleep(0.1)
     
+    final_codes_display_updates = [gr.skip() for _ in range(8)]
     for i in range(8):
         if i < len(audios):
             key = audios[i]["key"]
             audio_tensor = audios[i]["tensor"]
             sample_rate = audios[i]["sample_rate"]
             audio_params = audios[i]["params"]
-            # Use local output directory instead of system temp
+            is_silent = audios[i].get("silent", False)
             timestamp = int(time_module.time())
             temp_dir = os.path.join(DEFAULT_RESULTS_DIR, f"batch_{timestamp}")
             temp_dir = os.path.abspath(temp_dir).replace("\\", "/")
             os.makedirs(temp_dir, exist_ok=True)
             json_path = os.path.join(temp_dir, f"{key}.json").replace("\\", "/")
             audio_path = os.path.join(temp_dir, f"{key}.{audio_format}").replace("\\", "/")
-            save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(audio_params, f, indent=2, ensure_ascii=False)
-            audio_outputs[i] = audio_path
-            all_audio_paths.append(audio_path)
-            all_audio_paths.append(json_path)
+            if not is_silent and audio_tensor is not None:
+                save_audio(audio_data=audio_tensor, output_path=audio_path, sample_rate=sample_rate, format=audio_format, channels_first=True)
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(audio_params, f, indent=2, ensure_ascii=False)
+                audio_outputs[i] = audio_path
+                all_audio_paths.append(audio_path)
+                all_audio_paths.append(json_path)
+            else:
+                audio_outputs[i] = None
             
             code_str = audio_params.get("audio_codes", "")
             final_codes_list[i] = code_str
@@ -817,6 +826,7 @@ def generate_with_progress(
             
             codes_display_updates = [gr.skip() for _ in range(8)]
             codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
+            final_codes_display_updates[i] = gr.update(value=code_str, visible=True)  # Keep visible=True
             
             details_accordion_updates = [gr.skip() for _ in range(8)]
             # Don't change accordion visibility - keep it always expandable
@@ -914,7 +924,6 @@ def generate_with_progress(
     )
     
     # Build final codes display, LRC display, accordion visibility updates
-    final_codes_display_updates = [gr.skip() for _ in range(8)]
     # final_lrc_display_updates = [gr.skip() for _ in range(8)]
     final_accordion_updates = [gr.skip() for _ in range(8)]
 

@@ -47,7 +47,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 from loguru import logger
 
@@ -378,8 +378,10 @@ PARAM_ALIASES = {
     "guidance_scale": ["guidance_scale", "guidanceScale"],
     "use_random_seed": ["use_random_seed", "useRandomSeed"],
     "seed": ["seed"],
-    "audio_code_string": ["audio_code_string", "audioCodeString"],
+
     "audio_cover_strength": ["audio_cover_strength", "audioCoverStrength"],
+    "reference_audio_path": ["reference_audio_path", "ref_audio_path", "referenceAudioPath", "refAudioPath"],
+    "src_audio_path": ["src_audio_path", "ctx_audio_path", "sourceAudioPath", "srcAudioPath", "ctxAudioPath"],
     "task_type": ["task_type", "taskType"],
     "infer_method": ["infer_method", "inferMethod"],
     "use_tiled_decode": ["use_tiled_decode", "useTiledDecode"],
@@ -526,14 +528,12 @@ class GenerateMusicRequest(BaseModel):
     inference_steps: int = 8
     guidance_scale: float = 7.0
     use_random_seed: bool = True
-    seed: int = -1
+    seed: Union[int, str] = -1
 
     reference_audio_path: Optional[str] = None
     src_audio_path: Optional[str] = None
     audio_duration: Optional[float] = None
     batch_size: Optional[int] = None
-
-    audio_code_string: str = ""
 
     repainting_start: float = 0.0
     repainting_end: Optional[float] = None
@@ -562,7 +562,7 @@ class GenerateMusicRequest(BaseModel):
 
     # 5Hz LM (server-side): used for metadata completion and (when thinking=True) codes generation.
     lm_model_path: Optional[str] = None  # e.g. "acestep-5Hz-lm-0.6B"
-    lm_backend: Literal["vllm", "pt"] = "vllm"
+    lm_backend: Literal["vllm", "pt", "mlx"] = "vllm"
 
     constrained_decoding: bool = True
     constrained_decoding_debug: bool = False
@@ -736,6 +736,12 @@ class _JobRecord:
     progress_text: str = ""
     status_text: str = ""
     env: str = "development"
+    progress: float = 0.0  # 0.0 - 1.0
+    stage: str = "queued"
+    updated_at: Optional[float] = None
+    # OpenRouter integration: synchronous wait / streaming support
+    done_event: Optional[asyncio.Event] = None
+    progress_queue: Optional[asyncio.Queue] = None
 
 
 class _JobStore:
@@ -746,18 +752,23 @@ class _JobStore:
 
     def create(self) -> _JobRecord:
         job_id = str(uuid4())
-        rec = _JobRecord(job_id=job_id, status="queued", created_at=time.time())
+        now = time.time()
+        rec = _JobRecord(job_id=job_id, status="queued", created_at=now, progress=0.0, stage="queued", updated_at=now)
         with self._lock:
             self._jobs[job_id] = rec
         return rec
 
     def create_with_id(self, job_id: str, env: str = "development") -> _JobRecord:
         """Create job record with specified ID"""
+        now = time.time()
         rec = _JobRecord(
             job_id=job_id,
             status="queued",
-            created_at=time.time(),
-            env=env
+            created_at=now,
+            env=env,
+            progress=0.0,
+            stage="queued",
+            updated_at=now,
         )
         with self._lock:
             self._jobs[job_id] = rec
@@ -772,6 +783,9 @@ class _JobStore:
             rec = self._jobs[job_id]
             rec.status = "running"
             rec.started_at = time.time()
+            rec.progress = max(rec.progress, 0.01)
+            rec.stage = "running"
+            rec.updated_at = time.time()
 
     def mark_succeeded(self, job_id: str, result: Dict[str, Any]) -> None:
         with self._lock:
@@ -780,6 +794,9 @@ class _JobStore:
             rec.finished_at = time.time()
             rec.result = result
             rec.error = None
+            rec.progress = 1.0
+            rec.stage = "succeeded"
+            rec.updated_at = time.time()
 
     def mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -788,6 +805,19 @@ class _JobStore:
             rec.finished_at = time.time()
             rec.result = None
             rec.error = error
+            rec.progress = rec.progress if rec.progress > 0 else 0.0
+            rec.stage = "failed"
+            rec.updated_at = time.time()
+
+    def update_progress(self, job_id: str, progress: float, stage: Optional[str] = None) -> None:
+        with self._lock:
+            rec = self._jobs.get(job_id)
+            if not rec:
+                return
+            rec.progress = max(0.0, min(1.0, float(progress)))
+            if stage:
+                rec.stage = stage
+            rec.updated_at = time.time()
 
     def cleanup_old_jobs(self, max_age_seconds: Optional[int] = None) -> int:
         """
@@ -847,6 +877,8 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 
 
 def _get_model_name(config_path: str) -> str:
@@ -1260,6 +1292,8 @@ def create_app() -> FastAPI:
                                 "seed_value": seed_value,
                                 "lm_model": lm_model,
                                 "dit_model": dit_model,
+                                "progress": 1.0,
+                                "stage": "succeeded",
                             }
                             for p in audio_paths
                         ]
@@ -1277,11 +1311,43 @@ def create_app() -> FastAPI:
                             "seed_value": seed_value,
                             "lm_model": lm_model,
                             "dit_model": dit_model,
+                            "progress": 1.0,
+                            "stage": "succeeded",
                         }]
             else:
-                # Failed or other status - include error from job store
-                error_msg = rec.error if rec and rec.error else None
-                result_data = [{"file": "", "wave": "", "status": status_int, "create_time": int(create_time), "env": env, "error": error_msg}]
+                result_data = [{
+                    "file": "",
+                    "wave": "",
+                    "status": status_int,
+                    "create_time": int(create_time),
+                    "env": env,
+                    "progress": 0.0,
+                    "stage": "failed" if status == "failed" else status,
+                }]
+
+            result_key = f"{RESULT_KEY_PREFIX}{job_id}"
+            local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
+
+        def _update_local_cache_progress(job_id: str, progress: float, stage: str) -> None:
+            """Update local cache with job progress for queued/running states."""
+            local_cache = getattr(app.state, 'local_cache', None)
+            if not local_cache:
+                return
+
+            rec = store.get(job_id)
+            env = getattr(rec, 'env', 'development') if rec else 'development'
+            create_time = rec.created_at if rec else time.time()
+            status_int = _map_status("running")
+
+            result_data = [{
+                "file": "",
+                "wave": "",
+                "status": status_int,
+                "create_time": int(create_time),
+                "env": env,
+                "progress": float(progress),
+                "stage": stage,
+            }]
 
             result_key = f"{RESULT_KEY_PREFIX}{job_id}"
             local_cache.set(result_key, result_data, ex=RESULT_EXPIRE_SECONDS)
@@ -1293,7 +1359,8 @@ def create_app() -> FastAPI:
 
             await _ensure_initialized()
             job_store.mark_running(job_id)
-
+            _update_local_cache_progress(job_id, 0.01, "running")
+            
             # Select DiT handler based on user's model choice
             # Default: use primary handler
             selected_handler: AceStepHandler = app.state.handler
@@ -1352,6 +1419,7 @@ def create_app() -> FastAPI:
                         had_error = getattr(app.state, "_llm_init_error", None)
                         if initialized or had_error is not None:
                             return
+                        print("[API Server] reloading.")
 
                         # Check if lazy loading is disabled (GPU memory insufficient)
                         if getattr(app.state, "_llm_lazy_load_disabled", False):
@@ -1367,7 +1435,7 @@ def create_app() -> FastAPI:
                         checkpoint_dir = os.path.join(project_root, "checkpoints")
                         lm_model_path = (req.lm_model_path or os.getenv("ACESTEP_LM_MODEL_PATH") or "acestep-5Hz-lm-0.6B").strip()
                         backend = (req.lm_backend or os.getenv("ACESTEP_LM_BACKEND") or "vllm").strip().lower()
-                        if backend not in {"vllm", "pt"}:
+                        if backend not in {"vllm", "pt", "mlx"}:
                             backend = "vllm"
 
                         # Auto-download LM model if not present
@@ -1387,7 +1455,7 @@ def create_app() -> FastAPI:
                             backend=backend,
                             device=lm_device,
                             offload_to_cpu=lm_offload,
-                            dtype=h.dtype,
+                            dtype=None,
                         )
                         if not ok:
                             app.state._llm_init_error = status
@@ -1422,7 +1490,19 @@ def create_app() -> FastAPI:
                 use_format = bool(req.use_format)
                 use_cot_caption = bool(req.use_cot_caption)
                 use_cot_language = bool(req.use_cot_language)
+
                 full_analysis_only = bool(req.full_analysis_only)
+
+                # Unload LM for cover tasks on MPS to reduce memory; reload lazily when needed.
+                if req.task_type == "cover" and h.device == "mps":
+                    if getattr(app.state, "_llm_initialized", False) and getattr(llm, "llm_initialized", False):
+                        try:
+                            print("[API Server] unloading.")
+                            llm.unload()
+                            app.state._llm_initialized = False
+                            app.state._llm_init_error = None
+                        except Exception as e:
+                            print(f"[API Server] Failed to unload LM: {e}")
 
                 # LLM is REQUIRED for these features (fail if unavailable):
                 # - thinking mode (LM generates audio codes)
@@ -1567,7 +1647,7 @@ def create_app() -> FastAPI:
                     instruction=instruction_to_use,
                     reference_audio=req.reference_audio_path,
                     src_audio=req.src_audio_path,
-                    audio_codes=req.audio_code_string,
+                    audio_codes="",
                     caption=caption,
                     lyrics=lyrics,
                     instrumental=_is_instrumental(lyrics),
@@ -1620,6 +1700,28 @@ def create_app() -> FastAPI:
                 # Check LLM initialization status
                 llm_is_initialized = getattr(app.state, "_llm_initialized", False)
                 llm_to_pass = llm if llm_is_initialized else None
+
+                # Progress callback for API polling
+                last_progress = {"value": -1.0, "time": 0.0, "stage": ""}
+
+                def _progress_cb(value: float, desc: str = "") -> None:
+                    now = time.time()
+                    try:
+                        value_f = max(0.0, min(1.0, float(value)))
+                    except Exception:
+                        value_f = 0.0
+                    stage = desc or last_progress["stage"] or "running"
+                    # Throttle updates to avoid excessive cache writes
+                    if (
+                        value_f - last_progress["value"] >= 0.01
+                        or stage != last_progress["stage"]
+                        or (now - last_progress["time"]) >= 0.5
+                    ):
+                        last_progress["value"] = value_f
+                        last_progress["time"] = now
+                        last_progress["stage"] = stage
+                        job_store.update_progress(job_id, value_f, stage=stage)
+                        _update_local_cache_progress(job_id, value_f, stage)
 
                 if req.full_analysis_only:
                     store.update_progress_text(job_id, "Starting Deep Analysis...")
@@ -1676,6 +1778,7 @@ def create_app() -> FastAPI:
                     return {
                         "first_audio_path": None,
                         "audio_paths": [],
+                        "raw_audio_paths": [],
                         "generation_info": "Analysis Only Mode Complete",
                         "status_message": "Success",
                         "metas": metas_found,
@@ -1689,14 +1792,66 @@ def create_app() -> FastAPI:
                     }
 
                 # Generate music using unified interface
-                result = generate_music(
-                    dit_handler=h,
-                    llm_handler=llm_to_pass,
-                    params=params,
-                    config=config,
-                    save_dir=app.state.temp_audio_dir,
-                    progress=None,
-                )
+                sequential_runs = 1
+                if req.task_type == "cover" and h.device == "mps":
+                    # If user asked for multiple outputs, run sequentially on MPS to avoid OOM.
+                    if config.batch_size is not None and config.batch_size > 1:
+                        sequential_runs = int(config.batch_size)
+                        config.batch_size = 1
+                        print(f"[API Server] Job {job_id}: MPS cover sequential mode enabled (runs={sequential_runs})")
+
+                def _progress_for_slice(start: float, end: float):
+                    base = {"seen": False, "value": 0.0}
+                    def _cb(value: float, desc: str = "") -> None:
+                        try:
+                            value_f = max(0.0, min(1.0, float(value)))
+                        except Exception:
+                            value_f = 0.0
+                        if not base["seen"]:
+                            base["seen"] = True
+                            base["value"] = value_f
+                        # Normalize progress to avoid initial jump (e.g., 0.51 -> 0.0)
+                        if value_f <= base["value"]:
+                            norm = 0.0
+                        else:
+                            denom = max(1e-6, 1.0 - base["value"])
+                            norm = min(1.0, (value_f - base["value"]) / denom)
+                        mapped = start + (end - start) * norm
+                        _progress_cb(mapped, desc=desc)
+                    return _cb
+
+                aggregated_result = None
+                all_audios: List[Dict[str, Any]] = []
+                for run_idx in range(sequential_runs):
+                    if sequential_runs > 1:
+                        print(f"[API Server] Job {job_id}: Sequential cover run {run_idx + 1}/{sequential_runs}")
+                    if sequential_runs > 1:
+                        start = run_idx / sequential_runs
+                        end = (run_idx + 1) / sequential_runs
+                        progress_cb = _progress_for_slice(start, end)
+                    else:
+                        progress_cb = _progress_cb
+
+                    result = generate_music(
+                        dit_handler=h,
+                        llm_handler=llm_to_pass,
+                        params=params,
+                        config=config,
+                        save_dir=app.state.temp_audio_dir,
+                        progress=progress_cb,
+                    )
+                    if not result.success:
+                        raise RuntimeError(f"Music generation failed: {result.error or result.status_message}")
+
+                    if aggregated_result is None:
+                        aggregated_result = result
+                    all_audios.extend(result.audios)
+
+                # Use aggregated result with combined audios
+                if aggregated_result is None:
+                    raise RuntimeError("Music generation failed: no results")
+                aggregated_result.audios = all_audios
+                result = aggregated_result
 
                 if not result.success:
                     raise RuntimeError(f"Music generation failed: {result.error or result.status_message}")
@@ -1771,6 +1926,7 @@ def create_app() -> FastAPI:
                     "first_audio_path": _path_to_audio_url(first_audio) if first_audio else None,
                     "second_audio_path": _path_to_audio_url(second_audio) if second_audio else None,
                     "audio_paths": [_path_to_audio_url(p) for p in audio_paths],
+                    "raw_audio_paths": list(audio_paths),
                     "generation_info": generation_info,
                     "status_message": result.status_message,
                     "seed_value": seed_value,
@@ -1805,6 +1961,16 @@ def create_app() -> FastAPI:
                 # Update local cache
                 _update_local_cache(job_id, None, "failed")
             finally:
+                # Best-effort cache cleanup to reduce MPS memory fragmentation between jobs
+                try:
+                    if hasattr(h, "_empty_cache"):
+                        h._empty_cache()
+                    else:
+                        import torch
+                        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                            torch.mps.empty_cache()
+                except Exception:
+                    pass
                 dt = max(0.0, time.time() - t0)
                 async with app.state.stats_lock:
                     app.state.recent_durations.append(dt)
@@ -1814,6 +1980,7 @@ def create_app() -> FastAPI:
         async def _queue_worker(worker_idx: int) -> None:
             while True:
                 job_id, req = await app.state.job_queue.get()
+                rec = store.get(job_id)
                 try:
                     async with app.state.pending_lock:
                         try:
@@ -1822,6 +1989,26 @@ def create_app() -> FastAPI:
                             pass
 
                     await _run_one_job(job_id, req)
+
+                    # Notify OpenRouter waiters after job completion
+                    if rec and rec.progress_queue:
+                        if rec.status == "succeeded" and rec.result:
+                            await rec.progress_queue.put({"type": "result", "result": rec.result})
+                        elif rec.status == "failed":
+                            await rec.progress_queue.put({"type": "error", "content": rec.error or "Generation failed"})
+                        await rec.progress_queue.put({"type": "done"})
+                    if rec and rec.done_event:
+                        rec.done_event.set()
+
+                except Exception as exc:
+                    # _run_one_job raised (e.g. _ensure_initialized failed)
+                    if rec and rec.status not in ("succeeded", "failed"):
+                        store.mark_failed(job_id, str(exc))
+                    if rec and rec.progress_queue:
+                        await rec.progress_queue.put({"type": "error", "content": str(exc)})
+                        await rec.progress_queue.put({"type": "done"})
+                    if rec and rec.done_event:
+                        rec.done_event.set()
                 finally:
                     await _cleanup_job_temp_files(job_id)
                     app.state.job_queue.task_done()
@@ -2053,7 +2240,7 @@ def create_app() -> FastAPI:
 
         if init_llm:
             lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-            if lm_backend not in {"vllm", "pt"}:
+            if lm_backend not in {"vllm", "pt", "mlx"}:
                 lm_backend = "vllm"
             lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
 
@@ -2075,7 +2262,7 @@ def create_app() -> FastAPI:
                 backend=lm_backend,
                 device=lm_device,
                 offload_to_cpu=lm_offload,
-                dtype=handler.dtype,
+                dtype=None,
             )
             if llm_ok:
                 app.state._llm_initialized = True
@@ -2103,6 +2290,11 @@ def create_app() -> FastAPI:
             executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="ACE-Step API", version="1.0", lifespan=lifespan)
+
+    # Mount OpenRouter-compatible endpoints (/v1/chat/completions, /v1/models)
+    from acestep.openrouter_adapter import create_openrouter_router
+    openrouter_router = create_openrouter_router(lambda: app.state)
+    app.include_router(openrouter_router)
 
     async def _queue_position(job_id: str) -> int:
         async with app.state.pending_lock:
@@ -2145,11 +2337,12 @@ def create_app() -> FastAPI:
                 use_random_seed=p.bool("use_random_seed", True),
                 seed=p.int("seed", -1),
                 batch_size=p.int("batch_size"),
-                audio_code_string=p.str("audio_code_string"),
                 repainting_start=p.float("repainting_start", 0.0),
                 repainting_end=p.float("repainting_end"),
                 instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
                 audio_cover_strength=p.float("audio_cover_strength", 1.0),
+                reference_audio_path=p.str("reference_audio_path") or None,
+                src_audio_path=p.str("src_audio_path") or None,
                 task_type=p.str("task_type", "text2music"),
                 use_adg=p.bool("use_adg"),
                 cfg_interval_start=p.float("cfg_interval_start", 0.0),
@@ -2396,6 +2589,8 @@ def create_app() -> FastAPI:
                         "create_time": int(create_time), "env": env,
                         "prompt": "", "lyrics": "",
                         "metas": {},
+                        "progress": float(rec.progress) if rec else 0.0,
+                        "stage": rec.stage if rec else "queued",
                         "error": rec.error if rec.error else None,
                     }]
 
@@ -2529,7 +2724,7 @@ def create_app() -> FastAPI:
                 checkpoint_dir = os.path.join(project_root, "checkpoints")
                 lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
                 backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-                if backend not in {"vllm", "pt"}:
+                if backend not in {"vllm", "pt", "mlx"}:
                     backend = "vllm"
 
                 # Auto-download LM model if not present
@@ -2550,7 +2745,7 @@ def create_app() -> FastAPI:
                     backend=backend,
                     device=lm_device,
                     offload_to_cpu=lm_offload,
-                    dtype=h.dtype,
+                    dtype=None,
                 )
                 if not ok:
                     app.state._llm_init_error = status

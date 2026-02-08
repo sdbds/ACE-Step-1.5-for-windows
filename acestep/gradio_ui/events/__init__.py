@@ -4,6 +4,7 @@ Main entry point for setting up all event handlers
 """
 import gradio as gr
 from typing import Optional
+from loguru import logger
 
 # Import handler modules
 from . import generation_handlers as gen_h
@@ -538,6 +539,19 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         yield from res_h.generate_with_batch_management(dit_handler, llm_handler, *args)
     # ========== Generation Handler ==========
     generation_section["generate_btn"].click(
+        fn=res_h.clear_audio_outputs_for_new_generation,
+        outputs=[
+            results_section["generated_audio_1"],
+            results_section["generated_audio_2"],
+            results_section["generated_audio_3"],
+            results_section["generated_audio_4"],
+            results_section["generated_audio_5"],
+            results_section["generated_audio_6"],
+            results_section["generated_audio_7"],
+            results_section["generated_audio_8"],
+            results_section["generated_audio_batch"],
+        ],
+    ).then(
         fn=generation_wrapper,
         inputs=[
             generation_section["captions"],
@@ -647,7 +661,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             results_section["next_batch_btn"],
             results_section["next_batch_status"],
             results_section["restore_params_btn"],
-        ]
+        ],
     ).then(
         fn=lambda *args: res_h.generate_next_batch_background(dit_handler, llm_handler, *args),
         inputs=[
@@ -1180,12 +1194,15 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
     )
     
     # Start training from preprocessed tensors
-    def training_wrapper(tensor_dir, r, a, d, lr, ep, bs, ga, se, sh, sd, od, ts):
+    def training_wrapper(tensor_dir, r, a, d, lr, ep, bs, ga, se, sh, sd, od, rc, ts):
+        from loguru import logger
+        if not isinstance(ts, dict):
+            ts = {"is_training": False, "should_stop": False}
         try:
-            for progress, log, plot, state in train_h.start_training(
-                tensor_dir, dit_handler, llm_handler, r, a, d, lr, ep, bs, ga, se, sh, sd, od, ts
+            for progress, log_msg, plot, state in train_h.start_training(
+                tensor_dir, dit_handler, r, a, d, lr, ep, bs, ga, se, sh, sd, od, rc, ts
             ):
-                yield progress, log, plot, state
+                yield progress, log_msg, plot, state
         except Exception as e:
             logger.exception("Training wrapper error")
             yield f"❌ Error: {str(e)}", str(e), None, ts
@@ -1205,6 +1222,7 @@ def setup_training_event_handlers(demo, dit_handler, llm_handler, training_secti
             training_section["training_shift"],
             training_section["training_seed"],
             training_section["lora_output_dir"],
+            training_section["resume_checkpoint_dir"],
             training_section["training_state"],
         ],
         outputs=[

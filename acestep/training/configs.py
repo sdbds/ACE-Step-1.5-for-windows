@@ -77,7 +77,7 @@ class TrainingConfig:
     """Configuration for LoRA training process.
     
     Training uses:
-    - BFloat16 precision (only supported precision)
+    - Device-aware mixed precision (bf16 on CUDA/XPU, fp16 on MPS, fp32 on CPU)
     - Discrete timesteps from turbo shift=3.0 schedule (8 steps)
     - Randomly samples one of 8 timesteps per training step:
       [1.0, 0.9545, 0.9, 0.8333, 0.75, 0.6429, 0.5, 0.3]
@@ -93,7 +93,7 @@ class TrainingConfig:
         warmup_steps: Number of warmup steps for learning rate scheduler
         weight_decay: Weight decay for optimizer
         max_grad_norm: Maximum gradient norm for clipping
-        mixed_precision: Always "bf16" (only supported precision)
+        mixed_precision: Preferred precision mode for logging/config tracking
         seed: Random seed for reproducibility
         output_dir: Directory to save checkpoints and logs
     """
@@ -108,7 +108,7 @@ class TrainingConfig:
     warmup_steps: int = 100
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    mixed_precision: str = "bf16"  # Fixed: only bf16 supported
+    mixed_precision: str = "bf16"
     seed: int = 42
     output_dir: str = "./lora_output"
     use_fp8: bool = False  # Use FP8 quantization for decoder weights
@@ -116,6 +116,9 @@ class TrainingConfig:
     # Data loading
     num_workers: int = 4
     pin_memory: bool = True
+    prefetch_factor: int = 2
+    persistent_workers: bool = True
+    pin_memory_device: Optional[str] = None
     
     # Logging
     log_every_n_steps: int = 10
@@ -139,5 +142,8 @@ class TrainingConfig:
             "use_fp8": self.use_fp8,
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
+            "prefetch_factor": self.prefetch_factor,
+            "persistent_workers": self.persistent_workers,
+            "pin_memory_device": self.pin_memory_device,
             "log_every_n_steps": self.log_every_n_steps,
         }

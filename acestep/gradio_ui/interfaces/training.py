@@ -7,6 +7,7 @@ Contains the dataset builder and LoRA training interface components.
 import os
 import gradio as gr
 from acestep.gradio_ui.i18n import t
+from acestep.constants import DEBUG_TRAINING
 
 
 def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
@@ -24,6 +25,11 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
     # Check if running in service mode (hide training tab)
     service_mode = init_params is not None and init_params.get('service_mode', False)
     
+    debug_training_enabled = str(DEBUG_TRAINING).strip().upper() != "OFF"
+    epoch_min = 1 if debug_training_enabled else 100
+    epoch_step = 1 if debug_training_enabled else 100
+    epoch_default = 1 if debug_training_enabled else 1000
+
     with gr.Tab(t("training.tab_title"), visible=not service_mode):
         gr.HTML("""
         <div style="text-align: center; padding: 10px; margin-bottom: 15px;">
@@ -421,10 +427,10 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                     )
                     
                     train_epochs = gr.Slider(
-                        minimum=100,
+                        minimum=epoch_min,
                         maximum=4000,
-                        step=100,
-                        value=1000,
+                        step=epoch_step,
+                        value=epoch_default,
                         label=t("training.max_epochs"),
                     )
                     
@@ -476,6 +482,13 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                         value="./lora_output",
                         placeholder="./lora_output",
                         info=t("training.output_dir_info"),
+                    )
+                
+                with gr.Row():
+                    resume_checkpoint_dir = gr.Textbox(
+                        label="Resume Checkpoint (optional)",
+                        placeholder="./lora_output/checkpoints/epoch_200",
+                        info="Directory of a saved LoRA checkpoint to resume from",
                     )
                 
                 gr.HTML("<hr>")
@@ -599,6 +612,7 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
         "training_shift": training_shift,
         "training_seed": training_seed,
         "lora_output_dir": lora_output_dir,
+        "resume_checkpoint_dir": resume_checkpoint_dir,
         "start_training_btn": start_training_btn,
         "stop_training_btn": stop_training_btn,
         "training_progress": training_progress,

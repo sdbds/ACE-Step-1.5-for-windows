@@ -9,11 +9,16 @@ backward-compatible Gradio UI support.
 import math
 import os
 import tempfile
+import shutil
+import subprocess
+import sys
 from typing import Optional, Union, List, Dict, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from loguru import logger
 
-from acestep.audio_utils import AudioSaver, generate_uuid_from_params
+from acestep.audio_utils import AudioSaver, generate_uuid_from_params, is_audio_silent
+from acestep.constants import TASK_INSTRUCTIONS
+from acestep.gpu_config import get_gpu_config
 
 # HuggingFace Space environment detection
 IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
@@ -333,6 +338,15 @@ def generate_music(
         # Otherwise, check if we need audio codes (lm_dit mode) or just metas (dit mode)
         user_provided_audio_codes = bool(params.audio_codes and str(params.audio_codes).strip())
 
+        # Safety: cover task without any source audio or codes produces silence.
+        if params.task_type == "cover":
+            no_src_audio = not (params.reference_audio or params.src_audio)
+            if no_src_audio and not user_provided_audio_codes:
+                logger.warning("Cover task requested without source audio or audio codes. Falling back to text2music.")
+                params.task_type = "text2music"
+                if params.instruction == TASK_INSTRUCTIONS.get("cover"):
+                    params.instruction = TASK_INSTRUCTIONS.get("text2music", params.instruction)
+
         # Determine infer_type: use "llm_dit" if we need audio codes, "dit" if only metas needed
         # For now, we use "llm_dit" if batch mode or if user hasn't provided codes
         # Use "dit" if user has provided codes (only need metas) or if explicitly only need metas
@@ -383,11 +397,95 @@ def generate_music(
         
         if params.task_type in skip_lm_tasks:
             logger.info(f"Skipping LM for task_type='{params.task_type}' - using DiT directly")
-        
+
         logger.info(f"[generate_music] LLM usage decision: thinking={params.thinking}, "
                    f"use_cot_caption={params.use_cot_caption}, use_cot_language={params.use_cot_language}, "
                    f"use_cot_metas={params.use_cot_metas}, need_lm_for_cot={need_lm_for_cot}, "
                    f"llm_initialized={llm_handler.llm_initialized if llm_handler else False}, use_lm={use_lm}")
+
+        def _infer_audio_duration_seconds(audio_path: str) -> Optional[float]:
+            """Best-effort duration inference for common audio formats."""
+            if not audio_path:
+                return None
+            # Try torchaudio (supports more formats when ffmpeg backend is available)
+            try:
+                import torchaudio
+                info = torchaudio.info(audio_path)
+                if info and info.num_frames and info.sample_rate:
+                    return float(info.num_frames) / float(info.sample_rate)
+            except Exception:
+                pass
+            # Try soundfile (fast for wav/flac)
+            try:
+                import soundfile as sf
+                info = sf.info(audio_path)
+                if info and info.frames and info.samplerate:
+                    return float(info.frames) / float(info.samplerate)
+            except Exception:
+                pass
+            # macOS fallback: use afinfo for m4a/aac
+            if sys.platform == "darwin" and shutil.which("afinfo"):
+                try:
+                    result = subprocess.run(
+                        ["afinfo", audio_path],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.stdout:
+                        for line in result.stdout.splitlines():
+                            if "duration:" in line:
+                                # Example: "duration:  183.165s"
+                                parts = line.strip().split()
+                                for p in parts:
+                                    if p.endswith("s"):
+                                        try:
+                                            return float(p.rstrip("s"))
+                                        except ValueError:
+                                            continue
+                except Exception:
+                    pass
+            return None
+
+        # Clamp duration and batch size to GPU limits (applies to non-Gradio callers too)
+        try:
+            # If duration not provided, try to infer from source audio to enable safe clamping.
+            if (audio_duration is None or float(audio_duration) <= 0) and (params.src_audio or params.reference_audio):
+                audio_path = params.src_audio or params.reference_audio
+                try:
+                    inferred = _infer_audio_duration_seconds(audio_path)
+                    if inferred and inferred > 0:
+                        audio_duration = inferred
+                        params.duration = inferred
+                        logger.info(f"[generate_music] Inferred duration from audio file: {inferred:.2f}s")
+                except Exception as e:
+                    logger.warning(f"[generate_music] Failed to infer duration from audio file: {e}")
+
+            gpu_config = get_gpu_config()
+            max_duration = gpu_config.max_duration_with_lm if use_lm else gpu_config.max_duration_without_lm
+            if audio_duration is not None and float(audio_duration) > 0 and float(audio_duration) > max_duration:
+                logger.warning(f"[generate_music] Duration {audio_duration}s exceeds GPU limit {max_duration}s. Clamping.")
+                audio_duration = float(max_duration)
+                params.duration = float(max_duration)
+
+            max_batch = gpu_config.max_batch_size_with_lm if use_lm else gpu_config.max_batch_size_without_lm
+            if config.batch_size is not None and config.batch_size > max_batch:
+                logger.warning(f"[generate_music] Batch size {config.batch_size} exceeds GPU limit {max_batch}. Clamping.")
+                config.batch_size = max_batch
+
+            # Extra safety for MPS: large durations can OOM with batch > 1
+            if (
+                hasattr(dit_handler, "device")
+                and dit_handler.device == "mps"
+                and audio_duration is not None
+                and float(audio_duration) > 180
+                and config.batch_size is not None
+                and config.batch_size > 1
+            ):
+                logger.warning("[generate_music] MPS with long duration detected; reducing batch size to 1 to avoid OOM.")
+                config.batch_size = 1
+        except Exception as e:
+            logger.warning(f"[generate_music] Failed to clamp duration/batch to GPU limits: {e}")
         
         if use_lm:
             # Convert sampling parameters - handle None values safely
@@ -618,6 +716,7 @@ def generate_music(
         # Build audios list for GenerationResult with params and save files
         # Audio saving and UUID generation handled here, outside of handler
         audios = []
+        silent_warnings = []
         for idx, dit_audio in enumerate(dit_audios):
             # Create a copy of params dict for this audio
             audio_params = base_params_dict.copy()
@@ -642,9 +741,23 @@ def generate_music(
 
             audio_key = generate_uuid_from_params(audio_params)
 
-            # Save audio file (handled outside handler)
+            silent_check = False
+            if audio_tensor is not None:
+                silent_check, rms_val, peak_val = is_audio_silent(audio_tensor, channels_first=True)
+                if silent_check:
+                    logger.warning(
+                        f"[generate_music] Silent output detected (idx={idx}, RMS={rms_val:.2e}, peak={peak_val:.2e}). "
+                        "Likely cause: LLM backend returned empty conditioning, or incompatible torch/triton/flash-attn. "
+                        "Suggest running with --backend pt."
+                    )
+                    silent_warnings.append(
+                        f"Output {idx + 1}: silent or near-silent (RMS≈{rms_val:.2e}). "
+                        "Likely causes: LLM backend failure, incompatible torch/triton/flash-attn, or CPU/fallback path. "
+                        "Try running with --backend pt."
+                    )
+
             audio_path = None
-            if audio_tensor is not None and save_dir is not None:
+            if audio_tensor is not None and save_dir is not None and not silent_check:
                 try:
                     audio_file = os.path.join(save_dir, f"{audio_key}.{audio_format}")
                     audio_path = audio_saver.save_audio(audio_tensor,
@@ -654,14 +767,15 @@ def generate_music(
                                                         channels_first=True)
                 except Exception as e:
                     logger.error(f"[generate_music] Failed to save audio file: {e}")
-                    audio_path = ""  # Fallback to empty path
+                    audio_path = ""
 
             audio_dict = {
-                "path": audio_path or "",  # File path (saved here, not in handler)
-                "tensor": audio_tensor,  # Audio tensor [channels, samples], CPU, float32
+                "path": audio_path or "",
+                "tensor": audio_tensor,
                 "key": audio_key,
                 "sample_rate": sample_rate,
                 "params": audio_params,
+                "silent": silent_check,
             }
 
             audios.append(audio_dict)
@@ -697,6 +811,8 @@ def generate_music(
             status_message = "\n".join(lm_status) + "\n" + status_message
         else:
             status_message = status_message
+        if silent_warnings:
+            status_message = "⚠️ Silent output detected:\n" + "\n".join(silent_warnings) + "\n\nSuggested fix: try running with --backend pt\n\n" + (status_message or "")
         # Create and return GenerationResult
         return GenerationResult(
             audios=audios,

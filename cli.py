@@ -66,7 +66,7 @@ from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
 from acestep.inference import GenerationParams, GenerationConfig, generate_music, create_sample, format_sample
 from acestep.constants import DEFAULT_DIT_INSTRUCTION, TASK_INSTRUCTIONS
-from acestep.gpu_config import get_gpu_config, set_global_gpu_config, GPUConfig, GPU_TIER_CONFIGS
+from acestep.gpu_config import get_gpu_config
 import torch
 
 
@@ -466,21 +466,6 @@ def _resolve_device(device: str) -> str:
             return "mps"
         return "cpu"
     return device
-
-
-def _get_mps_wired_limit_mb() -> Optional[int]:
-    """Best-effort read of iogpu.wired_limit_mb on macOS (may be unavailable)."""
-    try:
-        import subprocess
-        out = subprocess.check_output(["sysctl", "iogpu.wired_limit_mb"], text=True).strip()
-        # Expected: "iogpu.wired_limit_mb: 12345"
-        parts = out.split(":")
-        if len(parts) == 2:
-            value = parts[1].strip()
-            return int(value)
-    except Exception:
-        pass
-    return None
 
 
 def _default_instruction_for_task(task_type: str, tracks: Optional[List[str]] = None) -> str:
@@ -990,48 +975,8 @@ def main():
     """
     Main function to run ACE-Step music generation from the command line.
     """
-    gpu_config = get_gpu_config()
-    # Override tier thresholds in CLI without modifying gpu_config.py.
-    # For MPS, use iogpu.wired_limit_mb as a proxy for memory when available.
-    mem_gib = None
-    if gpu_config.gpu_memory_gb > 0:
-        mem_gib = gpu_config.gpu_memory_gb
-    else:
-        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        if mps_available:
-            wired_limit_mb = _get_mps_wired_limit_mb()
-            if wired_limit_mb is not None and wired_limit_mb > 0:
-                mem_gib = wired_limit_mb / 1024.0
-    if mem_gib is not None and mem_gib > 0:
-        if mem_gib <= 24:
-            effective_tier = "tier1"
-        elif mem_gib <= 32:
-            effective_tier = "tier2"
-        elif mem_gib <= 40:
-            effective_tier = "tier3"
-        elif mem_gib <= 48:
-            effective_tier = "tier4"
-        elif mem_gib <= 56:
-            effective_tier = "tier5"
-        elif mem_gib <= 64:
-            effective_tier = "tier6"
-        else:
-            effective_tier = "unlimited"
-        if effective_tier != gpu_config.tier:
-            tier_config = GPU_TIER_CONFIGS[effective_tier]
-            gpu_config = GPUConfig(
-                tier=effective_tier,
-                gpu_memory_gb=mem_gib,
-                max_duration_with_lm=tier_config["max_duration_with_lm"],
-                max_duration_without_lm=tier_config["max_duration_without_lm"],
-                max_batch_size_with_lm=tier_config["max_batch_size_with_lm"],
-                max_batch_size_without_lm=tier_config["max_batch_size_without_lm"],
-                init_lm_default=tier_config["init_lm_default"],
-                available_lm_models=tier_config["available_lm_models"],
-                lm_memory_gb=tier_config["lm_memory_gb"],
-            )
-    set_global_gpu_config(gpu_config)
 
+    gpu_config = get_gpu_config()
     auto_offload = gpu_config.gpu_memory_gb > 0 and gpu_config.gpu_memory_gb < 16
     print(f"\n{'='*60}")
     print("GPU Configuration Detected:")
@@ -1044,22 +989,6 @@ def main():
     print(f"  Max Batch Size (without LM): {gpu_config.max_batch_size_without_lm}")
     print(f"  Default LM Init: {gpu_config.init_lm_default}")
     print(f"  Available LM Models: {gpu_config.available_lm_models or 'None'}")
-    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    if mps_available and gpu_config.gpu_memory_gb <= 0:
-        wired_limit_mb = _get_mps_wired_limit_mb()
-        if wired_limit_mb is not None:
-            print(f"  MPS Available: True (wired limit: {wired_limit_mb} MB)")
-        else:
-            print("  MPS Available: True (wired limit: unknown)")
-        print("  Note: MPS memory is not reported here; tier may be inaccurate.")
-    elif mps_available and gpu_config.gpu_memory_gb > 0:
-        wired_limit_mb = _get_mps_wired_limit_mb()
-        if wired_limit_mb is not None:
-            print(f"  MPS Available: True (wired limit: {wired_limit_mb} MB)")
-            print("  Note: Tiering uses MPS wired limit as a proxy for GPU memory.")
-        else:
-            print("  MPS Available: True (wired limit: unknown)")
-            print("  Note: Tiering uses MPS wired limit when available.")
     print(f"{'='*60}\n")
 
     if auto_offload:
@@ -1418,7 +1347,7 @@ def main():
 
     use_flash_attention = args.use_flash_attention
     if use_flash_attention is None:
-        use_flash_attention = dit_handler.is_flash_attention_available()
+        use_flash_attention = dit_handler.is_flash_attention_available(device)
 
     print(f"Initializing DiT handler with model: {args.config_path}")
     dit_handler.initialize_service(
@@ -1469,7 +1398,7 @@ def main():
             backend=args.backend,
             device=device,
             offload_to_cpu=args.offload_to_cpu,
-            dtype=dit_handler.dtype,
+            dtype=None,
         )
     else:
         if args.task_type in skip_lm_tasks:

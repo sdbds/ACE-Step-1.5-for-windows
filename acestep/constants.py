@@ -7,6 +7,9 @@ Centralized constants used across the codebase
 # Language Constants
 # ==============================================================================
 
+# Supported languages for vocal generation and language detection
+# Covers major world languages with good TTS support in the underlying model
+# 'unknown' is used when language cannot be determined automatically
 VALID_LANGUAGES = [
     'ar', 'az', 'bg', 'bn', 'ca', 'cs', 'da', 'de', 'el', 'en',
     'es', 'fa', 'fi', 'fr', 'he', 'hi', 'hr', 'ht', 'hu', 'id',
@@ -21,11 +24,17 @@ VALID_LANGUAGES = [
 # Keyscale Constants
 # ==============================================================================
 
+# Musical note names using standard Western notation
 KEYSCALE_NOTES = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+
+# Supported accidentals: natural, ASCII sharp/flat, Unicode sharp/flat
 KEYSCALE_ACCIDENTALS = ['', '#', 'b', '♯', '♭']  # empty + ASCII sharp/flat + Unicode sharp/flat
+
+# Major and minor scale modes
 KEYSCALE_MODES = ['major', 'minor']
 
 # Generate all valid keyscales: 7 notes × 5 accidentals × 2 modes = 70 combinations
+# Examples: "C major", "F# minor", "B♭ major"
 VALID_KEYSCALES = set()
 for note in KEYSCALE_NOTES:
     for acc in KEYSCALE_ACCIDENTALS:
@@ -37,28 +46,44 @@ for note in KEYSCALE_NOTES:
 # Metadata Range Constants
 # ==============================================================================
 
-# BPM (Beats Per Minute) range
+# BPM (Beats Per Minute) range - covers most musical styles
+# 30 BPM: Very slow ballads, ambient music
+# 300 BPM: Fast electronic dance music, extreme metal
 BPM_MIN = 30
 BPM_MAX = 300
 
-# Duration range (in seconds)
+# Duration range (in seconds) - balances quality vs. computational cost
+# 10s: Short loops, musical excerpts
+# 600s: Full songs, extended compositions (10 minutes)
 DURATION_MIN = 10
 DURATION_MAX = 600
 
-# Valid time signatures
+# Valid time signatures - common musical meter patterns
+# 2: 2/4 time (marches, polka)
+# 3: 3/4 time (waltzes, ballads) 
+# 4: 4/4 time (most pop, rock, hip-hop)
+# 6: 6/8 time (compound time, folk dances)
 VALID_TIME_SIGNATURES = [2, 3, 4, 6]
 
 
 # ==============================================================================
-# Task Type Constants
+# Task Type Constants  
 # ==============================================================================
 
+# All supported generation tasks across different model variants
 TASK_TYPES = ["text2music", "repaint", "cover", "extract", "lego", "complete"]
 
-# Task types available for turbo models (subset)
+# Task types available for turbo models (optimized subset for speed)
+# - text2music: Generate from text descriptions
+# - repaint: Selective audio editing/regeneration  
+# - cover: Style transfer using reference audio
 TASK_TYPES_TURBO = ["text2music", "repaint", "cover"]
 
-# Task types available for base models (full set)
+# Task types available for base models (full feature set)
+# Additional tasks requiring more computational resources:
+# - extract: Separate individual tracks/stems from audio
+# - lego: Multi-track generation (add layers)
+# - complete: Automatic completion of partial audio
 TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complete"]
 
 
@@ -93,11 +118,20 @@ TASK_INSTRUCTIONS = {
 # Track/Instrument Constants
 # ==============================================================================
 
+# Supported instrumental track types for multi-track generation and extraction
+# Organized by instrument families for logical grouping:
+# - Wind instruments: woodwinds, brass
+# - Electronic: fx (effects), synth (synthesizer)  
+# - String instruments: strings, guitar, bass
+# - Rhythm section: percussion, drums, keyboard
+# - Vocals: backing_vocals, vocals (lead vocals)
 TRACK_NAMES = [
     "woodwinds", "brass", "fx", "synth", "strings", "percussion",
     "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"
 ]
 
+# Template for SFT (Supervised Fine-Tuning) model prompts
+# Used to format inputs for the language model with instruction, caption, and metadata
 SFT_GEN_PROMPT = """# Instruction
 {}
 
