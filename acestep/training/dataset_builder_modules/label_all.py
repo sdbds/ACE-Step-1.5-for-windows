@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from loguru import logger
@@ -100,9 +100,19 @@ class LabelAllMixin:
                     target_device = dit_handler.device
                     if isinstance(target_device, str):
                         target_device = torch.device(target_device)
-                    if silence_latent.device != target_device:
+                    silence_device = silence_latent.device
+                    if silence_device.type != target_device.type:
                         raise RuntimeError(
-                            f"silence_latent on {silence_latent.device}, expected {target_device}"
+                            f"silence_latent on {silence_device}, expected {target_device}"
+                        )
+                    if (
+                        target_device.type == "cuda"
+                        and target_device.index is not None
+                        and silence_device.index is not None
+                        and silence_device.index != target_device.index
+                    ):
+                        raise RuntimeError(
+                            f"silence_latent on {silence_device}, expected {target_device}"
                         )
                 except Exception as e:
                     logger.error(f"Tokenize precheck failed: {e}")
@@ -191,6 +201,7 @@ class LabelAllMixin:
         chunk_size: int = 16,
         batch_size: int = 1,
         progress_callback=None,
+        sample_labeled_callback: Optional[Callable[[int, AudioSample, str], None]] = None,
     ) -> Tuple[List[AudioSample], str]:
         """Label all samples in the dataset."""
         if not self.samples:
@@ -231,7 +242,7 @@ class LabelAllMixin:
             if progress_callback:
                 progress_callback(f"Labeling {idx+1}/{total}: {sample.filename}")
 
-            _, status = self._label_sample_with_codes(
+            labeled_sample, status = self._label_sample_with_codes(
                 sample_idx=i,
                 audio_codes=codes_cache.get(i),
                 dit_handler=dit_handler,
@@ -241,6 +252,12 @@ class LabelAllMixin:
                 skip_metas=skip_metas,
                 progress_callback=progress_callback,
             )
+
+            if sample_labeled_callback is not None and labeled_sample is not None:
+                try:
+                    sample_labeled_callback(i, labeled_sample, status)
+                except Exception:
+                    logger.exception("sample_labeled_callback failed")
 
             if "✅" in status:
                 success_count += 1

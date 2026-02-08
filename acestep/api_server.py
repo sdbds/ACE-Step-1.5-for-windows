@@ -476,13 +476,40 @@ class AutoLabelTask:
     progress: str
     current: int
     total: int
+    save_path: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     created_at: float = 0.0
+    updated_at: float = 0.0
 
 
 _auto_label_tasks: Dict[str, AutoLabelTask] = {}
 _auto_label_lock = Lock()
+_auto_label_latest_task_id: Optional[str] = None
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    dir_path = os.path.dirname(path) if os.path.dirname(path) else "."
+    os.makedirs(dir_path, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=dir_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    dir_path = os.path.dirname(path) if os.path.dirname(path) else "."
+    os.makedirs(dir_path, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 @dataclass
@@ -613,6 +640,8 @@ class AutoLabelRequest(BaseModel):
     transcribe_lyrics: bool = Field(default=False, description="Transcribe lyrics from audio")
     only_unlabeled: bool = Field(default=False, description="Only label unlabeled samples")
 
+    save_path: Optional[str] = Field(default=None, description="Optional dataset JSON path to persist progress during auto-label")
+
     chunk_size: int = Field(default=16, ge=1, description="Chunk size for batch audio encoding")
     batch_size: int = Field(default=1, ge=1, description="Batch size for batch audio encoding")
 
@@ -686,9 +715,9 @@ class StartLoKRTrainingRequest(BaseModel):
     lokr_decompose_both: bool = Field(default=False, description="Decompose both matrices")
     lokr_use_tucker: bool = Field(default=False, description="Use Tucker decomposition")
     lokr_use_scalar: bool = Field(default=False, description="Use scalar calibration")
-    lokr_weight_decompose: bool = Field(default=False, description="Enable DoRA mode")
-    learning_rate: float = Field(default=1e-4, gt=0.0, description="Learning rate")
-    train_epochs: int = Field(default=10, ge=1, description="Training epochs")
+    lokr_weight_decompose: bool = Field(default=True, description="Enable DoRA mode")
+    learning_rate: float = Field(default=0.03, gt=0.0, description="Learning rate")
+    train_epochs: int = Field(default=500, ge=1, description="Training epochs")
     train_batch_size: int = Field(default=1, ge=1, description="Batch size")
     gradient_accumulation: int = Field(default=4, ge=1, description="Gradient accumulation steps")
     save_every_n_epochs: int = Field(default=5, ge=1, description="Save checkpoint every N epochs")
@@ -1227,11 +1256,12 @@ def create_app() -> FastAPI:
         app.state._python_executable = sys.executable
 
         # Temporary directory for saving generated audio files
-        app.state.temp_audio_dir = os.path.join(tmp_root, "api_audio")
+        app.state.temp_audio_dir = os.path.join(tempfile.gettempdir(), "acestep_audio")
         os.makedirs(app.state.temp_audio_dir, exist_ok=True)
 
         # Dataset builder and training state
         app.state.dataset_builder = None  # Will be created on first use
+        app.state.dataset_json_path = None
         app.state.training_state = {"is_training": False, "should_stop": False}
 
         # Initialize local cache
@@ -2942,6 +2972,7 @@ def create_app() -> FastAPI:
                 builder.set_custom_tag(request.custom_tag, request.tag_position)
 
             app.state.dataset_builder = builder
+            app.state.dataset_json_path = os.path.join(request.audio_dir.strip(), f"{builder.metadata.name}.json")
 
             # Return full sample data with all metadata
             samples_data = [
@@ -3064,6 +3095,33 @@ def create_app() -> FastAPI:
                 pass
 
         try:
+            resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
+            resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
+
+            def sample_labeled_callback(sample_idx: int, sample, status: str):
+                if resolved_save_path is None:
+                    return
+                if "✅" not in status:
+                    return
+                try:
+                    if resolved_jsonl_path is not None:
+                        _append_jsonl(
+                            resolved_jsonl_path,
+                            {
+                                "ts": time.time(),
+                                "index": sample_idx,
+                                "status": status,
+                                "sample": sample.to_dict(),
+                            },
+                        )
+                    dataset = {
+                        "metadata": builder.metadata.to_dict(),
+                        "samples": [s.to_dict() for s in builder.samples],
+                    }
+                    _atomic_write_json(resolved_save_path, dataset)
+                except Exception:
+                    logger.exception("Auto-label incremental save failed")
+
             samples, status = builder.label_all_samples(
                 dit_handler=handler,
                 llm_handler=llm,
@@ -3074,6 +3132,7 @@ def create_app() -> FastAPI:
                 chunk_size=request.chunk_size,
                 batch_size=request.batch_size,
                 progress_callback=None,
+                sample_labeled_callback=sample_labeled_callback,
             )
 
             # Return full sample data with all metadata
@@ -3143,6 +3202,7 @@ def create_app() -> FastAPI:
             })
 
         # Create task
+        resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
         with _auto_label_lock:
             _auto_label_tasks[task_id] = AutoLabelTask(
                 task_id=task_id,
@@ -3150,8 +3210,12 @@ def create_app() -> FastAPI:
                 progress="Starting...",
                 current=0,
                 total=total,
-                created_at=time.time()
+                save_path=resolved_save_path,
+                created_at=time.time(),
+                updated_at=time.time(),
             )
+            global _auto_label_latest_task_id
+            _auto_label_latest_task_id = task_id
 
         # Background labeling function
         def run_labeling():
@@ -3176,12 +3240,39 @@ def create_app() -> FastAPI:
                     with _auto_label_lock:
                         task = _auto_label_tasks.get(task_id)
                         if task:
-                            # Extract progress from message like "Labeling 5/100: filename.mp3"
+                            task.progress = msg
+                            task.updated_at = time.time()
                             import re
-                            match = re.match(r'Labeling (\d+)/(\d+)', msg)
+                            match = re.match(r'^(?:VAE encoding|Tokenizing|Labeling|Encoding) (\d+)/(\d+)', msg)
                             if match:
                                 task.current = int(match.group(1))
-                                task.progress = msg
+                                task.total = int(match.group(2))
+
+                resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
+
+                def sample_labeled_callback(sample_idx: int, sample, status: str):
+                    if resolved_save_path is None:
+                        return
+                    if "✅" not in status:
+                        return
+                    try:
+                        if resolved_jsonl_path is not None:
+                            _append_jsonl(
+                                resolved_jsonl_path,
+                                {
+                                    "ts": time.time(),
+                                    "index": sample_idx,
+                                    "status": status,
+                                    "sample": sample.to_dict(),
+                                },
+                            )
+                        dataset = {
+                            "metadata": builder.metadata.to_dict(),
+                            "samples": [s.to_dict() for s in builder.samples],
+                        }
+                        _atomic_write_json(resolved_save_path, dataset)
+                    except Exception:
+                        logger.exception("Auto-label incremental save failed")
 
                 # Run labeling
                 samples, status = builder.label_all_samples(
@@ -3194,6 +3285,7 @@ def create_app() -> FastAPI:
                     chunk_size=request.chunk_size,
                     batch_size=request.batch_size,
                     progress_callback=progress_callback,
+                    sample_labeled_callback=sample_labeled_callback,
                 )
 
                 # Prepare result
@@ -3227,6 +3319,7 @@ def create_app() -> FastAPI:
                         task.status = "completed"
                         task.progress = status
                         task.current = task.total
+                        task.updated_at = time.time()
                         task.result = {
                             "message": status,
                             "labeled_count": builder.get_labeled_count(),
@@ -3239,6 +3332,7 @@ def create_app() -> FastAPI:
                         task.status = "failed"
                         task.error = str(e)
                         task.progress = f"Failed: {str(e)}"
+                        task.updated_at = time.time()
 
         # Start background task
         import threading
@@ -3274,6 +3368,40 @@ def create_app() -> FastAPI:
 
             return _wrap_response(response_data)
 
+    @app.get("/v1/dataset/auto_label_status")
+    async def get_auto_label_status_latest(_: None = Depends(verify_api_key)):
+        with _auto_label_lock:
+            if _auto_label_latest_task_id is None:
+                return _wrap_response({
+                    "task_id": None,
+                    "status": "idle",
+                    "progress": "",
+                    "current": 0,
+                    "total": 0,
+                })
+            task = _auto_label_tasks.get(_auto_label_latest_task_id)
+            if task is None:
+                return _wrap_response({
+                    "task_id": _auto_label_latest_task_id,
+                    "status": "idle",
+                    "progress": "",
+                    "current": 0,
+                    "total": 0,
+                })
+
+            response_data = {
+                "task_id": task.task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "current": task.current,
+                "total": task.total,
+            }
+            if task.status == "completed" and task.result:
+                response_data["result"] = task.result
+            elif task.status == "failed" and task.error:
+                response_data["error"] = task.error
+            return _wrap_response(response_data)
+
     @app.post("/v1/dataset/save")
     async def save_dataset(request: SaveDatasetRequest, _: None = Depends(verify_api_key)):
         """Save dataset to JSON file."""
@@ -3295,9 +3423,11 @@ def create_app() -> FastAPI:
             status = builder.save_dataset(request.save_path.strip(), request.dataset_name)
 
             if status.startswith("✅"):
+                app.state.dataset_json_path = request.save_path.strip()
+
+            if status.startswith("✅"):
                 return _wrap_response({"message": status, "save_path": request.save_path})
-            else:
-                return _wrap_response(None, code=400, error=status)
+            return _wrap_response(None, code=400, error=status)
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Save failed: {str(e)}")
 
