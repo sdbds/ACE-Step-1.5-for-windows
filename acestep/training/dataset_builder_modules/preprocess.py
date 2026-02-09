@@ -189,6 +189,8 @@ class PreprocessMixin:
                     )
                 debug_end_verbose_for("dataset", f"run_encoder[{i}]", t0)
 
+                del text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
+
                 t0 = debug_start_verbose_for("dataset", f"build_context_latents[{i}]")
                 context_latents = build_context_latents(silence_latent, latent_length, device, dtype)
                 debug_end_verbose_for("dataset", f"build_context_latents[{i}]", t0)
@@ -217,8 +219,14 @@ class PreprocessMixin:
                 t0 = debug_start_verbose_for("dataset", f"torch.save[{i}]")
                 torch.save(output_data, output_path)
                 debug_end_verbose_for("dataset", f"torch.save[{i}]", t0)
+                del output_data
                 output_paths.append(output_path)
                 success_count += 1
+
+                del target_latents, attention_mask, encoder_hidden_states, encoder_attention_mask, context_latents
+
+                if device.type == "cuda" and (i + 1) % 8 == 0:
+                    torch.cuda.empty_cache()
 
             except Exception as e:
                 logger.exception(f"Error preprocessing {sample.filename}")
