@@ -3569,6 +3569,22 @@ def create_app() -> FastAPI:
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
 
+        preprocess_notes = []
+
+        decoder_offloaded = False
+        if handler.model is not None and hasattr(handler.model, "decoder") and handler.model.decoder is not None:
+            try:
+                first_param = next(handler.model.decoder.parameters(), None)
+                if first_param is not None and first_param.device.type != "cpu":
+                    handler.model.decoder = handler.model.decoder.to("cpu")
+                    decoder_offloaded = True
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            except Exception as e:
+                preprocess_notes.append(f"⚠️ Failed to offload decoder: {str(e)}")
+
         # Unload LLM before preprocessing to free VRAM (preprocessing doesn't need LLM)
         llm: LLMHandler = app.state.llm_handler
         llm_was_loaded = False
@@ -3580,9 +3596,8 @@ def create_app() -> FastAPI:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            except Exception:
-                # Silently continue if unload fails
-                pass
+            except Exception as e:
+                preprocess_notes.append(f"⚠️ Failed to unload LLM: {str(e)}")
 
         try:
             # Run preprocessing in thread pool to avoid blocking event loop
@@ -3623,6 +3638,10 @@ def create_app() -> FastAPI:
                 # Add notes about unloading
                 if llm_was_loaded:
                     status += "\n⚠️ LLM has been unloaded."
+                if decoder_offloaded:
+                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM for preprocessing."
+                if preprocess_notes:
+                    status += "\n" + "\n".join(preprocess_notes)
                 if components_unloaded:
                     status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
 
@@ -3677,6 +3696,22 @@ def create_app() -> FastAPI:
         # Background preprocessing function
         def run_preprocessing():
             try:
+                preprocess_notes = []
+
+                decoder_offloaded = False
+                if handler.model is not None and hasattr(handler.model, "decoder") and handler.model.decoder is not None:
+                    try:
+                        first_param = next(handler.model.decoder.parameters(), None)
+                        if first_param is not None and first_param.device.type != "cpu":
+                            handler.model.decoder = handler.model.decoder.to("cpu")
+                            decoder_offloaded = True
+                            import gc
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    except Exception as e:
+                        preprocess_notes.append(f"⚠️ Failed to offload decoder: {str(e)}")
+
                 # Unload LLM before preprocessing
                 llm: LLMHandler = app.state.llm_handler
                 llm_was_loaded = False
@@ -3688,8 +3723,8 @@ def create_app() -> FastAPI:
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        preprocess_notes.append(f"⚠️ Failed to unload LLM: {str(e)}")
 
                 # Progress callback
                 def progress_callback(msg: str):
@@ -3737,6 +3772,10 @@ def create_app() -> FastAPI:
                 # Add notes about unloading
                 if llm_was_loaded:
                     status += "\n⚠️ LLM has been unloaded."
+                if decoder_offloaded:
+                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM for preprocessing."
+                if preprocess_notes:
+                    status += "\n" + "\n".join(preprocess_notes)
                 if components_unloaded:
                     status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
 
