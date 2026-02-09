@@ -2978,6 +2978,21 @@ def create_app() -> FastAPI:
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Failed to set LoRA scale: {str(e)}")
 
+    @app.get("/v1/lora/status")
+    async def get_lora_status_endpoint(_: None = Depends(verify_api_key)):
+        """Get current LoRA/LoKr adapter state for the primary handler."""
+        handler: AceStepHandler = app.state.handler
+
+        if handler is None or handler.model is None:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+
+        return _wrap_response({
+            "lora_loaded": bool(getattr(handler, "lora_loaded", False)),
+            "use_lora": bool(getattr(handler, "use_lora", False)),
+            "lora_scale": float(getattr(handler, "lora_scale", 1.0)),
+            "adapter_type": getattr(handler, "_adapter_type", None),
+        })
+
     @app.post("/v1/dataset/scan")
     async def scan_dataset_directory(request: ScanDirectoryRequest, _: None = Depends(verify_api_key)):
         """Scan directory for audio files and create dataset."""
@@ -3825,7 +3840,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Sample index {sample_idx} out of range")
 
         sample = builder.samples[sample_idx]
-        return _wrap_response(sample.to_dict())
+        payload = sample.to_dict()
+        payload["index"] = sample_idx
+        return _wrap_response(payload)
 
     @app.put("/v1/dataset/sample/{sample_idx}")
     async def update_sample(sample_idx: int, request: UpdateSampleRequest, _: None = Depends(verify_api_key)):
@@ -3850,7 +3867,9 @@ def create_app() -> FastAPI:
             )
 
             if status.startswith("✅"):
-                return _wrap_response({"message": status, "sample": sample.to_dict()})
+                sample_payload = sample.to_dict()
+                sample_payload["index"] = sample_idx
+                return _wrap_response({"message": status, "sample": sample_payload})
             else:
                 return _wrap_response(None, code=400, error=status)
         except Exception as e:
