@@ -98,7 +98,11 @@ class AceStepHandler:
         )
         self._load_progress_estimates()
         self.last_init_params = None
-
+        
+        # Quantization state - tracks if model is quantized (int8_weight_only, fp8_weight_only, or w8a8_dynamic)
+        # Populated during initialize_service, remains None if quantization is disabled
+        self.quantization = None
+        
         # LoRA state
         self.lora_loaded = False
         self.use_lora = False
@@ -169,7 +173,16 @@ class AceStepHandler:
         """
         if self.model is None:
             return "❌ Model not initialized. Please initialize service first."
-
+        
+        # Check if model is quantized - LoRA loading on quantized models is not supported
+        # due to incompatibility between PEFT and torchao (missing get_apply_tensor_subclass argument)
+        if self.quantization is not None:
+            return (
+                f"❌ LoRA loading is not supported on quantized models. "
+                f"Current quantization: {self.quantization}. "
+                "Please re-initialize the service with quantization disabled, then try loading the LoRA adapter again."
+            )
+        
         if not lora_path or not lora_path.strip():
             return "❌ Please provide a LoRA path."
 
@@ -489,6 +502,11 @@ class AceStepHandler:
             (status_message, enable_generate_button)
         """
         try:
+            if config_path is None:
+                config_path = "acestep-v15-turbo"
+                logger.warning(
+                    "[initialize_service] config_path not set; defaulting to 'acestep-v15-turbo'."
+                )
             if device == "auto":
                 if torch.cuda.is_available():
                     device = "cuda"
@@ -535,12 +553,12 @@ class AceStepHandler:
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
             self.compiled = compile_model
-            # Set dtype based on device: bf16 for CUDA/XPU, fp16 for MPS, fp32 for CPU
-            # MPS fp16 is generally faster and more stable than bf16 on Apple Silicon.
+            # Set dtype based on device: bf16 for CUDA/XPU, fp32 for MPS/CPU
+            # MPS does not support bfloat16 natively, and converting bfloat16-trained
+            # weights to float16 causes NaN/Inf due to the narrower exponent range.
+            # Use float32 on MPS for numerical stability.
             if device in ["cuda", "xpu"]:
                 self.dtype = torch.bfloat16
-            elif device == "mps":
-                self.dtype = torch.float16
             else:
                 self.dtype = torch.float32
             self.quantization = quantization
@@ -569,6 +587,10 @@ class AceStepHandler:
                 logger.info(f"[initialize_service] {msg}")
 
             # Check and download the requested DiT model
+            if config_path == "":
+                logger.warning(
+                    "[initialize_service] Empty config_path; pass None to use the default model."
+                )
             if not check_model_exists(config_path, checkpoint_path):
                 logger.info(f"[initialize_service] DiT model '{config_path}' not found, starting auto-download...")
                 success, msg = ensure_dit_model(config_path, checkpoint_path, prefer_source=prefer_source)
@@ -926,74 +948,105 @@ class AceStepHandler:
             target_type = "cpu" if str(target_device) == "cpu" else "cuda"
         return tensor.device.type == target_type
 
+    def _is_quantized_tensor(self, t):
+        """True if t is a torchao AffineQuantizedTensor (calling .to() on it can raise NotImplementedError)."""
+        if t is None:
+            return False
+        try:
+            from torchao.quantization.affine_quantized import AffineQuantizedTensor
+            return isinstance(t, AffineQuantizedTensor)
+        except ImportError:
+            return False
+
+    def _has_quantized_params(self, module):
+        """True if module (or any submodule) has at least one AffineQuantizedTensor parameter."""
+        try:
+            from torchao.quantization.affine_quantized import AffineQuantizedTensor
+        except ImportError:
+            return False
+        for _, param in module.named_parameters():
+            if param is not None and isinstance(param, AffineQuantizedTensor):
+                return True
+        return False
+
     def _ensure_silence_latent_on_device(self):
         """Ensure silence_latent is on the correct device (self.device)."""
         if hasattr(self, "silence_latent") and self.silence_latent is not None:
             if not self._is_on_target_device(self.silence_latent, self.device):
                 self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
-
-    def _move_module_recursive(self, module, target_device, dtype=None, visited=None):
+    
+    def _move_module_recursive(self, module, target_device, dtype=None, visited=None, skip_quantized=False):
         """
         Recursively move a module and all its submodules to the target device.
-        This handles modules that may not be properly registered.
+        When skip_quantized=True, avoids calling .to() on the module or on AffineQuantizedTensor
+        parameters (torchao quantized tensors that can raise NotImplementedError on .to(device)).
         """
         if visited is None:
             visited = set()
-
         module_id = id(module)
         if module_id in visited:
             return
         visited.add(module_id)
 
-        # Move the module itself
-        module.to(target_device)
-        if dtype is not None:
-            module.to(dtype)
+        if not skip_quantized:
+            module.to(target_device)
+            if dtype is not None:
+                module.to(dtype)
 
-        # Move all direct parameters
         for param_name, param in module._parameters.items():
-            if param is not None and not self._is_on_target_device(param, target_device):
+            if param is None:
+                continue
+            if self._is_quantized_tensor(param):
+                continue
+            if not self._is_on_target_device(param, target_device):
                 module._parameters[param_name] = param.to(target_device)
                 if dtype is not None:
                     module._parameters[param_name] = module._parameters[param_name].to(dtype)
 
-        # Move all direct buffers
         for buf_name, buf in module._buffers.items():
-            if buf is not None and not self._is_on_target_device(buf, target_device):
+            if buf is None:
+                continue
+            if self._is_quantized_tensor(buf):
+                continue
+            if not self._is_on_target_device(buf, target_device):
                 module._buffers[buf_name] = buf.to(target_device)
 
-        # Recursively process all submodules (registered and unregistered)
         for name, child in module._modules.items():
             if child is not None:
-                self._move_module_recursive(child, target_device, dtype, visited)
+                self._move_module_recursive(child, target_device, dtype, visited, skip_quantized)
 
-        # Also check for any nn.Module attributes that might not be in _modules
         for attr_name in dir(module):
             if attr_name.startswith('_'):
                 continue
             try:
                 attr = getattr(module, attr_name, None)
                 if isinstance(attr, torch.nn.Module) and id(attr) not in visited:
-                    self._move_module_recursive(attr, target_device, dtype, visited)
+                    self._move_module_recursive(attr, target_device, dtype, visited, skip_quantized)
             except Exception:
                 pass
 
     def _recursive_to_device(self, model, device, dtype=None):
         """
         Recursively move all parameters and buffers of a model to the specified device.
-        This is more thorough than model.to() for some custom HuggingFace models.
+        When the model contains torchao AffineQuantizedTensor parameters, avoids calling
+        Module.to(device) (which can raise NotImplementedError via _has_compatible_shallow_copy_type).
         """
         target_device = torch.device(device) if isinstance(device, str) else device
+        skip_quantized = self._has_quantized_params(model)
 
-        # Method 1: Standard .to() call
-        model.to(target_device)
-        if dtype is not None:
-            model.to(dtype)
+        if skip_quantized:
+            logger.warning(
+                "[_recursive_to_device] Model has quantized (AffineQuantizedTensor) parameters; "
+                "skipping Module.to(device) to avoid NotImplementedError. Moving non-quantized parameters only."
+            )
 
-        # Method 2: Use our thorough recursive moving for any missed modules
-        self._move_module_recursive(model, target_device, dtype)
+        if not skip_quantized:
+            model.to(target_device)
+            if dtype is not None:
+                model.to(dtype)
 
-        # Method 3: Force move via state_dict if there are still parameters on wrong device
+        self._move_module_recursive(model, target_device, dtype, skip_quantized=skip_quantized)
+
         wrong_device_params = []
         for name, param in model.named_parameters():
             if not self._is_on_target_device(param, device):
@@ -1001,14 +1054,16 @@ class AceStepHandler:
 
         if wrong_device_params and device != "cpu":
             logger.warning(f"[_recursive_to_device] {len(wrong_device_params)} parameters on wrong device, using state_dict method")
-            # Get current state dict and move all tensors
             state_dict = model.state_dict()
             moved_state_dict = {}
             for key, value in state_dict.items():
                 if isinstance(value, torch.Tensor):
-                    moved_state_dict[key] = value.to(target_device)
-                    if dtype is not None and moved_state_dict[key].is_floating_point():
-                        moved_state_dict[key] = moved_state_dict[key].to(dtype)
+                    if self._is_quantized_tensor(value):
+                        moved_state_dict[key] = value
+                    else:
+                        moved_state_dict[key] = value.to(target_device)
+                        if dtype is not None and moved_state_dict[key].is_floating_point():
+                            moved_state_dict[key] = moved_state_dict[key].to(dtype)
                 else:
                     moved_state_dict[key] = value
             model.load_state_dict(moved_state_dict)

@@ -83,6 +83,8 @@ The Gradio interface consists of several main sections:
 | **Unload** | Remove the currently loaded LoRA |
 | **Use LoRA** | Enable/disable the loaded LoRA for inference |
 
+> **⚠️ Note:** LoRA adapters cannot be loaded on quantized models due to a compatibility issue between PEFT and TorchAO. If you need to use LoRA, set **INT8 Quantization** to **None** before loading the adapter.
+
 ### Initialization
 
 Click **Initialize Service** to load the models. The status box will show progress and confirmation.

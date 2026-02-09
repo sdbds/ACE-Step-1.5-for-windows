@@ -234,6 +234,9 @@ def check_model_exists(model_name: str, checkpoints_dir: Optional[Path] = None) 
     Returns:
         True if the model exists, False otherwise.
     """
+    if not model_name:
+        logger.warning("[check_model_exists] Empty model_name; treating as missing.")
+        return False
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
     
@@ -489,6 +492,8 @@ def ensure_dit_model(
         print("=" * 60 + "\n")
         return download_submodel(model_name, checkpoints_dir, token=token, prefer_source=prefer_source)
 
+    if not model_name:
+        return False, "Unknown DiT model: '' (pass None for default or choose a valid model)"
     return False, f"Unknown DiT model: {model_name}"
 
 

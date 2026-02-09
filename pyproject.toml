@@ -21,7 +21,7 @@ dependencies = [
     # Common dependencies
     "transformers>=4.51.0,<4.58.0",
     "diffusers",
-    "gradio>=6.5.1",
+    "gradio==6.2.0",
     "matplotlib>=3.7.5",
     "scipy>=1.10.1",
     "soundfile>=0.13.1",
@@ -40,12 +40,12 @@ dependencies = [
     "mlx>=0.25.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # Training dependencies
-    "peft>=0.7.0",
+    "peft>=0.18.0",
     "lightning>=2.0.0",
     "tensorboard>=2.0.0",
     # Local third-party packages
-    # nano-vllm is a local package - install separately: pip install -e acestep/third_parts/nano-vllm
-    # For uv users: automatically handled via [tool.uv.sources]
+    # nano-vllm source is configured in [tool.uv.sources]
+    "nano-vllm; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "modelscope",
     "tensorboard>=2.20.0",
     "mutagen",

@@ -397,24 +397,31 @@ def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tupl
         Tuple of (gpu_memory_utilization_ratio, target_memory_gb)
     """
     model_size = get_lm_model_size(model_path)
-
-    # Target memory allocation for each model size
-    target_memory = {
+    
+    # Model weight memory (approximate) for each model size
+    model_weight_memory = {
         "0.6B": 3.0,
         "1.7B": 8.0,
         "4B": 12.0,
     }
-
-    target_gb = target_memory.get(model_size, 3.0)
-
+    
+    target_gb = model_weight_memory.get(model_size, 3.0)
+    
+    # gpu_memory_utilization in nano-vllm caps the TOTAL GPU memory usage
+    # (model weights + KV cache + overhead). If we set it to just the model
+    # weight size, there is almost no room left for KV cache and inference
+    # fails with "Insufficient KV cache" errors.
+    # We therefore add generous headroom so the KV cache can hold at least
+    # max_model_len (4096) tokens comfortably.
+    total_target_gb = target_gb * 1.5  # 50% headroom for KV cache + overhead
+    
     # For large GPUs (>=24GB), don't restrict memory too much
     if total_gpu_memory_gb >= 24:
-        # Use a reasonable ratio that allows the model to run efficiently
-        ratio = min(0.9, max(0.2, target_gb / total_gpu_memory_gb))
+        ratio = min(0.9, max(0.2, total_target_gb / total_gpu_memory_gb))
     else:
         # For smaller GPUs, strictly limit memory usage
-        ratio = min(0.9, max(0.1, target_gb / total_gpu_memory_gb))
-
+        ratio = min(0.9, max(0.1, total_target_gb / total_gpu_memory_gb))
+    
     return ratio, target_gb
 
 

@@ -353,33 +353,6 @@ def generate_music(
         # Note: This logic can be refined based on specific requirements
         need_audio_codes = not user_provided_audio_codes
 
-        # Determine if we should use chunk-based LM generation (always use chunks for consistency)
-        # Determine actual batch size for chunk processing
-        actual_batch_size = config.batch_size if config.batch_size is not None else 1
-
-        # Prepare seeds for batch generation
-        # Use config.seed if provided, otherwise fallback to params.seed
-        # Convert config.seed (None, int, or List[int]) to format that prepare_seeds accepts
-        seed_for_generation = ""
-        # Original code (commented out because it crashes on int seeds):
-        # if config.seeds is not None and len(config.seeds) > 0:
-        #     if isinstance(config.seeds, list):
-        #         # Convert List[int] to comma-separated string
-        #         seed_for_generation = ",".join(str(s) for s in config.seeds)
-
-        if config.seeds is not None:
-            if isinstance(config.seeds, list) and len(config.seeds) > 0:
-                # Convert List[int] to comma-separated string
-                seed_for_generation = ",".join(str(s) for s in config.seeds)
-            elif isinstance(config.seeds, int):
-                # Fix: Explicitly handle single integer seeds by converting to string.
-                # Previously, this would crash because 'len()' was called on an int.
-                seed_for_generation = str(config.seeds)
-
-        # Use dit_handler.prepare_seeds to handle seed list generation and padding
-        # This will handle all the logic: padding with random seeds if needed, etc.
-        actual_seed_list, _ = dit_handler.prepare_seeds(actual_batch_size, seed_for_generation, config.use_random_seed)
-
         # LM-based Chain-of-Thought reasoning
         # Skip LM for cover/repaint tasks - these tasks use reference/src audio directly
         # and don't need LM to generate audio codes
@@ -459,6 +432,9 @@ def generate_music(
             return None
 
         # Clamp duration and batch size to GPU limits (applies to non-Gradio callers too)
+        # IMPORTANT: This must happen BEFORE actual_batch_size is set, so that LM and DiT
+        # use the same batch size. Previously the MPS clamp happened after LM generation,
+        # causing LM to generate N samples but DiT to only process 1.
         try:
             # If duration not provided, try to infer from source audio to enable safe clamping.
             if (audio_duration is None or float(audio_duration) <= 0) and (params.src_audio or params.reference_audio):
@@ -484,7 +460,11 @@ def generate_music(
                 logger.warning(f"[generate_music] Batch size {config.batch_size} exceeds GPU limit {max_batch}. Clamping.")
                 config.batch_size = max_batch
 
-            # Extra safety for MPS: large durations can OOM with batch > 1
+            # MPS memory-aware batch size adjustment for long durations.
+            # Mac unified memory is typically large (16-192GB), so we use a
+            # memory-based heuristic instead of a hard-coded batch=1 cutoff.
+            # Rough estimate: each batch item at 232s ≈ 2-3GB on MPS.
+            # We keep batch size as-is if GPU memory can handle it.
             if (
                 hasattr(dit_handler, "device")
                 and dit_handler.device == "mps"
@@ -493,10 +473,58 @@ def generate_music(
                 and config.batch_size is not None
                 and config.batch_size > 1
             ):
-                logger.warning("[generate_music] MPS with long duration detected; reducing batch size to 1 to avoid OOM.")
-                config.batch_size = 1
+                mem_gb = gpu_config.gpu_memory_gb
+                dur = float(audio_duration)
+                # Estimate memory per batch item (GB): ~0.01 GB per second of audio
+                # at batch=1, plus overhead. Conservative multiplier.
+                estimated_per_item_gb = dur * 0.015 + 2.0  # base 2GB + duration-proportional
+                estimated_total_gb = estimated_per_item_gb * config.batch_size
+                # Allow up to 80% of available memory for generation
+                available_gb = mem_gb * 0.8
+                if estimated_total_gb > available_gb:
+                    safe_batch = max(1, int(available_gb / estimated_per_item_gb))
+                    logger.warning(
+                        f"[generate_music] MPS long duration ({dur:.0f}s): estimated {estimated_total_gb:.1f}GB "
+                        f"for batch={config.batch_size} exceeds {available_gb:.1f}GB available. "
+                        f"Reducing batch size to {safe_batch}."
+                    )
+                    config.batch_size = safe_batch
+                else:
+                    logger.info(
+                        f"[generate_music] MPS long duration ({dur:.0f}s): estimated {estimated_total_gb:.1f}GB "
+                        f"for batch={config.batch_size}, {available_gb:.1f}GB available. Batch size OK."
+                    )
         except Exception as e:
             logger.warning(f"[generate_music] Failed to clamp duration/batch to GPU limits: {e}")
+
+        # Determine actual batch size for chunk processing
+        # This MUST be set AFTER the GPU limit clamping above to ensure LM and DiT
+        # use the same batch size.
+        actual_batch_size = config.batch_size if config.batch_size is not None else 1
+
+        # Prepare seeds for batch generation
+        # Use config.seed if provided, otherwise fallback to params.seed
+        # Convert config.seed (None, int, or List[int]) to format that prepare_seeds accepts
+        seed_for_generation = ""
+
+        if config.seeds is not None:
+            if isinstance(config.seeds, list) and len(config.seeds) > 0:
+                seed_for_generation = ",".join(str(s) for s in config.seeds)
+            elif isinstance(config.seeds, int):
+                seed_for_generation = str(config.seeds)
+        elif not config.use_random_seed and params.seed is not None:
+            try:
+                s = params.seed
+                if isinstance(s, (int, float)) and s >= 0:
+                    seed_for_generation = str(int(s))
+                elif isinstance(s, str) and s.strip() and s.strip() != "-1":
+                    seed_for_generation = s.strip()
+            except (TypeError, ValueError):
+                pass
+
+        # Use dit_handler.prepare_seeds to handle seed list generation and padding
+        # This will handle all the logic: padding with random seeds if needed, etc.
+        actual_seed_list, _ = dit_handler.prepare_seeds(actual_batch_size, seed_for_generation, config.use_random_seed)
 
         if use_lm:
             # Convert sampling parameters - handle None values safely

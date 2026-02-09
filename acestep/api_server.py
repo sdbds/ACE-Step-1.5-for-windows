@@ -1094,6 +1094,25 @@ class RequestParser:
         return _to_bool(self.get(name), default)
 
 
+def _validate_audio_path(path: Optional[str]) -> Optional[str]:
+    """Validate a user-supplied audio file path to prevent path traversal attacks.
+
+    Rejects absolute paths and paths containing '..' traversal sequences.
+    Returns the validated path or None if the input is None/empty.
+    Raises HTTPException 400 if the path is unsafe.
+    """
+    if not path:
+        return None
+    # Reject absolute paths (Unix and Windows)
+    if os.path.isabs(path):
+        raise HTTPException(status_code=400, detail="absolute audio file paths are not allowed")
+    # Reject path traversal via '..' components
+    normalized = os.path.normpath(path)
+    if ".." in normalized.split(os.sep):
+        raise HTTPException(status_code=400, detail="path traversal in audio file paths is not allowed")
+    return path
+
+
 async def _save_upload_to_temp(upload: StarletteUploadFile, *, prefix: str) -> str:
     suffix = Path(upload.filename or "").suffix
     fd, path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=suffix)
@@ -2374,6 +2393,10 @@ def create_app() -> FastAPI:
 
         def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
             """Build GenerateMusicRequest from parsed parameters."""
+            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
+            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
+            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
+            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
             return GenerateMusicRequest(
                 prompt=p.str("prompt"),
                 lyrics=p.str("lyrics"),
@@ -2398,8 +2421,8 @@ def create_app() -> FastAPI:
                 repainting_end=p.float("repainting_end"),
                 instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
                 audio_cover_strength=p.float("audio_cover_strength", 1.0),
-                reference_audio_path=p.str("reference_audio_path") or None,
-                src_audio_path=p.str("src_audio_path") or None,
+                reference_audio_path=_validate_audio_path(ref_audio),
+                src_audio_path=_validate_audio_path(src_audio),
                 task_type=p.str("task_type", "text2music"),
                 use_adg=p.bool("use_adg"),
                 cfg_interval_start=p.float("cfg_interval_start", 0.0),
@@ -2455,13 +2478,13 @@ def create_app() -> FastAPI:
                 reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
                 temp_files.append(reference_audio_path)
             else:
-                reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
 
             if isinstance(ctx_up, StarletteUploadFile):
                 src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
                 temp_files.append(src_audio_path)
             else:
-                src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
 
             req = _build_request(
                 RequestParser(dict(form)),
@@ -2473,8 +2496,8 @@ def create_app() -> FastAPI:
             form = await request.form()
             form_dict = dict(form)
             verify_token_from_request(form_dict, authorization)
-            reference_audio_path = str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None
-            src_audio_path = str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None
+            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
+            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
             req = _build_request(
                 RequestParser(form_dict),
                 reference_audio_path=reference_audio_path,
@@ -2505,8 +2528,8 @@ def create_app() -> FastAPI:
                 parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
                 flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
                 verify_token_from_request(flat, authorization)
-                reference_audio_path = str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None
-                src_audio_path = str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None
+                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
+                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
                 req = _build_request(
                     RequestParser(flat),
                     reference_audio_path=reference_audio_path,
