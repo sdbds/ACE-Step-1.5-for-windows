@@ -484,7 +484,8 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
                 generation_section["key_scale"],
                 generation_section["vocal_language"],
                 generation_section["time_signature"],
-                results_section["is_format_caption_state"]
+                results_section["is_format_caption_state"],
+                generation_section["audio_uploads_accordion"]
             ]
         )
     

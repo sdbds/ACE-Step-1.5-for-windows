@@ -1,99 +1,154 @@
 #!/usr/bin/env python3
 """
-Enhanced profiling script for ACE-Step inference with deep LLM analysis
+ACE-Step 1.5 Inference Profiler & Benchmark
 
-This script helps diagnose why LLM generation is slow by tracking:
-1. Total tokens generated vs expected throughput (200 tokens/sec baseline)
-2. Per-iteration timing to detect compilation overhead or slow operations
-3. Constrained decoding overhead
-4. CFG overhead (2x forward passes)
-5. Model forward time vs sampling/processing time
+Comprehensive profiling tool that supports all features, devices, and backends.
+Uses the high-level inference API and built-in time_costs for accurate timing.
+
+Modes:
+    profile         - Profile a single generation run with detailed timing breakdown
+    benchmark       - Run a matrix of configurations and produce a summary table
+    understand      - Profile the understand_music() API (audio codes -> metadata)
+    create_sample   - Profile the create_sample() API (inspiration/simple mode)
+    format_sample   - Profile the format_sample() API (caption+lyrics -> metadata)
 
 Usage:
-    python profile_inference.py                    # Standard profiling with warmup
-    python profile_inference.py --no-warmup        # Profile first run (includes compilation)
-    python profile_inference.py --llm-debug        # Deep LLM performance debugging
-    python profile_inference.py --detailed         # Add cProfile function-level analysis
-    
-    Inference mode options:
-    python profile_inference.py --thinking                        # Enable CoT for code generation
-    python profile_inference.py --use-constrained-decoding        # Use FSM constrained decoding
-    python profile_inference.py --use-cot-metas                  # Enable LM to generate metadata via CoT
+    # Profile text2music with default settings
+    python profile_inference.py
+
+    # Profile with thinking enabled on MPS
+    python profile_inference.py --device mps --thinking
+
+    # Benchmark across configurations
+    python profile_inference.py --mode benchmark
+
+    # Profile create_sample (inspiration mode)
+    python profile_inference.py --mode create_sample --sample-query "a soft Bengali love song"
+
+    # Profile understand mode
+    python profile_inference.py --mode understand
+
+    # Full profiling with cProfile
+    python profile_inference.py --detailed --llm-debug
 """
 
 import time
 import argparse
 import sys
 import os
+import json
+import tempfile
 from contextlib import contextmanager
 from collections import defaultdict
-import json
-from typing import Tuple, Dict, Any, List
-from functools import wraps
+from typing import Tuple, Dict, Any, List, Optional
 
 # Add project root to path
-project_root = os.path.abspath(os.path.dirname(__file__))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import torch
+
+from acestep.inference import (
+    generate_music,
+    understand_music,
+    create_sample,
+    format_sample,
+    GenerationParams,
+    GenerationConfig,
+    GenerationResult,
+)
+from acestep.handler import AceStepHandler
+from acestep.llm_inference import LLMHandler
+from acestep.gpu_config import get_gpu_config, set_global_gpu_config
 
 
-def load_env_config():
-    """从 .env 文件加载配置"""
+# =============================================================================
+# Device / Backend helpers
+# =============================================================================
+
+
+def resolve_device(device: str) -> str:
+    """Resolve 'auto' device to the best available device."""
+    if device == "auto":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    return device
+
+
+def auto_detect_backend(device: str) -> str:
+    """Auto-detect the best LLM backend for the resolved device."""
+    if device == "mps":
+        try:
+            import mlx.core  # noqa: F401
+            return "mlx"
+        except ImportError:
+            return "pt"
+    if device.startswith("cuda"):
+        return "vllm"
+    return "pt"
+
+
+def load_env_config() -> Dict[str, str]:
+    """Load configuration defaults from .env file."""
     env_config = {
-        'ACESTEP_CONFIG_PATH': 'acestep-v15-turbo',
-        'ACESTEP_LM_MODEL_PATH': 'acestep-5Hz-lm-0.6B',
-        'ACESTEP_DEVICE': 'auto',
-        'ACESTEP_LM_BACKEND': 'vllm',
+        "ACESTEP_CONFIG_PATH": "acestep-v15-turbo",
+        "ACESTEP_LM_MODEL_PATH": "acestep-5Hz-lm-0.6B",
+        "ACESTEP_DEVICE": "auto",
+        "ACESTEP_LM_BACKEND": "auto",
     }
-    
-    env_file = os.path.join(project_root, '.env')
+    env_file = os.path.join(PROJECT_ROOT, ".env")
     if os.path.exists(env_file):
-        with open(env_file, 'r', encoding='utf-8') as f:
+        with open(env_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                # 跳过空行和注释
-                if not line or line.startswith('#'):
+                if not line or line.startswith("#"):
                     continue
-                # 解析键值对
-                if '=' in line:
-                    key, value = line.split('=', 1)
+                if "=" in line:
+                    key, value = line.split("=", 1)
                     key = key.strip()
                     value = value.strip()
                     if key in env_config and value:
                         env_config[key] = value
-    
     return env_config
 
-import torch
-from acestep.inference import generate_music, GenerationParams, GenerationConfig
-from acestep.handler import AceStepHandler
-from acestep.llm_inference import LLMHandler
+
+# =============================================================================
+# Timer utilities
+# =============================================================================
 
 
 class PreciseTimer:
-    """High-precision timer with CUDA synchronization for accurate GPU timing"""
+    """High-precision timer with GPU synchronization for accurate timing."""
     
-    def __init__(self, device="cuda"):
+    def __init__(self, device: str = "cpu"):
         self.device = device
-        self.timings = defaultdict(list)
+        self.timings: Dict[str, List[float]] = defaultdict(list)
         self.enabled = True
         
     def sync(self):
-        """Synchronize GPU operations for accurate timing"""
+        """Synchronize GPU operations for accurate timing."""
         if not self.enabled:
             return
         if self.device.startswith("cuda") and torch.cuda.is_available():
             torch.cuda.synchronize()
         elif self.device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            if hasattr(torch, "mps"):
             torch.mps.synchronize()
+        elif self.device.startswith("xpu") and hasattr(torch, "xpu"):
+            torch.xpu.synchronize()
     
     @contextmanager
     def time(self, name: str):
-        """Time a code section with CUDA synchronization"""
+        """Time a code section with GPU synchronization."""
         if not self.enabled:
             yield
             return
-            
         self.sync()
         start = time.perf_counter()
         try:
@@ -104,562 +159,289 @@ class PreciseTimer:
             self.timings[name].append(elapsed)
     
     def get_total(self, name: str) -> float:
-        """Get total accumulated time for a section"""
         return sum(self.timings.get(name, []))
     
     def get_mean(self, name: str) -> float:
-        """Get mean time per call for a section"""
         times = self.timings.get(name, [])
         return sum(times) / len(times) if times else 0.0
     
     def get_count(self, name: str) -> int:
-        """Get number of calls for a section"""
         return len(self.timings.get(name, []))
     
-    def get_all(self, name: str) -> List[float]:
-        """Get all timing samples for a section"""
-        return self.timings.get(name, [])
-
-
-class LLMDebugger:
-    """Track detailed LLM performance metrics to diagnose slow generation"""
-    
-    def __init__(self):
-        self.reset()
-    
     def reset(self):
-        """Reset all metrics"""
-        self.total_tokens = 0
-        self.generation_start = None
-        self.generation_end = None
-        self.output_text = ""
-        self.prompt_length = 0
-        
-    def start(self, prompt_length: int = 0):
-        """Mark generation start"""
-        self.generation_start = time.perf_counter()
-        self.prompt_length = prompt_length
-        
-    def end(self, output_text: str = ""):
-        """Mark generation end and store output"""
-        self.generation_end = time.perf_counter()
-        self.output_text = output_text
-        
-    def set_token_count(self, count: int):
-        """Set total token count"""
-        self.total_tokens = count
-        
-    def get_throughput(self) -> float:
-        """Calculate actual tokens per second"""
-        if self.generation_start and self.generation_end and self.total_tokens > 0:
-            total_time = self.generation_end - self.generation_start
-            if total_time > 0:
-                return self.total_tokens / total_time
-        return 0.0
-    
-    def print_analysis(self):
-        """Print detailed LLM performance analysis"""
-        if not self.generation_start or not self.generation_end:
-            return
-            
-        print("\n" + "=" * 100)
-        print("🔍 LLM PERFORMANCE DEEP DIVE")
-        print("=" * 100)
-        
-        total_time = self.generation_end - self.generation_start
-        throughput = self.get_throughput()
-        
-        # Basic metrics table
-        print(f"\n{'Metric':<40} {'Value':<20} {'Notes'}")
-        print("-" * 100)
-        print(f"{'Total Tokens Generated:':<40} {self.total_tokens:<20} (new tokens only)")
-        print(f"{'Prompt Length (estimate):':<40} {self.prompt_length:<20} (input tokens)")
-        print(f"{'Total Generation Time:':<40} {total_time:<20.3f} seconds")
-        print(f"{'Measured Throughput:':<40} {throughput:<20.1f} tokens/sec")
-        print(f"{'Expected Throughput:':<40} {'200':<20} tokens/sec (baseline)")
-        
-        # Calculate performance gap
-        if throughput > 0:
-            slowdown = 200.0 / throughput
-            efficiency = (throughput / 200.0) * 100
-            print(f"{'Performance vs Baseline:':<40} {efficiency:<20.1f}% of expected")
-            print(f"{'Slowdown Factor:':<40} {slowdown:<20.2f}x slower")
-        
-        # Analyze generated output
-        if self.output_text:
-            print(f"\n{'Output Analysis:':<40}")
-            print(f"{'  Output length:':<40} {len(self.output_text):<20} characters")
-            
-            # Count audio codes
-            import re
-            code_pattern = r'<\|audio_code_\d+\|>'
-            codes = re.findall(code_pattern, self.output_text)
-            if codes:
-                print(f"{'  Audio codes generated:':<40} {len(codes):<20} codes")
-                print(f"{'  Expected audio duration:':<40} {f'~{len(codes)/5:.1f}s':<20} (5 codes per second)")
-                if total_time > 0:
-                    print(f"{'  Time per audio code:':<40} {f'{total_time/len(codes)*1000:.1f}ms':<20}")
-            
-            # Check for CoT section
-            if '<think>' in self.output_text and '</think>' in self.output_text:
-                cot_start = self.output_text.find('<think>')
-                cot_end = self.output_text.find('</think>') + 8
-                cot_section = self.output_text[cot_start:cot_end]
-                cot_token_est = len(cot_section) // 4
-                print(f"{'  CoT section tokens (estimate):':<40} {f'~{cot_token_est}':<20}")
-        
-        # Diagnostic guidance
-        print("\n" + "=" * 100)
-        print("🔧 DIAGNOSTIC GUIDANCE")
-        print("=" * 100)
-        
-        if throughput < 50:
-            print("\n⚠️  CRITICAL: Throughput is extremely low (<50 tokens/sec)")
-            print("\nThis is ~4x slower than expected. Likely causes:")
-            print("  1. ❗ Constrained decoding FSM overhead")
-            print("     → Each token triggers FSM state machine validation")
-            print("     → Try: set use_constrained_decoding=False in config")
-            print("  2. ❗ CFG with double forward passes")
-            print("     → cfg_scale > 1.0 means running model twice per token")
-            print("     → Check: params.lm_cfg_scale value")
-            print("  3. ❗ Running in eager mode without compilation")
-            print("     → PyTorch should compile kernels after warmup")
-            print("     → Check: torch._dynamo.config settings")
-            
-        elif throughput < 100:
-            print("\n⚠️  WARNING: Throughput is low (50-100 tokens/sec)")
-            print("\nLikely causes:")
-            print("  1. Constrained decoding overhead (~30-50% slowdown expected)")
-            print("  2. CFG enabled (2x compute per token if cfg_scale > 1.0)")
-            print("  3. Small model or inefficient GPU utilization")
-            
-        elif throughput < 150:
-            print("\n⚠️  Throughput is below baseline but acceptable (100-150 tokens/sec)")
-            print("\nMinor overhead from:")
-            print("  - Constrained decoding: ~20-30% overhead")
-            print("  - Profiling instrumentation: ~5-10% overhead")
-            
-        else:
-            print(f"\n✓ Throughput is good ({throughput:.1f} tokens/sec)")
-            print("  Performance is within acceptable range")
+        self.timings.clear()
 
 
-# Global instances
-timer = None
-llm_debugger = None
+# =============================================================================
+# Example config loader
+# =============================================================================
 
 
-def wrap_method_with_timing(obj, method_name: str, timing_key: str):
-    """Wrap a method with timing instrumentation"""
-    original_method = getattr(obj, method_name)
-    
-    @wraps(original_method)
-    def timed_wrapper(*args, **kwargs):
-        with timer.time(timing_key):
-            return original_method(*args, **kwargs)
-    
-    setattr(obj, method_name, timed_wrapper)
-    return original_method
-
-
-def wrap_llm_with_debug_tracking(llm_handler):
-    """Wrap LLM generation with detailed performance tracking"""
-    original_method = llm_handler.generate_with_stop_condition
-    
-    @wraps(original_method)
-    def debug_wrapper(*args, **kwargs):
-        # Estimate prompt length
-        caption = kwargs.get('caption', args[0] if len(args) > 0 else "")
-        lyrics = kwargs.get('lyrics', args[1] if len(args) > 1 else "")
-        prompt_estimate = len(caption) + len(lyrics)
-        prompt_tokens_estimate = prompt_estimate // 4
-        
-        # Start tracking
-        llm_debugger.reset()
-        llm_debugger.start(prompt_length=prompt_tokens_estimate)
-        
-        # Call original with timing
-        with timer.time('llm_inference'):
-            result = original_method(*args, **kwargs)
-        
-        # Extract and analyze output
-        output_text = ""
-        if isinstance(result, tuple) and len(result) >= 2:
-            if isinstance(result[1], list):
-                # Batch mode
-                output_text = "".join(result[1])
-            else:
-                # Single mode
-                cot_output = ""
-                if isinstance(result[0], dict):
-                    for v in result[0].values():
-                        if isinstance(v, str):
-                            cot_output += v
-                output_text = cot_output + str(result[1])
-        
-        # Count tokens
-        import re
-        code_pattern = r'<\|audio_code_\d+\|>'
-        codes = re.findall(code_pattern, output_text)
-        remaining_text = re.sub(code_pattern, '', output_text)
-        cot_tokens_estimate = len(remaining_text) // 4
-        total_tokens = len(codes) + cot_tokens_estimate
-        
-        llm_debugger.set_token_count(total_tokens)
-        llm_debugger.end(output_text)
-        
-        return result
-    
-    llm_handler.generate_with_stop_condition = debug_wrapper
-    return original_method
-
-
-def instrument_handlers(dit_handler, llm_handler, enable_llm_debug=False):
-    """Add timing instrumentation to handler methods"""
-    originals = {}
-    
-    # Instrument LLM
-    if llm_handler and llm_handler.llm_initialized:
-        if enable_llm_debug:
-            originals['llm_generate'] = wrap_llm_with_debug_tracking(llm_handler)
-        else:
-            originals['llm_generate'] = wrap_method_with_timing(
-                llm_handler, 'generate_with_stop_condition', 'llm_inference'
-            )
-    
-    # Instrument DiT handler
-    originals['dit_prepare'] = wrap_method_with_timing(
-        dit_handler, 'prepare_batch_data', 'prepare_batch_data'
-    )
-    originals['dit_generate'] = wrap_method_with_timing(
-        dit_handler, 'service_generate', 'dit_inference'
-    )
-    originals['dit_decode'] = wrap_method_with_timing(
-        dit_handler, 'tiled_decode', 'vae_decode'
-    )
-    
-    return originals
-
-
-def restore_handlers(dit_handler, llm_handler, originals):
-    """Restore original handler methods after profiling"""
-    if llm_handler and 'llm_generate' in originals:
-        llm_handler.generate_with_stop_condition = originals['llm_generate']
-    
-    dit_handler.prepare_batch_data = originals['dit_prepare']
-    dit_handler.service_generate = originals['dit_generate']
-    dit_handler.tiled_decode = originals['dit_decode']
-
-
-def print_profiling_results(total_time: float, show_llm_debug: bool = False):
-    """Print comprehensive profiling results with performance insights"""
-    print("\n" + "=" * 100)
-    print("🎯 PROFILING RESULTS")
-    print("=" * 100)
-    
-    # Define timing categories
-    model_sections = {
-        'llm_inference': 'LLM Inference (5Hz Language Model)',
-        'dit_inference': 'DiT Inference (Diffusion Transformer)',
-        'vae_decode': 'VAE Decode (Audio Decoder)',
-    }
-    
-    non_model_sections = {
-        'prepare_batch_data': 'Prepare Batch Data (embedding, formatting)',
-    }
-    
-    # Calculate totals
-    model_time = sum(timer.get_total(k) for k in model_sections.keys())
-    non_model_time = sum(timer.get_total(k) for k in non_model_sections.keys())
-    other_time = total_time - model_time - non_model_time
-    
-    # Print summary table
-    print(f"\n{'CATEGORY':<50} {'TIME (s)':<12} {'%':<8} {'CALLS':<8}")
-    print("-" * 100)
-    
-    # Model time breakdown
-    print(f"\n{'🤖 MODEL TIME (Total)':<50} {model_time:<12.3f} {100*model_time/total_time:>6.1f}% {'':<8}")
-    for key, desc in model_sections.items():
-        t = timer.get_total(key)
-        c = timer.get_count(key)
-        if c > 0:
-            mean = timer.get_mean(key)
-            pct = 100 * t / total_time
-            print(f"  {'├─ ' + desc:<48} {t:<12.3f} {pct:>6.1f}% {c:<8} (avg: {mean:.3f}s)")
-    
-    # Non-model time breakdown
-    print(f"\n{'⚙️  NON-MODEL TIME (Total)':<50} {non_model_time:<12.3f} {100*non_model_time/total_time:>6.1f}% {'':<8}")
-    for key, desc in non_model_sections.items():
-        t = timer.get_total(key)
-        c = timer.get_count(key)
-        if c > 0:
-            mean = timer.get_mean(key)
-            pct = 100 * t / total_time
-            print(f"  {'├─ ' + desc:<48} {t:<12.3f} {pct:>6.1f}% {c:<8} (avg: {mean:.3f}s)")
-    
-    # Other time
-    if other_time > 0.01:
-        pct = 100 * other_time / total_time
-        print(f"\n{'📦 OTHER TIME (I/O, overhead, audio save)':<50} {other_time:<12.3f} {pct:>6.1f}% {'':<8}")
-    
-    print(f"\n{'📊 TOTAL TIME':<50} {total_time:<12.3f} {'100.0%':>6} {'':<8}")
-    
-    # Show LLM detailed analysis if enabled
-    if show_llm_debug:
-        llm_debugger.print_analysis()
-    
-    # Performance insights
-    print("\n" + "=" * 100)
-    print("💡 PERFORMANCE INSIGHTS")
-    print("=" * 100)
-    
-    llm_t = timer.get_total('llm_inference')
-    dit_t = timer.get_total('dit_inference')
-    vae_t = timer.get_total('vae_decode')
-    prep_t = timer.get_total('prepare_batch_data')
-    
-    # Model time insights
-    if model_time > 0:
-        print(f"\n✓ Model operations: {model_time:.3f}s ({100*model_time/total_time:.1f}% of total)")
-        
-        if llm_t > 0:
-            print(f"  - LLM: {llm_t:.3f}s ({100*llm_t/model_time:.1f}% of model time)")
-        if dit_t > 0:
-            print(f"  - DiT: {dit_t:.3f}s ({100*dit_t/model_time:.1f}% of model time)")
-        if vae_t > 0:
-            print(f"  - VAE: {vae_t:.3f}s ({100*vae_t/model_time:.1f}% of model time)")
-    
-    # LLM bottleneck analysis
-    if llm_t > dit_t and llm_t > 5.0:
-        print(f"\n⚠️  LLM IS THE BOTTLENECK: {llm_t:.3f}s ({100*llm_t/total_time:.1f}% of total)")
-        print(f"\n   Possible causes:")
-        print(f"   1. Generating too many tokens → use --llm-debug to verify")
-        print(f"   2. Constrained decoding overhead → FSM validation per token")
-        print(f"   3. CFG overhead → cfg_scale > 1.0 = 2x forward passes")
-        print(f"   4. First-token latency → warmup should help")
-        print(f"   5. KV cache inefficiency → should be ~5-10ms/token")
-    
-    # Non-model insights
-    if non_model_time / total_time > 0.1:
-        print(f"\n⚠️  Non-model operations: {non_model_time:.3f}s ({100*non_model_time/total_time:.1f}%)")
-        if prep_t > 0.1:
-            print(f"   - Batch preparation: {prep_t:.3f}s")
-    
-    # I/O overhead
-    if other_time / total_time > 0.2:
-        print(f"\n⚠️  Overhead/I/O: {other_time:.3f}s ({100*other_time/total_time:.1f}%)")
-    
-    # Recommendations
-    print("\n" + "=" * 100)
-    print("🚀 OPTIMIZATION RECOMMENDATIONS")
-    print("=" * 100)
-    
-    if llm_t > dit_t * 2:
-        print("\n🎯 Priority: Optimize LLM")
-        print("  1. Run: python profile_inference.py --llm-debug")
-        print("     → Shows exact token count and throughput")
-        print("  2. Check constrained decoding overhead")
-        print("  3. Check CFG scaling (lm_cfg_scale parameter)")
-        print("  4. Profile nanovllm engine step() timing")
-        print("  5. Compare vllm vs transformers backends")
-
-
-def run_profiled_generation(dit_handler, llm_handler, params, config,
-                           enable_cprofile=False, enable_llm_debug=False):
-    """Execute generation with full profiling instrumentation"""
-    # Instrument handlers
-    originals = instrument_handlers(dit_handler, llm_handler, enable_llm_debug)
-    
+def load_example_config(
+    example_file: str, cli_overrides: argparse.Namespace
+) -> Tuple[Optional[GenerationParams], Optional[GenerationConfig]]:
+    """Load configuration from example JSON file, applying CLI overrides."""
     try:
-        print("\n[Profiling] Starting generation...")
-        timer.sync()
-        total_start = time.perf_counter()
-        
-        # Optional cProfile
-        prof = None
-        if enable_cprofile:
-            import cProfile
-            prof = cProfile.Profile()
-            prof.enable()
-        
-        # Run generation
-        result = generate_music(dit_handler, llm_handler, params, config, save_dir="./")
-        
-        # Stop timing
-        timer.sync()
-        total_time = time.perf_counter() - total_start
-        
-        # Save cProfile if enabled
-        if enable_cprofile and prof:
-            prof.disable()
-            
-            import pstats
-            import io
-            
-            output_file = "profile_cprofile_detailed.txt"
-            with open(output_file, 'w') as f:
-                ps = pstats.Stats(prof, stream=f)
-                ps.sort_stats('cumulative')
-                ps.print_stats(100)
-            
-            # Print top functions
-            print("\n" + "=" * 100)
-            print("📊 TOP 20 FUNCTIONS BY CUMULATIVE TIME (cProfile)")
-            print("=" * 100)
-            s = io.StringIO()
-            ps = pstats.Stats(prof, stream=s)
-            ps.sort_stats('cumulative')
-            ps.print_stats(20)
-            print(s.getvalue())
-            
-            print(f"\nFull report: {output_file}")
-        
-        # Print results
-        print_profiling_results(total_time, show_llm_debug=enable_llm_debug)
-        
-        return result, total_time
-        
-    finally:
-        restore_handlers(dit_handler, llm_handler, originals)
-
-
-def load_example_config(example_file: str) -> Tuple[GenerationParams, GenerationConfig]:
-    """Load configuration from example JSON file"""
-    try:
-        with open(example_file, 'r', encoding='utf-8') as f:
+        with open(example_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
+
         params = GenerationParams(
-            caption=data.get('caption', ''),
-            lyrics=data.get('lyrics', ''),
-            bpm=data.get('bpm'),
-            keyscale=data.get('keyscale', ''),
-            timesignature=data.get('timesignature', ''),
-            vocal_language=data.get('language', 'unknown'),
-            duration=data.get('duration'),
-            thinking=data.get('think', False),
-            inference_steps=data.get('inference_steps', 8),
-            seed=data.get('seed', 42),
+            caption=data.get("caption", ""),
+            lyrics=data.get("lyrics", ""),
+            bpm=data.get("bpm"),
+            keyscale=data.get("keyscale", ""),
+            timesignature=data.get("timesignature", ""),
+            vocal_language=data.get("language", "unknown"),
+            duration=(
+                cli_overrides.duration
+                if cli_overrides.duration is not None
+                else data.get("duration", -1.0)
+            ),
+            thinking=cli_overrides.thinking,
+            use_cot_metas=cli_overrides.use_cot_metas,
+            use_cot_caption=cli_overrides.use_cot_caption,
+            use_cot_language=cli_overrides.use_cot_language,
+            use_constrained_decoding=cli_overrides.use_constrained_decoding,
+            inference_steps=(
+                cli_overrides.inference_steps
+                if cli_overrides.inference_steps is not None
+                else data.get("inference_steps", 8)
+            ),
+            seed=(
+                cli_overrides.seed
+                if cli_overrides.seed is not None
+                else data.get("seed", 42)
+            ),
+            task_type=cli_overrides.task_type,
+            lm_temperature=cli_overrides.lm_temperature,
+            lm_cfg_scale=cli_overrides.lm_cfg_scale,
+            guidance_scale=cli_overrides.guidance_scale,
+            reference_audio=cli_overrides.reference_audio,
+            src_audio=cli_overrides.src_audio,
         )
-        
-        config = GenerationConfig(batch_size=data.get('batch_size', 1), seeds=[42])
-        
+
+        config = GenerationConfig(
+            batch_size=(
+                cli_overrides.batch_size
+                if cli_overrides.batch_size is not None
+                else data.get("batch_size", 1)
+            ),
+            seeds=[params.seed] if params.seed >= 0 else None,
+            use_random_seed=(params.seed < 0),
+            audio_format="flac",
+        )
+
         return params, config
-        
+
     except Exception as e:
-        print(f"  ❌ Failed to load: {e}")
+        print(f"  Failed to load example: {e}")
         return None, None
 
 
-def main():
-    global timer, llm_debugger
-    
-    # 从 .env 文件加载默认配置
-    env_config = load_env_config()
-    
-    parser = argparse.ArgumentParser(
-        description="Profile ACE-Step inference with LLM debugging"
-    )
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
-    parser.add_argument("--config-path", type=str, default=env_config['ACESTEP_CONFIG_PATH'],
-                       help=f"模型配置路径 (默认从 .env: {env_config['ACESTEP_CONFIG_PATH']})")
-    parser.add_argument("--device", type=str, default=env_config['ACESTEP_DEVICE'],
-                       help=f"设备 (默认从 .env: {env_config['ACESTEP_DEVICE']})")
-    parser.add_argument("--lm-model", type=str, default=env_config['ACESTEP_LM_MODEL_PATH'],
-                       help=f"LLM 模型路径 (默认从 .env: {env_config['ACESTEP_LM_MODEL_PATH']})")
-    parser.add_argument("--lm-backend", type=str, default=env_config['ACESTEP_LM_BACKEND'],
-                       help=f"LLM 后端 (默认从 .env: {env_config['ACESTEP_LM_BACKEND']})")
-    parser.add_argument("--no-warmup", action="store_true")
-    parser.add_argument("--detailed", action="store_true")
-    parser.add_argument("--llm-debug", action="store_true",
-                       help="Enable deep LLM debugging (token count, throughput)")
-    parser.add_argument("--example", type=str, default="example_05.json")
-    
-    # Inference mode parameters
-    parser.add_argument("--thinking", action="store_true",
-                       help="Enable CoT reasoning for LM to generate audio codes")
-    parser.add_argument("--use-constrained-decoding", action="store_true",
-                       help="Use FSM-based constrained decoding for meta generation")
-    parser.add_argument("--use-cot-metas", action="store_true",
-                       help="Enable LLM to generate music metadata via CoT reasoning")
-    
-    args = parser.parse_args()
-    
-    # Initialize
-    timer = PreciseTimer(device=args.device)
-    llm_debugger = LLMDebugger()
-    
-    print("=" * 100)
-    print("🎵 ACE-Step Inference Profiler (LLM Performance Analysis)")
-    print("=" * 100)
-    print(f"\n模型配置 (从 .env 加载):")
-    print(f"  DiT 模型: {args.config_path}")
-    print(f"  LLM 模型: {args.lm_model}")
-    print(f"\n运行配置:")
-    print(f"  Device: {args.device}")
-    print(f"  LLM Backend: {args.lm_backend}")
-    print(f"  LLM Debug: {'Enabled' if args.llm_debug else 'Disabled'}")
-    print(f"  Warmup: {'Disabled' if args.no_warmup else 'Enabled'}")
-    print(f"\nInference Mode:")
-    print(f"  Thinking (CoT): {'Enabled' if args.thinking else 'Disabled'}")
-    print(f"  Constrained Decoding: {'Enabled' if args.use_constrained_decoding else 'Disabled'}")
-    print(f"  Use CoT for Metas: {'Enabled' if args.use_cot_metas else 'Disabled'}")
-    
-    # Initialize models
-    print(f"\nInitializing models...")
-    
-    dit_handler = AceStepHandler()
-    llm_handler = LLMHandler()
-    
-    print("  🎹 Initializing DiT...")
-    status_dit, success_dit = dit_handler.initialize_service(
-        project_root=project_root,
-        config_path=args.config_path,
-        device=args.device,
-        use_flash_attention=True,
-    )
-    if not success_dit:
-        print(f"  ❌ Failed: {status_dit}")
-        sys.exit(1)
-    print(f"     ✓ DiT ready")
-    
-    print("  🧠 Initializing LLM...")
-    if args.thinking or args.use_cot_metas:
-        status_llm, success_llm = llm_handler.initialize(
-            checkpoint_dir=args.checkpoint_dir,
-            lm_model_path=args.lm_model,
-            backend=args.lm_backend,
-            device=args.device,
-        )
-        if success_llm:
-            print(f"     ✓ LLM ready ({args.lm_backend})")
-        else:
-            print(f"     ⚠ Failed: {status_llm}")
-    else:
-        print(f"     ✓ LLM not initialized (thinking or use_cot_metas is disabled)")
-    
-    # Load example
-    example_file = os.path.join(project_root, "examples", "text2music", args.example)
-    if not os.path.exists(example_file):
-        print(f"\n❌ Not found: {example_file}")
-        sys.exit(1)
-    
-    print(f"\n📄 Loading: {args.example}")
-    params, config = load_example_config(example_file)
-    
-    if not params or not config:
-        print("❌ Failed to load config")
-        sys.exit(1)
-    
-    print(f"   Caption: {params.caption[:60]}...")
-    print(f"   Batch: {config.batch_size}, Steps: {params.inference_steps}, LLM: {params.thinking}")
-    
-    # Warmup
-    if not args.no_warmup:
+# =============================================================================
+# Printing helpers
+# =============================================================================
+
+
+def print_time_costs_breakdown(
+    time_costs: Dict[str, float], total_wall_time: float
+):
+    """Print a detailed timing breakdown from result.extra_outputs['time_costs']."""
         print("\n" + "=" * 100)
-        print("🔥 WARMUP RUN")
+    print("PROFILING RESULTS")
         print("=" * 100)
         
+    if not time_costs:
+        print("\n  (No time_costs data available from the pipeline)")
+        print(f"\n  Total wall time: {total_wall_time:.3f}s")
+        return
+
+    # Categorize keys
+    lm_keys = {
+        k: v
+        for k, v in time_costs.items()
+        if k.startswith("lm_") and isinstance(v, (int, float))
+    }
+    dit_keys = {
+        k: v
+        for k, v in time_costs.items()
+        if k.startswith("dit_") and isinstance(v, (int, float))
+    }
+    pipeline_keys = {
+        k: v
+        for k, v in time_costs.items()
+        if k.startswith("pipeline_") and isinstance(v, (int, float))
+    }
+    other_keys = {
+        k: v
+        for k, v in time_costs.items()
+        if not k.startswith(("lm_", "dit_", "pipeline_"))
+        and isinstance(v, (int, float))
+    }
+
+    print(f"\n{'COMPONENT':<50} {'TIME (s)':<12} {'% of wall':<10}")
+    print("-" * 72)
+
+    # LM timing
+    lm_total = lm_keys.get("lm_total_time", 0.0)
+    if lm_keys:
+        print(
+            f"\n{'LLM (5Hz Language Model)':<50} "
+            f"{lm_total:<12.3f} {100 * lm_total / total_wall_time:>6.1f}%"
+        )
+        for k, v in sorted(lm_keys.items()):
+            if k != "lm_total_time":
+                label = k.replace("lm_", "  ")
+                print(
+                    f"  {label:<48} "
+                    f"{v:<12.3f} {100 * v / total_wall_time:>6.1f}%"
+                )
+
+    # DiT timing
+    dit_total = dit_keys.get("dit_total_time_cost", 0.0)
+    if dit_keys:
+        print(
+            f"\n{'DiT (Diffusion Transformer)':<50} "
+            f"{dit_total:<12.3f} {100 * dit_total / total_wall_time:>6.1f}%"
+        )
+        for k, v in sorted(dit_keys.items()):
+            if k != "dit_total_time_cost":
+                label = k.replace("dit_", "  ")
+                print(
+                    f"  {label:<48} "
+                    f"{v:<12.3f} {100 * v / total_wall_time:>6.1f}%"
+                )
+
+    # Pipeline total
+    if pipeline_keys:
+        for k, v in sorted(pipeline_keys.items()):
+            print(
+                f"\n{'Pipeline: ' + k:<50} "
+                f"{v:<12.3f} {100 * v / total_wall_time:>6.1f}%"
+            )
+
+    # Other keys
+    if other_keys:
+        print(f"\n{'Other:':<50}")
+        for k, v in sorted(other_keys.items()):
+            print(
+                f"  {k:<48} "
+                f"{v:<12.3f} {100 * v / total_wall_time:>6.1f}%"
+            )
+
+    # Overhead (wall time minus accounted time)
+    accounted = lm_total + dit_total
+    overhead = total_wall_time - accounted
+    if overhead > 0.01:
+        print(
+            f"\n{'Overhead (I/O, audio save, etc.)':<50} "
+            f"{overhead:<12.3f} {100 * overhead / total_wall_time:>6.1f}%"
+        )
+
+    print(f"\n{'TOTAL WALL TIME':<50} {total_wall_time:<12.3f} {'100.0%':>6}")
+
+    # Performance insights
+        print("\n" + "=" * 100)
+    print("PERFORMANCE INSIGHTS")
+        print("=" * 100)
+        
+    if lm_total > 0 and dit_total > 0:
+        if lm_total > dit_total * 2:
+            print(
+                f"\n  LLM is the bottleneck: {lm_total:.1f}s "
+                f"({100 * lm_total / total_wall_time:.0f}% of total)"
+            )
+            print("  Suggestions:")
+            print("    1. Run with --llm-debug for token-level throughput analysis")
+            print("    2. Try --no-constrained-decoding to reduce FSM overhead")
+            print("    3. Compare backends: --lm-backend vllm vs pt vs mlx")
+            print(
+                "    4. Reduce lm_cfg_scale "
+                "(currently doubles forward passes if > 1.0)"
+            )
+        elif dit_total > lm_total * 2:
+            print(
+                f"\n  DiT is the bottleneck: {dit_total:.1f}s "
+                f"({100 * dit_total / total_wall_time:.0f}% of total)"
+            )
+            print("  Suggestions:")
+            print("    1. Reduce --inference-steps (turbo model supports 4-8)")
+            print("    2. Reduce --duration")
+            print("    3. Try --quantization int8_weight_only")
+        else:
+            print(
+                f"\n  Balanced pipeline: LLM={lm_total:.1f}s, DiT={dit_total:.1f}s"
+            )
+    elif dit_total > 0:
+        print(f"\n  DiT only (no LLM): {dit_total:.1f}s")
+        vae_time = dit_keys.get("dit_vae_decode_time_cost", 0.0)
+        diffusion_time = dit_keys.get(
+            "dit_diffusion_time_cost", dit_total - vae_time
+        )
+        if vae_time > 0:
+            print(
+                f"    Diffusion: {diffusion_time:.1f}s, "
+                f"VAE decode: {vae_time:.1f}s"
+            )
+
+
+def print_result_summary(result: GenerationResult, mode: str = "profile"):
+    """Print a short summary of the generation result."""
+    if result.success:
+        n_audios = len(result.audios)
+        silent_count = sum(1 for a in result.audios if a.get("silent", False))
+        print(f"\n  Success! Generated {n_audios} audio(s)", end="")
+        if silent_count:
+            print(f" ({silent_count} silent)", end="")
+        print()
+        else:
+        print(f"\n  FAILED: {result.error}")
+
+
+# =============================================================================
+# Mode: profile (text2music and other task types)
+# =============================================================================
+
+
+def run_profile_mode(dit_handler, llm_handler, args, timer: PreciseTimer):
+    """Run a single profiled generation."""
+    example_dir = "text2music"
+    example_file = os.path.join(
+        PROJECT_ROOT, "examples", example_dir, args.example
+    )
+    if not os.path.exists(example_file):
+        print(f"\n  Example not found: {example_file}")
+        sys.exit(1)
+
+    print(f"\n  Loading example: {args.example}")
+    params, config = load_example_config(example_file, args)
+    if not params or not config:
+        print("  Failed to load example config")
+        sys.exit(1)
+
+    caption_preview = (
+        params.caption[:80] + "..."
+        if len(params.caption) > 80
+        else params.caption
+    )
+    print(f"  Caption: {caption_preview}")
+    print(
+        f"  Task: {params.task_type}, Batch: {config.batch_size}, "
+        f"Steps: {params.inference_steps}"
+    )
+    print(
+        f"  Thinking: {params.thinking}, CoT Metas: {params.use_cot_metas}, "
+        f"CoT Caption: {params.use_cot_caption}"
+    )
+
+    # Use a temporary directory for output (don't pollute project root)
+    save_dir = tempfile.mkdtemp(prefix="acestep_profile_")
+
+    # Warmup
+    if not args.no_warmup:
+        print("\n" + "-" * 100)
+        print("WARMUP RUN")
+        print("-" * 100)
         warmup_params = GenerationParams(
             caption=params.caption,
             lyrics=params.lyrics,
@@ -668,56 +450,867 @@ def main():
             timesignature=params.timesignature,
             vocal_language=params.vocal_language,
             duration=params.duration,
-            thinking=args.thinking,
-            use_cot_metas=args.use_cot_metas,
+            thinking=params.thinking,
+            use_cot_metas=params.use_cot_metas,
+            use_cot_caption=params.use_cot_caption,
+            use_cot_language=params.use_cot_language,
+            use_constrained_decoding=params.use_constrained_decoding,
             inference_steps=params.inference_steps,
-            seed=params.seed,
+            seed=42,
+            task_type=params.task_type,
+            lm_temperature=params.lm_temperature,
+            lm_cfg_scale=params.lm_cfg_scale,
+            guidance_scale=params.guidance_scale,
         )
-        warmup_config = GenerationConfig(batch_size=1, seeds=[42])
-        warmup_config.use_constrained_decoding = args.use_constrained_decoding
-        
+        warmup_config = GenerationConfig(
+            batch_size=1, seeds=[42], use_random_seed=False, audio_format="flac"
+        )
         warmup_start = time.perf_counter()
-        warmup_result = generate_music(dit_handler, llm_handler, warmup_params, warmup_config, save_dir="./")
+        warmup_result = generate_music(
+            dit_handler, llm_handler, warmup_params, warmup_config,
+            save_dir=save_dir,
+        )
         warmup_time = time.perf_counter() - warmup_start
-        
-        print(f"\n✓ Warmup: {warmup_time:.2f}s")
+        print(f"  Warmup completed: {warmup_time:.2f}s")
         if not warmup_result.success:
-            print(f"⚠️  Warning: {warmup_result.error}")
-        
-        # Reset
-        timer = PreciseTimer(device=args.device)
-        llm_debugger = LLMDebugger()
-    
+            print(f"  Warning: warmup failed: {warmup_result.error}")
+        timer.reset()
+
     # Profiling run
     print("\n" + "=" * 100)
-    print("⏱️  PROFILING RUN")
+    print("PROFILING RUN")
     print("=" * 100)
-    
-    # Apply inference mode settings
-    config.use_constrained_decoding = args.use_constrained_decoding
-    # Override thinking and use_cot_metas parameters if specified via CLI
-    if args.thinking:
-        params.thinking = True
-    if args.use_cot_metas:
-        params.use_cot_metas = True
-    
-    result, total_time = run_profiled_generation(
-        dit_handler, llm_handler, params, config,
-        enable_cprofile=args.detailed,
-        enable_llm_debug=args.llm_debug
-    )
-    
-    if not result.success:
-        print(f"\n❌ Failed: {result.error}")
-        sys.exit(1)
-    
-    print(f"\n✅ Success! Generated {len(result.audios)} audio file(s)")
-    
-    # Final tips
+
+    # Optional cProfile
+    prof = None
     if args.detailed:
-        print("\n💡 Check profile_cprofile_detailed.txt for function-level analysis")
-    elif not args.llm_debug:
-        print("\n💡 Run with --llm-debug to see LLM token count and throughput analysis")
+        import cProfile
+
+        prof = cProfile.Profile()
+        prof.enable()
+
+    timer.sync()
+    total_start = time.perf_counter()
+
+    result = generate_music(
+        dit_handler, llm_handler, params, config, save_dir=save_dir
+    )
+
+    timer.sync()
+    total_wall_time = time.perf_counter() - total_start
+
+    if args.detailed and prof:
+        prof.disable()
+        _print_cprofile(prof)
+
+    # Print results
+    print_result_summary(result, "profile")
+
+    time_costs = (
+        result.extra_outputs.get("time_costs", {}) if result.success else {}
+    )
+    print_time_costs_breakdown(time_costs, total_wall_time)
+
+    # Cleanup temp dir
+    _cleanup_dir(save_dir)
+
+    return result, total_wall_time
+
+
+# =============================================================================
+# Mode: benchmark
+# =============================================================================
+
+
+def run_benchmark_mode(dit_handler, llm_handler, args, timer: PreciseTimer):
+    """Run a matrix of configurations and produce a summary table."""
+    example_file = os.path.join(
+        PROJECT_ROOT, "examples", "text2music", args.example
+    )
+    if not os.path.exists(example_file):
+        print(f"\n  Example not found: {example_file}")
+        sys.exit(1)
+
+    with open(example_file, "r", encoding="utf-8") as f:
+        example_data = json.load(f)
+
+    save_dir = tempfile.mkdtemp(prefix="acestep_bench_")
+
+    # Define benchmark matrix
+    durations = [30, 60, 120]
+    batch_sizes = [1, 2]
+    thinking_options = (
+        [False, True] if llm_handler.llm_initialized else [False]
+    )
+    inference_steps_options = [8]
+
+    # Clamp to GPU limits
+    gpu_config = get_gpu_config()
+    max_dur = gpu_config.max_duration_without_lm
+    max_batch = gpu_config.max_batch_size_without_lm
+    durations = [d for d in durations if d <= max_dur]
+    batch_sizes = [b for b in batch_sizes if b <= max_batch]
+
+    if not durations:
+        durations = [30]
+    if not batch_sizes:
+        batch_sizes = [1]
+
+    configs = []
+    for dur in durations:
+        for bs in batch_sizes:
+            for think in thinking_options:
+                for steps in inference_steps_options:
+                    configs.append(
+                        {
+                            "duration": dur,
+                            "batch_size": bs,
+                            "thinking": think,
+                            "inference_steps": steps,
+                        }
+                    )
+
+    print(f"\n  Running {len(configs)} benchmark configurations...")
+    print(f"  Durations: {durations}, Batch sizes: {batch_sizes}")
+    print(f"  Thinking: {thinking_options}, Steps: {inference_steps_options}")
+
+    # Warmup
+    if not args.no_warmup:
+        print("\n  Warmup run...")
+        warmup_params = GenerationParams(
+            caption=example_data.get("caption", ""),
+            lyrics=example_data.get("lyrics", ""),
+            duration=30,
+            thinking=False,
+            inference_steps=8,
+            seed=42,
+        )
+        warmup_config = GenerationConfig(
+            batch_size=1, seeds=[42], use_random_seed=False, audio_format="flac"
+        )
+        generate_music(
+            dit_handler, llm_handler, warmup_params, warmup_config,
+            save_dir=save_dir,
+        )
+        print("  Warmup done.")
+
+    # Run benchmark
+    results = []
+    for i, cfg in enumerate(configs):
+        label = (
+            f"dur={cfg['duration']}s, bs={cfg['batch_size']}, "
+            f"think={cfg['thinking']}, steps={cfg['inference_steps']}"
+        )
+        print(f"\n  [{i + 1}/{len(configs)}] {label}")
+
+        params = GenerationParams(
+            caption=example_data.get("caption", ""),
+            lyrics=example_data.get("lyrics", ""),
+            bpm=example_data.get("bpm"),
+            keyscale=example_data.get("keyscale", ""),
+            timesignature=example_data.get("timesignature", ""),
+            vocal_language=example_data.get("language", "unknown"),
+            duration=cfg["duration"],
+            thinking=cfg["thinking"],
+            use_cot_metas=cfg["thinking"],
+            use_cot_caption=cfg["thinking"],
+            use_cot_language=cfg["thinking"],
+            use_constrained_decoding=args.use_constrained_decoding,
+            inference_steps=cfg["inference_steps"],
+            seed=42,
+            lm_temperature=args.lm_temperature,
+            lm_cfg_scale=args.lm_cfg_scale,
+            guidance_scale=args.guidance_scale,
+        )
+        config = GenerationConfig(
+            batch_size=cfg["batch_size"],
+            seeds=[42 + j for j in range(cfg["batch_size"])],
+            use_random_seed=False,
+            audio_format="flac",
+        )
+
+        timer.sync()
+        t0 = time.perf_counter()
+        result = generate_music(
+            dit_handler, llm_handler, params, config, save_dir=save_dir
+        )
+        timer.sync()
+        wall_time = time.perf_counter() - t0
+
+        tc = (
+            result.extra_outputs.get("time_costs", {})
+            if result.success
+            else {}
+        )
+        entry = {
+            "config": cfg,
+            "wall_time": wall_time,
+            "success": result.success,
+            "error": result.error,
+            "lm_time": tc.get("lm_total_time", 0.0),
+            "dit_time": tc.get("dit_total_time_cost", 0.0),
+            "vae_time": tc.get("dit_vae_decode_time_cost", 0.0),
+            "n_audios": len(result.audios) if result.success else 0,
+        }
+        results.append(entry)
+
+        status = "OK" if result.success else f"FAIL: {result.error}"
+        print(
+            f"    {status} | wall={wall_time:.1f}s, "
+            f"lm={entry['lm_time']:.1f}s, dit={entry['dit_time']:.1f}s"
+        )
+    
+    # Print summary table
+    print("\n" + "=" * 120)
+    print("BENCHMARK SUMMARY")
+    print("=" * 120)
+
+    header = (
+        f"{'Duration':<10} {'Batch':<7} {'Think':<7} {'Steps':<7} "
+        f"{'Wall(s)':<10} {'LM(s)':<10} {'DiT(s)':<10} "
+        f"{'VAE(s)':<10} {'Status':<10}"
+    )
+    print(header)
+    print("-" * 120)
+
+    for entry in results:
+        cfg = entry["config"]
+        status = "OK" if entry["success"] else "FAIL"
+        print(
+            f"{cfg['duration']:<10} {cfg['batch_size']:<7} "
+            f"{str(cfg['thinking']):<7} {cfg['inference_steps']:<7} "
+            f"{entry['wall_time']:<10.2f} {entry['lm_time']:<10.2f} "
+            f"{entry['dit_time']:<10.2f} {entry['vae_time']:<10.2f} "
+            f"{status:<10}"
+        )
+
+    # Save benchmark results as JSON
+    if args.benchmark_output:
+        output_path = args.benchmark_output
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\n  Benchmark results saved to: {output_path}")
+
+    _cleanup_dir(save_dir)
+    return results
+
+
+# =============================================================================
+# Mode: understand
+# =============================================================================
+
+
+def run_understand_mode(dit_handler, llm_handler, args, timer: PreciseTimer):
+    """Profile the understand_music() API."""
+    if not llm_handler.llm_initialized:
+        print("\n  LLM not initialized. understand mode requires LLM.")
+        print("  Re-run with --thinking or ensure LLM is available.")
+        sys.exit(1)
+
+    audio_codes = args.audio_codes if args.audio_codes else ""
+
+    print(
+        f"\n  Audio codes: "
+        f"{'<provided>' if audio_codes else '<empty - will generate sample>'}"
+    )
+
+    timer.sync()
+    t0 = time.perf_counter()
+
+    result = understand_music(
+        llm_handler=llm_handler,
+        audio_codes=audio_codes,
+        temperature=args.lm_temperature,
+        use_constrained_decoding=args.use_constrained_decoding,
+    )
+
+    timer.sync()
+    wall_time = time.perf_counter() - t0
+
+    print(f"\n  Wall time: {wall_time:.3f}s")
+    print(f"  Success: {result.success}")
+    if result.success:
+        print(f"  Caption: {result.caption[:100]}...")
+        print(
+            f"  BPM: {result.bpm}, Duration: {result.duration}, "
+            f"Key: {result.keyscale}"
+        )
+        print(
+            f"  Language: {result.language}, Time Sig: {result.timesignature}"
+        )
+        if result.lyrics:
+            print(f"  Lyrics: {result.lyrics[:100]}...")
+    else:
+        print(f"  Error: {result.error}")
+
+    return result, wall_time
+
+
+# =============================================================================
+# Mode: create_sample
+# =============================================================================
+
+
+def run_create_sample_mode(
+    dit_handler, llm_handler, args, timer: PreciseTimer
+):
+    """Profile the create_sample() API (inspiration/simple mode)."""
+    if not llm_handler.llm_initialized:
+        print("\n  LLM not initialized. create_sample mode requires LLM.")
+        sys.exit(1)
+
+    query = args.sample_query or "a soft love song for a quiet evening"
+    print(f"\n  Query: {query}")
+    print(f"  Instrumental: {args.instrumental}")
+
+        timer.sync()
+    t0 = time.perf_counter()
+
+    result = create_sample(
+        llm_handler=llm_handler,
+        query=query,
+        instrumental=args.instrumental,
+        temperature=args.lm_temperature,
+        use_constrained_decoding=args.use_constrained_decoding,
+    )
+
+    timer.sync()
+    wall_time = time.perf_counter() - t0
+
+    print(f"\n  Wall time: {wall_time:.3f}s")
+    print(f"  Success: {result.success}")
+    if result.success:
+        print(f"  Caption: {result.caption[:100]}...")
+        print(
+            f"  BPM: {result.bpm}, Duration: {result.duration}, "
+            f"Key: {result.keyscale}"
+        )
+        print(
+            f"  Language: {result.language}, Time Sig: {result.timesignature}"
+        )
+        print(f"  Instrumental: {result.instrumental}")
+        if result.lyrics:
+            print(f"  Lyrics: {result.lyrics[:100]}...")
+    else:
+        print(f"  Error: {result.error}")
+
+    return result, wall_time
+
+
+# =============================================================================
+# Mode: format_sample
+# =============================================================================
+
+
+def run_format_sample_mode(
+    dit_handler, llm_handler, args, timer: PreciseTimer
+):
+    """Profile the format_sample() API."""
+    if not llm_handler.llm_initialized:
+        print("\n  LLM not initialized. format_sample mode requires LLM.")
+        sys.exit(1)
+
+    example_file = os.path.join(
+        PROJECT_ROOT, "examples", "text2music", args.example
+    )
+    if not os.path.exists(example_file):
+        print(f"\n  Example not found: {example_file}")
+        sys.exit(1)
+
+    with open(example_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    caption = data.get("caption", "Latin pop, reggaeton")
+    lyrics = data.get("lyrics", "[Verse 1]\nHola mundo")
+
+    print(f"\n  Caption: {caption[:80]}...")
+    print(f"  Lyrics: {lyrics[:80]}...")
+
+        timer.sync()
+    t0 = time.perf_counter()
+
+    result = format_sample(
+        llm_handler=llm_handler,
+        caption=caption,
+        lyrics=lyrics,
+        temperature=args.lm_temperature,
+        use_constrained_decoding=args.use_constrained_decoding,
+    )
+
+    timer.sync()
+    wall_time = time.perf_counter() - t0
+
+    print(f"\n  Wall time: {wall_time:.3f}s")
+    print(f"  Success: {result.success}")
+    if result.success:
+        print(f"  Caption: {result.caption[:100]}...")
+        print(
+            f"  BPM: {result.bpm}, Duration: {result.duration}, "
+            f"Key: {result.keyscale}"
+        )
+        print(
+            f"  Language: {result.language}, Time Sig: {result.timesignature}"
+        )
+    else:
+        print(f"  Error: {result.error}")
+
+    return result, wall_time
+
+
+# =============================================================================
+# cProfile helper
+# =============================================================================
+
+
+def _print_cprofile(prof):
+    """Print cProfile results and save to file."""
+            import pstats
+            import io
+            
+            output_file = "profile_cprofile_detailed.txt"
+    with open(output_file, "w") as f:
+                ps = pstats.Stats(prof, stream=f)
+        ps.sort_stats("cumulative")
+                ps.print_stats(100)
+            
+            print("\n" + "=" * 100)
+    print("TOP 20 FUNCTIONS BY CUMULATIVE TIME (cProfile)")
+            print("=" * 100)
+            s = io.StringIO()
+            ps = pstats.Stats(prof, stream=s)
+    ps.sort_stats("cumulative")
+            ps.print_stats(20)
+            print(s.getvalue())
+    print(f"Full report saved to: {output_file}")
+
+
+def _cleanup_dir(path: str):
+    """Remove temporary directory silently."""
+    try:
+        import shutil
+
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Handler initialization
+# =============================================================================
+
+
+def initialize_handlers(
+    args, device: str
+) -> Tuple[AceStepHandler, LLMHandler]:
+    """Initialize DiT and LLM handlers with current API."""
+    dit_handler = AceStepHandler()
+    llm_handler = LLMHandler()
+
+    # Determine flash attention availability
+    use_flash_attention = False
+    if device.startswith("cuda"):
+        try:
+            import flash_attn  # noqa: F401
+
+            use_flash_attention = True
+        except ImportError:
+            pass
+
+    print("  Initializing DiT handler...")
+    status_dit, success_dit = dit_handler.initialize_service(
+        project_root=PROJECT_ROOT,
+        config_path=args.config_path,
+        device=args.device,  # Pass original device string (handler resolves "auto")
+        use_flash_attention=use_flash_attention,
+        compile_model=False,
+        offload_to_cpu=args.offload_to_cpu,
+        offload_dit_to_cpu=args.offload_dit_to_cpu,
+        quantization=args.quantization,
+    )
+    if not success_dit:
+        print(f"  DiT initialization failed: {status_dit}")
+        sys.exit(1)
+    print(f"  DiT ready (device={dit_handler.device})")
+
+    # Determine if LLM should be initialized
+    need_llm = (
+        args.thinking
+        or args.use_cot_metas
+        or args.use_cot_caption
+        or args.use_cot_language
+        or args.mode in ("understand", "create_sample", "format_sample")
+    )
+
+    if need_llm:
+        print(f"  Initializing LLM handler (backend={args.lm_backend})...")
+        status_llm, success_llm = llm_handler.initialize(
+            checkpoint_dir=os.path.join(PROJECT_ROOT, "checkpoints"),
+            lm_model_path=args.lm_model,
+            backend=args.lm_backend,
+            device=args.device,
+            offload_to_cpu=args.offload_to_cpu,
+            dtype=None,
+        )
+        if success_llm:
+            print(f"  LLM ready (backend={llm_handler.llm_backend})")
+        else:
+            print(f"  LLM initialization failed: {status_llm}")
+            if args.mode in ("understand", "create_sample", "format_sample"):
+                sys.exit(1)
+    else:
+        print(
+            "  LLM not needed for current configuration "
+            "(thinking/CoT disabled)"
+        )
+
+    return dit_handler, llm_handler
+
+
+# =============================================================================
+# CLI argument parser
+# =============================================================================
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with all options."""
+    env_config = load_env_config()
+    
+    parser = argparse.ArgumentParser(
+        description="ACE-Step 1.5 Inference Profiler & Benchmark",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python profile_inference.py                                    # Profile text2music
+  python profile_inference.py --thinking --llm-debug             # With LLM analysis
+  python profile_inference.py --mode benchmark                   # Benchmark matrix
+  python profile_inference.py --mode understand                  # Profile understand API
+  python profile_inference.py --mode create_sample --sample-query "jazz ballad"
+  python profile_inference.py --device mps --lm-backend mlx      # Apple Silicon
+  python profile_inference.py --device cuda --lm-backend vllm    # NVIDIA GPU
+""",
+    )
+
+    # Mode
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="profile",
+        choices=[
+            "profile",
+            "benchmark",
+            "understand",
+            "create_sample",
+            "format_sample",
+        ],
+        help="Profiling mode (default: profile)",
+    )
+
+    # Device & backend
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=env_config["ACESTEP_DEVICE"],
+        help=(
+            f"Device: auto/cuda/mps/cpu "
+            f"(default: {env_config['ACESTEP_DEVICE']})"
+        ),
+    )
+    parser.add_argument(
+        "--lm-backend",
+        type=str,
+        default=env_config["ACESTEP_LM_BACKEND"],
+        choices=["auto", "vllm", "pt", "mlx"],
+        help=(
+            f"LLM backend "
+            f"(default: {env_config['ACESTEP_LM_BACKEND']})"
+        ),
+    )
+
+    # Model paths
+    parser.add_argument(
+        "--config-path",
+        type=str,
+        default=env_config["ACESTEP_CONFIG_PATH"],
+        help=(
+            f"DiT model config "
+            f"(default: {env_config['ACESTEP_CONFIG_PATH']})"
+        ),
+    )
+    parser.add_argument(
+        "--lm-model",
+        type=str,
+        default=env_config["ACESTEP_LM_MODEL_PATH"],
+        help=(
+            f"LLM model path "
+            f"(default: {env_config['ACESTEP_LM_MODEL_PATH']})"
+        ),
+    )
+
+    # Hardware options
+    parser.add_argument(
+        "--offload-to-cpu",
+        action="store_true",
+        help="Offload models to CPU when not in use",
+    )
+    parser.add_argument(
+        "--offload-dit-to-cpu",
+        action="store_true",
+        help="Offload DiT to CPU when not in use",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["int8_weight_only", "fp8_weight_only", "w8a8_dynamic"],
+        help="Quantization mode for DiT model",
+    )
+
+    # Example & input
+    parser.add_argument(
+        "--example",
+        type=str,
+        default="example_05.json",
+        help="Example JSON file from examples/text2music/",
+    )
+
+    # Task type
+    parser.add_argument(
+        "--task-type",
+        type=str,
+        default="text2music",
+        choices=[
+            "text2music",
+            "cover",
+            "repaint",
+            "lego",
+            "extract",
+            "complete",
+        ],
+        help="Generation task type (default: text2music)",
+    )
+    parser.add_argument(
+        "--reference-audio",
+        type=str,
+        default=None,
+        help="Reference audio path (for cover/style transfer)",
+    )
+    parser.add_argument(
+        "--src-audio",
+        type=str,
+        default=None,
+        help="Source audio path (for audio-to-audio tasks)",
+    )
+
+    # Generation parameters
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Audio duration in seconds (overrides example)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size (overrides example)",
+    )
+    parser.add_argument(
+        "--inference-steps",
+        type=int,
+        default=None,
+        help="Diffusion inference steps (overrides example)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (overrides example)",
+    )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=7.0,
+        help="CFG guidance scale for DiT (default: 7.0)",
+    )
+
+    # LLM / CoT parameters
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Enable 5Hz LM Chain-of-Thought reasoning",
+    )
+    parser.add_argument(
+        "--use-cot-metas",
+        action="store_true",
+        help="Enable LLM to generate music metadata via CoT",
+    )
+    parser.add_argument(
+        "--use-cot-caption",
+        action="store_true",
+        help="Enable LLM to rewrite/format caption via CoT",
+    )
+    parser.add_argument(
+        "--use-cot-language",
+        action="store_true",
+        help="Enable LLM to detect vocal language via CoT",
+    )
+    parser.add_argument(
+        "--use-constrained-decoding",
+        action="store_true",
+        default=True,
+        help="Use FSM-based constrained decoding (default: True)",
+    )
+    parser.add_argument(
+        "--no-constrained-decoding",
+        action="store_true",
+        help="Disable constrained decoding",
+    )
+    parser.add_argument(
+        "--lm-temperature",
+        type=float,
+        default=0.85,
+        help="LLM sampling temperature (default: 0.85)",
+    )
+    parser.add_argument(
+        "--lm-cfg-scale",
+        type=float,
+        default=2.0,
+        help="LLM CFG scale (default: 2.0)",
+    )
+
+    # Profiling options
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Skip warmup run (includes compilation overhead)",
+    )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Enable cProfile function-level analysis",
+    )
+    parser.add_argument(
+        "--llm-debug",
+        action="store_true",
+        help="Enable deep LLM debugging (token count, throughput)",
+    )
+
+    # Benchmark options
+    parser.add_argument(
+        "--benchmark-output",
+        type=str,
+        default=None,
+        help="Save benchmark results to JSON file",
+    )
+
+    # create_sample / understand options
+    parser.add_argument(
+        "--sample-query",
+        type=str,
+        default=None,
+        help="Query for create_sample mode",
+    )
+    parser.add_argument(
+        "--instrumental",
+        action="store_true",
+        help="Generate instrumental music (for create_sample)",
+    )
+    parser.add_argument(
+        "--audio-codes",
+        type=str,
+        default=None,
+        help="Audio codes string (for understand mode)",
+    )
+
+    return parser
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Handle --no-constrained-decoding
+    if args.no_constrained_decoding:
+        args.use_constrained_decoding = False
+
+    # Resolve device
+    device = resolve_device(args.device)
+
+    # Auto-detect backend
+    if args.lm_backend == "auto":
+        args.lm_backend = auto_detect_backend(device)
+
+    # Setup GPU config
+    gpu_config = get_gpu_config()
+    set_global_gpu_config(gpu_config)
+
+    # Auto-enable offload for small GPUs
+    if (
+        gpu_config.gpu_memory_gb > 0
+        and gpu_config.gpu_memory_gb < 16
+        and not args.offload_to_cpu
+    ):
+        args.offload_to_cpu = True
+
+    # Print header
+    print("=" * 100)
+    print("ACE-Step 1.5 Inference Profiler")
+    print("=" * 100)
+    print(f"\n  Mode:           {args.mode}")
+    print(f"  Device:         {device} (requested: {args.device})")
+    print(f"  LLM Backend:    {args.lm_backend}")
+    print(f"  DiT Config:     {args.config_path}")
+    print(f"  LLM Model:      {args.lm_model}")
+    print(
+        f"  GPU Memory:     {gpu_config.gpu_memory_gb:.1f} GB "
+        f"(tier: {gpu_config.tier})"
+    )
+    if args.quantization:
+        print(f"  Quantization:   {args.quantization}")
+    if args.offload_to_cpu:
+        print("  CPU Offload:    enabled")
+    print(f"\n  Thinking:       {args.thinking}")
+    print(f"  CoT Metas:      {args.use_cot_metas}")
+    print(f"  CoT Caption:    {args.use_cot_caption}")
+    print(f"  CoT Language:   {args.use_cot_language}")
+    print(f"  Constrained:    {args.use_constrained_decoding}")
+    print(f"  Warmup:         {'disabled' if args.no_warmup else 'enabled'}")
+
+    # Initialize handlers
+    print("\n" + "-" * 100)
+    print("INITIALIZING MODELS")
+    print("-" * 100)
+
+    dit_handler, llm_handler = initialize_handlers(args, device)
+
+    # Create timer with resolved device
+    actual_device = getattr(dit_handler, "device", device)
+    timer = PreciseTimer(device=actual_device)
+
+    # Dispatch to mode
+    print("\n" + "=" * 100)
+    print(f"RUNNING MODE: {args.mode.upper()}")
+    print("=" * 100)
+
+    if args.mode == "profile":
+        run_profile_mode(dit_handler, llm_handler, args, timer)
+    elif args.mode == "benchmark":
+        run_benchmark_mode(dit_handler, llm_handler, args, timer)
+    elif args.mode == "understand":
+        run_understand_mode(dit_handler, llm_handler, args, timer)
+    elif args.mode == "create_sample":
+        run_create_sample_mode(dit_handler, llm_handler, args, timer)
+    elif args.mode == "format_sample":
+        run_format_sample_mode(dit_handler, llm_handler, args, timer)
+
+    print("\n" + "=" * 100)
+    print("DONE")
+    print("=" * 100)
 
 
 if __name__ == "__main__":

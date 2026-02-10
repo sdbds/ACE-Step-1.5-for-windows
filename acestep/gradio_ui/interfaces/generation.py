@@ -62,7 +62,7 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
     with gr.Group():
         # Service Configuration - collapse if pre-initialized, hide if in service mode
         accordion_open = not service_pre_initialized
-        accordion_visible = not service_pre_initialized  # Hide when running in service mode
+        accordion_visible = not service_mode  # Hide only in restricted service mode, not when pre-initialized
         with gr.Accordion(t("service.title"), open=accordion_open, visible=accordion_visible) as service_config_accordion:
             # Language selector at the top
             with gr.Row():

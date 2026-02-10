@@ -450,18 +450,19 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
     
     This function ONLY sets the src_audio field. All other metadata fields (caption, lyrics, etc.)
     are preserved by returning gr.skip() to avoid overwriting user's existing inputs.
+    Also opens the audio_uploads_accordion so the user can see the uploaded audio.
     
     Args:
         audio_file: Audio file path
         lm_metadata: Dictionary containing LM-generated metadata (unused, kept for API compatibility)
         
     Returns:
-        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption)
-        All values except audio_file are gr.skip() to preserve existing UI values
+        Tuple of (audio_file, bpm, caption, lyrics, duration, key_scale, language, time_signature, is_format_caption, audio_uploads_accordion)
+        All values except audio_file and audio_uploads_accordion are gr.skip() to preserve existing UI values
     """
     if audio_file is None:
         # Return all skip to not modify anything
-        return (gr.skip(),) * 9
+        return (gr.skip(),) * 10
     
     # Only set the audio file, skip all other fields to preserve existing values
     # This ensures user's caption, lyrics, bpm, etc. are NOT cleared
@@ -475,6 +476,7 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
         gr.skip(),       # language - preserve existing value
         gr.skip(),       # time_signature - preserve existing value
         gr.skip(),       # is_format_caption - preserve existing value
+        gr.Accordion(open=True),  # audio_uploads_accordion - expand to show uploaded audio
     )
 
 

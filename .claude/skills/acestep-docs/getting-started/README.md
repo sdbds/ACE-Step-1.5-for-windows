@@ -3,7 +3,7 @@
 ## Requirements
 
 - Python 3.11
-- CUDA GPU recommended (works on CPU/MPS but slower)
+- CUDA GPU recommended (works on CPU/MPS/MLX but slower)
 
 ## Installation
 
@@ -13,29 +13,65 @@
 2. Requirements: CUDA 12.8
 3. The package includes `python_embeded` with all dependencies pre-installed
 
-**Quick Start (Using Batch Scripts):**
+**Quick Start:**
 ```bash
-# Launch Gradio Web UI
+# Launch Gradio Web UI (CUDA)
 start_gradio_ui.bat
 
-# Launch REST API Server
+# Launch REST API Server (CUDA)
 start_api_server.bat
+
+# Launch Gradio Web UI (AMD ROCm)
+start_gradio_ui_rocm.bat
+
+# Launch REST API Server (AMD ROCm)
+start_api_server_rocm.bat
 ```
 
-Both scripts support:
-- ✅ Auto environment detection (`python_embeded` or `uv`)
-- ✅ Auto install `uv` if needed (via winget or PowerShell)
-- ✅ Configurable download source (HuggingFace/ModelScope)
-- ✅ Optional Git update check
-- ✅ Customizable language, models, and parameters
+### Launch Scripts (All Platforms)
+
+Ready-to-use launch scripts with auto environment detection, update checking, and uv auto-install.
+
+**Windows (.bat):**
+```bash
+start_gradio_ui.bat          # Gradio Web UI (CUDA)
+start_api_server.bat         # REST API Server (CUDA)
+start_gradio_ui_rocm.bat     # Gradio Web UI (AMD ROCm)
+start_api_server_rocm.bat    # REST API Server (AMD ROCm)
+```
+
+**Linux (.sh):**
+```bash
+chmod +x start_gradio_ui.sh start_api_server.sh   # First time only
+./start_gradio_ui.sh         # Gradio Web UI (CUDA)
+./start_api_server.sh        # REST API Server (CUDA)
+```
+
+**macOS Apple Silicon (.sh):**
+```bash
+chmod +x start_gradio_ui_macos.sh start_api_server_macos.sh   # First time only
+./start_gradio_ui_macos.sh   # Gradio Web UI (MLX backend)
+./start_api_server_macos.sh  # REST API Server (MLX backend)
+```
+
+All launch scripts support:
+- Startup update check (enabled by default, configurable)
+- Auto environment detection (`python_embeded` or `uv`)
+- Auto install `uv` if needed
+- Configurable download source (HuggingFace/ModelScope)
+- Customizable language, models, and parameters
+
+See [SCRIPT_CONFIGURATION.md](../guides/SCRIPT_CONFIGURATION.md) for configuration details.
 
 **Manual Launch (Using Python Directly):**
 ```bash
 # Gradio Web UI
-python_embeded\python.exe acestep\acestep_v15_pipeline.py
+python_embeded\python.exe acestep\acestep_v15_pipeline.py    # Windows portable
+python acestep/acestep_v15_pipeline.py                        # Linux/macOS
 
 # REST API Server
-python_embeded\python.exe acestep\api_server.py
+python_embeded\python.exe acestep\api_server.py              # Windows portable
+python acestep/api_server.py                                  # Linux/macOS
 ```
 
 ### Standard Installation (All Platforms)

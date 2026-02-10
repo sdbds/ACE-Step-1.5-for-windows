@@ -668,6 +668,7 @@ class AceStepHandler:
 
                     if self.quantization is not None:
                         from torchao.quantization import quantize_
+                        from torchao.quantization.quant_api import _is_linear
                         if self.quantization == "int8_weight_only":
                             from torchao.quantization import Int8WeightOnlyConfig
                             quant_config = Int8WeightOnlyConfig()
@@ -679,8 +680,23 @@ class AceStepHandler:
                             quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
                         else:
                             raise ValueError(f"Unsupported quantization type: {self.quantization}")
-
-                        quantize_(self.model, quant_config)
+                        
+                        # Only quantize DiT layers; exclude tokenizer and detokenizer submodules.
+                        # The tokenizer (ResidualFSQ) and detokenizer contain small Linear layers
+                        # that are used for audio code decoding. Quantizing them causes device
+                        # mismatch errors during CPU↔GPU offloading because some torchao versions
+                        # don't fully support .to(device) on AffineQuantizedTensor, and these
+                        # layers are too small to benefit from quantization anyway.
+                        def _dit_filter_fn(module, fqn):
+                            if not _is_linear(module, fqn):
+                                return False
+                            # Exclude tokenizer/detokenizer (including via _orig_mod prefix from torch.compile)
+                            for part in fqn.split("."):
+                                if part in ("tokenizer", "detokenizer"):
+                                    return False
+                            return True
+                        
+                        quantize_(self.model, quant_config, filter_fn=_dit_filter_fn)
                         logger.info(f"[initialize_service] DiT quantized with: {self.quantization}")
 
 
@@ -948,24 +964,41 @@ class AceStepHandler:
             target_type = "cpu" if str(target_device) == "cpu" else "cuda"
         return tensor.device.type == target_type
 
+    @staticmethod
+    def _get_affine_quantized_tensor_class():
+        """Return the AffineQuantizedTensor class from torchao, or None if unavailable.
+        
+        Supports both old (torchao.quantization.affine_quantized) and new
+        (torchao.dtypes.affine_quantized_tensor) import paths across torchao versions.
+        """
+        try:
+            from torchao.dtypes.affine_quantized_tensor import AffineQuantizedTensor
+            return AffineQuantizedTensor
+        except ImportError:
+            pass
+        try:
+            from torchao.quantization.affine_quantized import AffineQuantizedTensor
+            return AffineQuantizedTensor
+        except ImportError:
+            pass
+        return None
+
     def _is_quantized_tensor(self, t):
         """True if t is a torchao AffineQuantizedTensor (calling .to() on it can raise NotImplementedError)."""
         if t is None:
             return False
-        try:
-            from torchao.quantization.affine_quantized import AffineQuantizedTensor
-            return isinstance(t, AffineQuantizedTensor)
-        except ImportError:
+        cls = self._get_affine_quantized_tensor_class()
+        if cls is None:
             return False
+        return isinstance(t, cls)
 
     def _has_quantized_params(self, module):
         """True if module (or any submodule) has at least one AffineQuantizedTensor parameter."""
-        try:
-            from torchao.quantization.affine_quantized import AffineQuantizedTensor
-        except ImportError:
+        cls = self._get_affine_quantized_tensor_class()
+        if cls is None:
             return False
         for _, param in module.named_parameters():
-            if param is not None and isinstance(param, AffineQuantizedTensor):
+            if param is not None and isinstance(param, cls):
                 return True
         return False
 
@@ -975,99 +1008,145 @@ class AceStepHandler:
             if not self._is_on_target_device(self.silence_latent, self.device):
                 self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
     
-    def _move_module_recursive(self, module, target_device, dtype=None, visited=None, skip_quantized=False):
+    def _move_module_recursive(self, module, target_device, dtype=None, visited=None):
         """
         Recursively move a module and all its submodules to the target device.
-        When skip_quantized=True, avoids calling .to() on the module or on AffineQuantizedTensor
-        parameters (torchao quantized tensors that can raise NotImplementedError on .to(device)).
+        This handles modules that may not be properly registered.
         """
         if visited is None:
             visited = set()
+        
         module_id = id(module)
         if module_id in visited:
             return
         visited.add(module_id)
-
-        if not skip_quantized:
-            module.to(target_device)
-            if dtype is not None:
-                module.to(dtype)
-
+        
+        # Move the module itself
+        module.to(target_device)
+        if dtype is not None:
+            module.to(dtype)
+        
+        # Move all direct parameters
         for param_name, param in module._parameters.items():
-            if param is None:
-                continue
-            if self._is_quantized_tensor(param):
-                continue
-            if not self._is_on_target_device(param, target_device):
+            if param is not None and not self._is_on_target_device(param, target_device):
                 module._parameters[param_name] = param.to(target_device)
                 if dtype is not None:
                     module._parameters[param_name] = module._parameters[param_name].to(dtype)
-
+        
+        # Move all direct buffers
         for buf_name, buf in module._buffers.items():
-            if buf is None:
-                continue
-            if self._is_quantized_tensor(buf):
-                continue
-            if not self._is_on_target_device(buf, target_device):
+            if buf is not None and not self._is_on_target_device(buf, target_device):
                 module._buffers[buf_name] = buf.to(target_device)
-
+        
+        # Recursively process all submodules (registered and unregistered)
         for name, child in module._modules.items():
             if child is not None:
-                self._move_module_recursive(child, target_device, dtype, visited, skip_quantized)
-
+                self._move_module_recursive(child, target_device, dtype, visited)
+        
+        # Also check for any nn.Module attributes that might not be in _modules
         for attr_name in dir(module):
             if attr_name.startswith('_'):
                 continue
             try:
                 attr = getattr(module, attr_name, None)
                 if isinstance(attr, torch.nn.Module) and id(attr) not in visited:
-                    self._move_module_recursive(attr, target_device, dtype, visited, skip_quantized)
+                    self._move_module_recursive(attr, target_device, dtype, visited)
             except Exception:
                 pass
+    
+    def _move_quantized_param(self, param, target_device):
+        """Move an AffineQuantizedTensor to target_device using _apply_fn_to_data.
+        
+        This is the safe fallback for older torch versions where model.to(device) raises
+        NotImplementedError on AffineQuantizedTensor (because aten._has_compatible_shallow_copy_type
+        is not implemented). _apply_fn_to_data recursively applies a function to all inner
+        tensors (int_data, scale, zero_point, etc.) without going through Module._apply.
+        """
+        if hasattr(param, '_apply_fn_to_data'):
+            return torch.nn.Parameter(
+                param._apply_fn_to_data(lambda x: x.to(target_device)),
+                requires_grad=param.requires_grad,
+            )
+        # Last resort: try direct .to() (may raise)
+        return param.to(target_device)
 
     def _recursive_to_device(self, model, device, dtype=None):
         """
         Recursively move all parameters and buffers of a model to the specified device.
-        When the model contains torchao AffineQuantizedTensor parameters, avoids calling
-        Module.to(device) (which can raise NotImplementedError via _has_compatible_shallow_copy_type).
+        This is more thorough than model.to() for some custom HuggingFace models.
+        
+        Handles torchao AffineQuantizedTensor parameters that may raise NotImplementedError
+        on model.to(device) in older torch versions (where Module._apply calls
+        _has_compatible_shallow_copy_type, which is not implemented for AffineQuantizedTensor).
+        In that case, falls back to moving quantized parameters individually via _apply_fn_to_data.
         """
         target_device = torch.device(device) if isinstance(device, str) else device
-        skip_quantized = self._has_quantized_params(model)
-
-        if skip_quantized:
-            logger.warning(
-                "[_recursive_to_device] Model has quantized (AffineQuantizedTensor) parameters; "
-                "skipping Module.to(device) to avoid NotImplementedError. Moving non-quantized parameters only."
-            )
-
-        if not skip_quantized:
+        
+        # Method 1: Standard .to() call — works on newer torch where _apply uses swap_tensors
+        try:
             model.to(target_device)
             if dtype is not None:
                 model.to(dtype)
-
-        self._move_module_recursive(model, target_device, dtype, skip_quantized=skip_quantized)
-
+        except NotImplementedError:
+            # Older torch: Module._apply calls _has_compatible_shallow_copy_type which is
+            # not implemented for AffineQuantizedTensor. Move parameters manually.
+            logger.info(
+                "[_recursive_to_device] model.to() raised NotImplementedError "
+                "(AffineQuantizedTensor on older torch). Moving parameters individually."
+            )
+            for module in model.modules():
+                # Move non-quantized parameters and buffers directly
+                for param_name, param in module._parameters.items():
+                    if param is None:
+                        continue
+                    if self._is_on_target_device(param, target_device):
+                        continue
+                    if self._is_quantized_tensor(param):
+                        module._parameters[param_name] = self._move_quantized_param(param, target_device)
+                    else:
+                        module._parameters[param_name] = torch.nn.Parameter(
+                            param.data.to(target_device), requires_grad=param.requires_grad
+                        )
+                        if dtype is not None:
+                            module._parameters[param_name] = torch.nn.Parameter(
+                                module._parameters[param_name].data.to(dtype),
+                                requires_grad=param.requires_grad,
+                            )
+                for buf_name, buf in module._buffers.items():
+                    if buf is not None and not self._is_on_target_device(buf, target_device):
+                        module._buffers[buf_name] = buf.to(target_device)
+        
+        # Method 2: Use our thorough recursive moving for any missed modules
+        # (skip if model.to() failed — we already moved everything above)
+        try:
+            self._move_module_recursive(model, target_device, dtype)
+        except NotImplementedError:
+            pass  # Already handled above
+        
+        # Method 3: Force move via state_dict if there are still parameters on wrong device
         wrong_device_params = []
         for name, param in model.named_parameters():
             if not self._is_on_target_device(param, device):
                 wrong_device_params.append(name)
-
+        
         if wrong_device_params and device != "cpu":
-            logger.warning(f"[_recursive_to_device] {len(wrong_device_params)} parameters on wrong device, using state_dict method")
-            state_dict = model.state_dict()
-            moved_state_dict = {}
-            for key, value in state_dict.items():
-                if isinstance(value, torch.Tensor):
-                    if self._is_quantized_tensor(value):
-                        moved_state_dict[key] = value
+            logger.warning(f"[_recursive_to_device] {len(wrong_device_params)} parameters on wrong device after initial move, retrying individually")
+            for module in model.modules():
+                for param_name, param in module._parameters.items():
+                    if param is None or self._is_on_target_device(param, target_device):
+                        continue
+                    if self._is_quantized_tensor(param):
+                        module._parameters[param_name] = self._move_quantized_param(param, target_device)
                     else:
-                        moved_state_dict[key] = value.to(target_device)
-                        if dtype is not None and moved_state_dict[key].is_floating_point():
-                            moved_state_dict[key] = moved_state_dict[key].to(dtype)
-                else:
-                    moved_state_dict[key] = value
-            model.load_state_dict(moved_state_dict)
-
+                        module._parameters[param_name] = torch.nn.Parameter(
+                            param.data.to(target_device), requires_grad=param.requires_grad
+                        )
+                        if dtype is not None and module._parameters[param_name].is_floating_point():
+                            module._parameters[param_name] = torch.nn.Parameter(
+                                module._parameters[param_name].data.to(dtype),
+                                requires_grad=param.requires_grad,
+                            )
+        
         # Synchronize accelerator to ensure all transfers are complete
         if device != "cpu":
             self._synchronize()

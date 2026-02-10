@@ -215,7 +215,9 @@ def check_main_model_exists(checkpoints_dir: Optional[Path] = None) -> bool:
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     for component in MAIN_MODEL_COMPONENTS:
         component_path = checkpoints_dir / component
         if not component_path.exists():
@@ -239,7 +241,9 @@ def check_model_exists(model_name: str, checkpoints_dir: Optional[Path] = None) 
         return False
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     model_path = checkpoints_dir / model_name
     return model_path.exists()
 
@@ -284,6 +288,8 @@ def download_main_model(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     # Ensure checkpoints directory exists
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +331,8 @@ def download_submodel(
 
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     # Ensure checkpoints directory exists
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -361,7 +369,9 @@ def download_all_models(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
-    
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
+
     messages = []
     all_success = True
     
@@ -436,6 +446,8 @@ def ensure_lm_model(
 
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     if check_model_exists(model_name, checkpoints_dir):
         return True, f"LM model '{model_name}' is available"
@@ -477,6 +489,8 @@ def ensure_dit_model(
     """
     if checkpoints_dir is None:
         checkpoints_dir = get_checkpoints_dir()
+    elif isinstance(checkpoints_dir, str):
+        checkpoints_dir = Path(checkpoints_dir)
 
     if check_model_exists(model_name, checkpoints_dir):
         return True, f"DiT model '{model_name}' is available"

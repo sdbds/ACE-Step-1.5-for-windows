@@ -1,0 +1,13 @@
+{
+  "api_url": "http://127.0.0.1:8001",
+  "api_key": "",
+  "generation": {
+    "thinking": true,
+    "use_format": false,
+    "use_cot_caption": true,
+    "use_cot_language": false,
+    "audio_format": "mp3",
+    "batch_size": 1,
+    "vocal_language": "en"
+  }
+}

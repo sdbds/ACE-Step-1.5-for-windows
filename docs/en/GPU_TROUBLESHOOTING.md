@@ -39,9 +39,10 @@ export HSA_OVERRIDE_GFX_VERSION=11.0.2  # For RX 7600
 set HSA_OVERRIDE_GFX_VERSION=11.0.0
 ```
 
-Or use the provided launcher script which sets this automatically:
+Or use the provided launcher scripts which set this automatically:
 ```cmd
 start_gradio_ui_rocm.bat
+start_api_server_rocm.bat
 ```
 
 #### For RDNA2 GPUs (RX 6000 series):
@@ -155,7 +156,7 @@ For NVIDIA GPUs in WSL2, you need CUDA on WSL2:
 
 For AMD GPUs, ROCm support in WSL2 is limited. Consider:
 - Running on native Linux
-- Using Windows with `start_gradio_ui_rocm.bat`
+- Using Windows with `start_gradio_ui_rocm.bat` / `start_api_server_rocm.bat`
 
 ## GPU-Specific Configuration
 
@@ -166,7 +167,7 @@ For AMD GPUs, ROCm support in WSL2 is limited. Consider:
 export HSA_OVERRIDE_GFX_VERSION=11.0.0
 export MIOPEN_FIND_MODE=FAST
 
-# Windows (or use start_gradio_ui_rocm.bat)
+# Windows (or use start_gradio_ui_rocm.bat / start_api_server_rocm.bat)
 set HSA_OVERRIDE_GFX_VERSION=11.0.0
 set MIOPEN_FIND_MODE=FAST
 ```

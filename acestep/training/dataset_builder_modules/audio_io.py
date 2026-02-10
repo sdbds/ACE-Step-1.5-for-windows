@@ -36,5 +36,11 @@ def get_audio_duration(audio_path: str) -> int:
         if audio is not None:
             return int(audio.info.length)
     except Exception as e:
+        logger.warning(f"torchaudio failed for {audio_path}: {e}, trying soundfile")
+    try:
+        import soundfile as sf
+        info = sf.info(audio_path)
+        return int(info.duration)
+    except Exception as e:
         logger.warning(f"Failed to get duration for {audio_path}: {e}")
     return 0

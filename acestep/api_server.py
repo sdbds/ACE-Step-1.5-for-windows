@@ -2112,9 +2112,11 @@ def create_app() -> FastAPI:
         # =================================================================
         # Initialize models at startup (not lazily on first request)
         # =================================================================
-        print("[API Server] Initializing models at startup...")
 
-        # Detect GPU memory and get configuration
+        # Check if --no-init flag is set (skip model loading at startup)
+        no_init = _env_bool("ACESTEP_NO_INIT", False)
+
+        # Detect GPU memory and get configuration (always needed)
         gpu_config = get_gpu_config()
         set_global_gpu_config(gpu_config)
         app.state.gpu_config = gpu_config
@@ -2140,222 +2142,234 @@ def create_app() -> FastAPI:
             print("[API Server] Auto-enabling CPU offload (GPU < 16GB)")
         elif gpu_memory_gb > 0:
             print("[API Server] CPU offload disabled by default (GPU >= 16GB)")
+        if no_init:
+            print("[API Server] --no-init mode: Skipping all model loading at startup")
+            print("[API Server] Models will be lazy-loaded on first request")
+            print("[API Server] Server is ready to accept requests (models not loaded yet)")
         else:
-            print("[API Server] No GPU detected, running on CPU")
+            print("[API Server] Initializing models at startup...")
 
-        project_root = _get_project_root()
-        config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
-        device = os.getenv("ACESTEP_DEVICE", "auto")
-        use_flash_attention = _env_bool("ACESTEP_USE_FLASH_ATTENTION", True)
-
-        # Auto-determine offload settings based on GPU config if not explicitly set
-        offload_to_cpu_env = os.getenv("ACESTEP_OFFLOAD_TO_CPU")
-        if offload_to_cpu_env is not None:
-            offload_to_cpu = _env_bool("ACESTEP_OFFLOAD_TO_CPU", False)
-        else:
-            offload_to_cpu = auto_offload
             if auto_offload:
-                print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
+                print(f"[API Server] Auto-enabling CPU offload (GPU < 16GB)")
+            elif gpu_memory_gb > 0:
+                print(f"[API Server] CPU offload disabled by default (GPU >= 16GB)")
+            else:
+                print("[API Server] No GPU detected, running on CPU")
 
-        offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
+            project_root = _get_project_root()
+            config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
+            device = os.getenv("ACESTEP_DEVICE", "auto")
+            use_flash_attention = _env_bool("ACESTEP_USE_FLASH_ATTENTION", True)
 
-        # Checkpoint directory
-        checkpoint_dir = os.path.join(project_root, "checkpoints")
-        os.makedirs(checkpoint_dir, exist_ok=True)
+            # Auto-determine offload settings based on GPU config if not explicitly set
+            offload_to_cpu_env = os.getenv("ACESTEP_OFFLOAD_TO_CPU")
+            if offload_to_cpu_env is not None:
+                offload_to_cpu = _env_bool("ACESTEP_OFFLOAD_TO_CPU", False)
+            else:
+                offload_to_cpu = auto_offload
+                if auto_offload:
+                    print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
 
-        # Download and initialize primary DiT model
-        dit_model_name = _get_model_name(config_path)
-        if dit_model_name:
-            try:
-                _ensure_model_downloaded(dit_model_name, checkpoint_dir)
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to download DiT model: {e}")
+            offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
 
-        # Download VAE model
-        try:
-            _ensure_model_downloaded("vae", checkpoint_dir)
-        except Exception as e:
-            print(f"[API Server] Warning: Failed to download VAE model: {e}")
+            # Checkpoint directory
+            checkpoint_dir = os.path.join(project_root, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-        print(f"[API Server] Loading primary DiT model: {config_path}")
-        status_msg, ok = handler.initialize_service(
-            project_root=project_root,
-            config_path=config_path,
-            device=device,
-            use_flash_attention=use_flash_attention,
-            compile_model=False,
-            offload_to_cpu=offload_to_cpu,
-            offload_dit_to_cpu=offload_dit_to_cpu,
-        )
-        if not ok:
-            app.state._init_error = status_msg
-            print(f"[API Server] ERROR: Primary model failed to load: {status_msg}")
-            raise RuntimeError(status_msg)
-        app.state._initialized = True
-        print(f"[API Server] Primary model loaded: {_get_model_name(config_path)}")
-
-        # Initialize secondary model if configured
-        if handler2 and config_path2:
-            model2_name = _get_model_name(config_path2)
-            if model2_name:
+            # Download and initialize primary DiT model
+            dit_model_name = _get_model_name(config_path)
+            if dit_model_name:
                 try:
-                    _ensure_model_downloaded(model2_name, checkpoint_dir)
+                    _ensure_model_downloaded(dit_model_name, checkpoint_dir)
                 except Exception as e:
-                    print(f"[API Server] Warning: Failed to download secondary model: {e}")
+                    print(f"[API Server] Warning: Failed to download DiT model: {e}")
 
-            print(f"[API Server] Loading secondary DiT model: {config_path2}")
+            # Download VAE model
             try:
-                status_msg2, ok2 = handler2.initialize_service(
-                    project_root=project_root,
-                    config_path=config_path2,
-                    device=device,
-                    use_flash_attention=use_flash_attention,
-                    compile_model=False,
-                    offload_to_cpu=offload_to_cpu,
-                    offload_dit_to_cpu=offload_dit_to_cpu,
-                )
-                app.state._initialized2 = ok2
-                if ok2:
-                    print(f"[API Server] Secondary model loaded: {model2_name}")
-                else:
-                    print(f"[API Server] Warning: Secondary model failed: {status_msg2}")
+                _ensure_model_downloaded("vae", checkpoint_dir)
             except Exception as e:
-                print(f"[API Server] Warning: Failed to initialize secondary model: {e}")
-                app.state._initialized2 = False
+                print(f"[API Server] Warning: Failed to download VAE model: {e}")
 
-        # Initialize third model if configured
-        if handler3 and config_path3:
-            model3_name = _get_model_name(config_path3)
-            if model3_name:
-                try:
-                    _ensure_model_downloaded(model3_name, checkpoint_dir)
-                except Exception as e:
-                    print(f"[API Server] Warning: Failed to download third model: {e}")
-
-            print(f"[API Server] Loading third DiT model: {config_path3}")
-            try:
-                status_msg3, ok3 = handler3.initialize_service(
-                    project_root=project_root,
-                    config_path=config_path3,
-                    device=device,
-                    use_flash_attention=use_flash_attention,
-                    compile_model=False,
-                    offload_to_cpu=offload_to_cpu,
-                    offload_dit_to_cpu=offload_dit_to_cpu,
-                )
-                app.state._initialized3 = ok3
-                if ok3:
-                    print(f"[API Server] Third model loaded: {model3_name}")
-                else:
-                    print(f"[API Server] Warning: Third model failed: {status_msg3}")
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to initialize third model: {e}")
-                app.state._initialized3 = False
-
-        # Initialize LLM model based on GPU configuration
-        # ACESTEP_INIT_LLM controls LLM initialization:
-        #   - "auto" / empty / not set: Use GPU config default (auto-detect)
-        #   - "true"/"1"/"yes": Force enable LLM after GPU config is applied
-        #   - "false"/"0"/"no": Force disable LLM
-        #
-        # Flow: GPU detection → model validation → ACESTEP_INIT_LLM override
-        # This ensures GPU optimizations (offload, quantization, etc.) are always applied.
-        init_llm_env = os.getenv("ACESTEP_INIT_LLM", "").strip().lower()
-
-        # Step 1: Start with GPU auto-detection result
-        init_llm = gpu_config.init_lm_default
-        print(f"[API Server] GPU auto-detection: init_llm={init_llm} (VRAM: {gpu_config.gpu_memory_gb:.1f}GB, tier: {gpu_config.tier})")
-
-        # Step 2: Apply user override if set
-        if not init_llm_env or init_llm_env == "auto":
-            print(f"[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
-        elif init_llm_env in {"1", "true", "yes", "y", "on"}:
-            if init_llm:
-                print(f"[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
-            else:
-                init_llm = True
-                print(f"[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
-        else:
-            if not init_llm:
-                print(f"[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
-            else:
-                init_llm = False
-                print(f"[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
-
-        if init_llm:
-            print("[API Server] Loading LLM model...")
-
-            # Auto-select LM model based on GPU config if not explicitly set
-            lm_model_path_env = os.getenv("ACESTEP_LM_MODEL_PATH", "").strip()
-            if lm_model_path_env:
-                lm_model_path = lm_model_path_env
-                print(f"[API Server] Using user-specified LM model: {lm_model_path}")
-            else:
-                # Get recommended LM model for this GPU tier
-                recommended_lm = get_recommended_lm_model(gpu_config)
-                if recommended_lm:
-                    lm_model_path = recommended_lm
-                    print(f"[API Server] Auto-selected LM model: {lm_model_path} based on GPU tier")
-                else:
-                    # No recommended model (GPU tier too low), default to smallest
-                    lm_model_path = "acestep-5Hz-lm-0.6B"
-                    print(f"[API Server] No recommended model for this GPU tier, using smallest: {lm_model_path}")
-
-            # Validate LM model support (warning only, does not block)
-            is_supported, warning_msg = is_lm_model_supported(lm_model_path, gpu_config)
-            if not is_supported:
-                print(f"[API Server] Warning: {warning_msg}")
-                # Try to fall back to a supported model
-                recommended_lm = get_recommended_lm_model(gpu_config)
-                if recommended_lm:
-                    lm_model_path = recommended_lm
-                    print(f"[API Server] Falling back to supported LM model: {lm_model_path}")
-                else:
-                    # No supported model, but user may have forced init
-                    print(f"[API Server] No GPU-validated LM model available, attempting {lm_model_path} anyway (may cause OOM)")
-
-        if init_llm:
-            lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-            if lm_backend not in {"vllm", "pt", "mlx"}:
-                lm_backend = "vllm"
-            lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
-
-            # Auto-determine LM offload based on GPU config
-            lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
-            if lm_offload_env is not None:
-                lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-            else:
-                lm_offload = offload_to_cpu
-
-            try:
-                _ensure_model_downloaded(lm_model_path, checkpoint_dir)
-            except Exception as e:
-                print(f"[API Server] Warning: Failed to download LLM model: {e}")
-
-            llm_status, llm_ok = llm_handler.initialize(
-                checkpoint_dir=checkpoint_dir,
-                lm_model_path=lm_model_path,
-                backend=lm_backend,
-                device=lm_device,
-                offload_to_cpu=lm_offload,
-                dtype=None,
+            print(f"[API Server] Loading primary DiT model: {config_path}")
+            status_msg, ok = handler.initialize_service(
+                project_root=project_root,
+                config_path=config_path,
+                device=device,
+                use_flash_attention=use_flash_attention,
+                compile_model=False,
+                offload_to_cpu=offload_to_cpu,
+                offload_dit_to_cpu=offload_dit_to_cpu,
             )
-            if llm_ok:
-                app.state._llm_initialized = True
-                print(f"[API Server] LLM model loaded: {lm_model_path}")
-            else:
-                app.state._llm_init_error = llm_status
-                print(f"[API Server] Warning: LLM model failed to load: {llm_status}")
-        else:
-            print("[API Server] Skipping LLM initialization (disabled or not supported for this GPU)")
-            app.state._llm_initialized = False
-            # Disable lazy loading of LLM - don't try to load it later during requests
-            app.state._llm_lazy_load_disabled = True
-            print("[API Server] LLM lazy loading disabled. To enable LLM:")
-            print("[API Server]   - Set ACESTEP_INIT_LLM=true in .env or environment")
-            print("[API Server]   - Or use --init-llm command line flag")
+            if not ok:
+                app.state._init_error = status_msg
+                print(f"[API Server] ERROR: Primary model failed to load: {status_msg}")
+                raise RuntimeError(status_msg)
+            app.state._initialized = True
+            print(f"[API Server] Primary model loaded: {_get_model_name(config_path)}")
 
-        print("[API Server] All models initialized successfully!")
+            # Initialize secondary model if configured
+            if handler2 and config_path2:
+                model2_name = _get_model_name(config_path2)
+                if model2_name:
+                    try:
+                        _ensure_model_downloaded(model2_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download secondary model: {e}")
+
+                print(f"[API Server] Loading secondary DiT model: {config_path2}")
+                try:
+                    status_msg2, ok2 = handler2.initialize_service(
+                        project_root=project_root,
+                        config_path=config_path2,
+                        device=device,
+                        use_flash_attention=use_flash_attention,
+                        compile_model=False,
+                        offload_to_cpu=offload_to_cpu,
+                        offload_dit_to_cpu=offload_dit_to_cpu,
+                    )
+                    app.state._initialized2 = ok2
+                    if ok2:
+                        print(f"[API Server] Secondary model loaded: {model2_name}")
+                    else:
+                        print(f"[API Server] Warning: Secondary model failed: {status_msg2}")
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to initialize secondary model: {e}")
+                    app.state._initialized2 = False
+
+            # Initialize third model if configured
+            if handler3 and config_path3:
+                model3_name = _get_model_name(config_path3)
+                if model3_name:
+                    try:
+                        _ensure_model_downloaded(model3_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download third model: {e}")
+
+                print(f"[API Server] Loading third DiT model: {config_path3}")
+                try:
+                    status_msg3, ok3 = handler3.initialize_service(
+                        project_root=project_root,
+                        config_path=config_path3,
+                        device=device,
+                        use_flash_attention=use_flash_attention,
+                        compile_model=False,
+                        offload_to_cpu=offload_to_cpu,
+                        offload_dit_to_cpu=offload_dit_to_cpu,
+                    )
+                    app.state._initialized3 = ok3
+                    if ok3:
+                        print(f"[API Server] Third model loaded: {model3_name}")
+                    else:
+                        print(f"[API Server] Warning: Third model failed: {status_msg3}")
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to initialize third model: {e}")
+                    app.state._initialized3 = False
+
+            # Initialize LLM model based on GPU configuration
+            # ACESTEP_INIT_LLM controls LLM initialization:
+            #   - "auto" / empty / not set: Use GPU config default (auto-detect)
+            #   - "true"/"1"/"yes": Force enable LLM after GPU config is applied
+            #   - "false"/"0"/"no": Force disable LLM
+            #
+            # Flow: GPU detection → model validation → ACESTEP_INIT_LLM override
+            # This ensures GPU optimizations (offload, quantization, etc.) are always applied.
+            init_llm_env = os.getenv("ACESTEP_INIT_LLM", "").strip().lower()
+
+            # Step 1: Start with GPU auto-detection result
+            init_llm = gpu_config.init_lm_default
+            print(f"[API Server] GPU auto-detection: init_llm={init_llm} (VRAM: {gpu_config.gpu_memory_gb:.1f}GB, tier: {gpu_config.tier})")
+
+            # Step 2: Apply user override if set
+            if not init_llm_env or init_llm_env == "auto":
+                print(f"[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
+            elif init_llm_env in {"1", "true", "yes", "y", "on"}:
+                if init_llm:
+                    print(f"[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
+                else:
+                    init_llm = True
+                    print(f"[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
+            else:
+                if not init_llm:
+                    print(f"[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
+                else:
+                    init_llm = False
+                    print(f"[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
+
+            if init_llm:
+                print("[API Server] Loading LLM model...")
+
+                # Auto-select LM model based on GPU config if not explicitly set
+                lm_model_path_env = os.getenv("ACESTEP_LM_MODEL_PATH", "").strip()
+                if lm_model_path_env:
+                    lm_model_path = lm_model_path_env
+                    print(f"[API Server] Using user-specified LM model: {lm_model_path}")
+                else:
+                    # Get recommended LM model for this GPU tier
+                    recommended_lm = get_recommended_lm_model(gpu_config)
+                    if recommended_lm:
+                        lm_model_path = recommended_lm
+                        print(f"[API Server] Auto-selected LM model: {lm_model_path} based on GPU tier")
+                    else:
+                        # No recommended model (GPU tier too low), default to smallest
+                        lm_model_path = "acestep-5Hz-lm-0.6B"
+                        print(f"[API Server] No recommended model for this GPU tier, using smallest: {lm_model_path}")
+
+                # Validate LM model support (warning only, does not block)
+                is_supported, warning_msg = is_lm_model_supported(lm_model_path, gpu_config)
+                if not is_supported:
+                    print(f"[API Server] Warning: {warning_msg}")
+                    # Try to fall back to a supported model
+                    recommended_lm = get_recommended_lm_model(gpu_config)
+                    if recommended_lm:
+                        lm_model_path = recommended_lm
+                        print(f"[API Server] Falling back to supported LM model: {lm_model_path}")
+                    else:
+                        # No supported model, but user may have forced init
+                        print(f"[API Server] No GPU-validated LM model available, attempting {lm_model_path} anyway (may cause OOM)")
+
+            if init_llm:
+                lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
+                if lm_backend not in {"vllm", "pt", "mlx"}:
+                    lm_backend = "vllm"
+                lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
+
+                # Auto-determine LM offload based on GPU config
+                lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
+                if lm_offload_env is not None:
+                    lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
+                else:
+                    lm_offload = offload_to_cpu
+
+                lm_model_name = _get_model_name(lm_model_path)
+                try:
+                    _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to download LLM model: {e}")
+
+                llm_status, llm_ok = llm_handler.initialize(
+                    checkpoint_dir=checkpoint_dir,
+                    lm_model_path=lm_model_path,
+                    backend=lm_backend,
+                    device=lm_device,
+                    offload_to_cpu=lm_offload,
+                    dtype=None,
+                )
+                if llm_ok:
+                    app.state._llm_initialized = True
+                    print(f"[API Server] LLM model loaded: {lm_model_path}")
+                else:
+                    app.state._llm_init_error = llm_status
+                    print(f"[API Server] Warning: LLM model failed to load: {llm_status}")
+            else:
+                print("[API Server] Skipping LLM initialization (disabled or not supported for this GPU)")
+                app.state._llm_initialized = False
+                # Disable lazy loading of LLM - don't try to load it later during requests
+                app.state._llm_lazy_load_disabled = True
+                print("[API Server] LLM lazy loading disabled. To enable LLM:")
+                print("[API Server]   - Set ACESTEP_INIT_LLM=true in .env or environment")
+                print("[API Server]   - Or use --init-llm command line flag")
+
+            print("[API Server] All models initialized successfully!")
 
         try:
             yield
@@ -4632,6 +4646,13 @@ def main() -> None:
         default=os.getenv("ACESTEP_LM_MODEL_PATH", ""),
         help="LM model to load (e.g., 'acestep-5Hz-lm-0.6B'). Default from ACESTEP_LM_MODEL_PATH.",
     )
+    parser.add_argument(
+        "--no-init",
+        action="store_true",
+        default=_env_bool("ACESTEP_NO_INIT", False),
+        help="Skip model loading at startup (models will be lazy-loaded on first request). "
+             "Can also be set via ACESTEP_NO_INIT=true environment variable.",
+    )
     args = parser.parse_args()
 
     # Set API key from command line argument
@@ -4652,6 +4673,11 @@ def main() -> None:
     if args.lm_model_path:
         os.environ["ACESTEP_LM_MODEL_PATH"] = args.lm_model_path
         print(f"[API Server] Using LM model: {args.lm_model_path}")
+
+    # Set no-init flag
+    if args.no_init:
+        os.environ["ACESTEP_NO_INIT"] = "true"
+        print("[API Server] --no-init: Models will NOT be loaded at startup (lazy load on first request)")
 
     # IMPORTANT: in-memory queue/store -> workers MUST be 1
     uvicorn.run(

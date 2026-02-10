@@ -443,7 +443,7 @@ def create_results_section(dit_handler) -> dict:
             size="sm"
         )
         
-        with gr.Accordion(t("results.batch_results_title"), open=False):
+        with gr.Accordion(t("results.batch_results_title"), open=True):
             generated_audio_batch = gr.File(
                 label=t("results.all_files_label"),
                 file_count="multiple",

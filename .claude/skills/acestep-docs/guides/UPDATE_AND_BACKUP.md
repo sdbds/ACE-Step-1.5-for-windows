@@ -1,114 +1,193 @@
 # Update and Backup Guide
 
-**For Portable Package Users**
+## Overview
 
-This guide is specifically designed for **Windows portable package users** who want to keep their ACE-Step installation up-to-date using Git. If you downloaded the portable package (ACE-Step-1.5.7z), this guide will help you set up automatic update checks and handle configuration conflicts during updates.
+All ACE-Step launch scripts check for updates on startup by default. The update check is a lightweight inline operation that runs before the application starts, ensuring you are always notified about new versions without any manual setup.
 
-> **Note**: If you're using the Git repository with `uv`, you can simply use `git pull` directly. This guide focuses on portable package users who need PortableGit for updates.
+- **Default behavior**: Update checking is enabled (`CHECK_UPDATE=true`) in every launch script.
+- **Platforms supported**: Windows, Linux, and macOS.
+- **Graceful failures**: If git is not installed, the network is unreachable, or the project is not a git repository, the check is silently skipped and the application starts normally.
+- **User control**: You can disable the check at any time by setting `CHECK_UPDATE=false`.
 
 ---
 
-## Git Update Check Feature
+## Update Check Feature
 
-### Overview
+### How It Works
 
-Portable package users can use PortableGit to automatically check for updates from GitHub without needing a full Git installation.
+Each launch script contains a lightweight inline update check that runs before the main application starts. The check does not require any external update service -- it uses git directly to compare your local commit with the remote.
 
-### Requirements
+**Flow:**
 
-1. **PortableGit**: Download from https://git-scm.com/download/win
-   - Extract to `PortableGit\` folder in project root
-   - File location: `PortableGit\bin\git.exe`
-
-2. **Git Repository**: Project must be a valid Git repository
-
-3. **Internet Connection**: Required to check GitHub
-
-### Setup
-
-**1. Install PortableGit**
+```text
+Startup
+  |
+  v
+CHECK_UPDATE=true?  --No--> Skip, start app
+  |
+  Yes
+  v
+Git available?  --No--> Skip, start app
+  |
+  Yes
+  v
+Valid git repo?  --No--> Skip, start app
+  |
+  Yes
+  v
+Fetch origin (10s timeout)  --Timeout/Error--> Skip, start app
+  |
+  Success
+  v
+Compare local HEAD vs origin HEAD
+  |
+  +-- Same commit --> "Already up to date", start app
+  |
+  +-- Different commit --> Show new commits, ask Y/N
+        |
+        +-- N --> Skip, start app
+        |
+        +-- Y --> Run check_update.bat / check_update.sh for full update
+                    |
+                    v
+                  Start app
 ```
+
+At every failure point (no git, no network, not a repo), the check exits gracefully and the application starts without interruption.
+
+### Enabling and Disabling
+
+The update check is controlled by the `CHECK_UPDATE` variable near the top of each launch script.
+
+**Windows** (`start_gradio_ui.bat`, `start_api_server.bat`):
+
+```batch
+REM Update check on startup (set to false to disable)
+set CHECK_UPDATE=true
+REM set CHECK_UPDATE=false
+```
+
+**Linux / macOS** (`start_gradio_ui.sh`, `start_api_server.sh`, `start_gradio_ui_macos.sh`, `start_api_server_macos.sh`):
+
+```bash
+# Update check on startup (set to "false" to disable)
+CHECK_UPDATE="true"
+# CHECK_UPDATE="false"
+```
+
+To disable, change the active line to `false`. To re-enable, change it back to `true`.
+
+### Git Requirements by Platform
+
+The inline update check requires git to be available. How you obtain git depends on your platform.
+
+**Windows:**
+
+- **Option A -- PortableGit** (no installation required): Download from <https://git-scm.com/download/win>, choose the portable version, and extract to a `PortableGit\` folder in the project root. The launch scripts look for `PortableGit\bin\git.exe` first.
+- **Option B -- System git**: Install git through any standard method (Git for Windows installer, winget, scoop, etc.). The launch scripts fall back to system git if PortableGit is not found.
+
+```text
 Project Root/
-├── PortableGit/
+├── PortableGit/          <-- Optional, checked first on Windows
 │   └── bin/
 │       └── git.exe
 ├── start_gradio_ui.bat
+├── check_update.bat
 └── ...
 ```
 
-**2. Enable Update Check**
+**Linux:**
 
-Edit `start_gradio_ui.bat` or `start_api_server.bat`:
-```batch
-REM Update check: true or false
-set CHECK_UPDATE=true
+Install git through your distribution's package manager:
+
+```bash
+# Ubuntu / Debian
+sudo apt install git
+
+# CentOS / RHEL / Fedora
+sudo yum install git
+# or
+sudo dnf install git
+
+# Arch Linux
+sudo pacman -S git
 ```
 
-**3. Run Startup Script**
-```batch
-start_gradio_ui.bat
-```
+**macOS:**
 
-### Update Flow
+Install git through Xcode command-line tools or Homebrew:
 
-```
-1. Startup script runs
-   ↓
-2. Checks if CHECK_UPDATE=true
-   ↓
-3. Connects to GitHub (10 second timeout)
-   ↓
-4. Compares local vs remote version
-   ↓
-5a. Up to date → Continue startup
-5b. Update available → Prompt user
-5c. Timeout/error → Skip check, continue startup
+```bash
+# Xcode command-line tools (includes git)
+xcode-select --install
+
+# Or via Homebrew
+brew install git
 ```
 
 ### Example Output
 
-**Already up to date**:
-```
-========================================
-ACE-Step Update Check
-========================================
+**Already up to date:**
 
-[1/4] Checking current version...
-  Branch: main
-  Commit: a1b2c3d
-
-[2/4] Checking for updates (timeout: 10s)...
-  [Success] Fetched latest information from GitHub.
-
-[3/4] Comparing versions...
-  Local:  a1b2c3d
-  Remote: a1b2c3d
-
-[4/4] Result: Already up to date!
+```text
+[Update] Checking for updates...
+[Update] Already up to date (abc1234).
 
 Starting ACE-Step Gradio Web UI...
 ```
 
-**Update available**:
-```
-[4/4] Result: Update available!
-  A new version is available on GitHub.
+**Update available:**
 
-  New commits:
-  * e4f5g6h Fix audio processing bug
-  * c3d4e5f Add new model support
+```text
+[Update] Checking for updates...
 
-Do you want to update now? (Y/N):
+========================================
+  Update available!
+========================================
+  Current: abc1234  ->  Latest: def5678
+
+  Recent changes:
+* def5678 Fix audio processing bug
+* ccc3333 Add new model support
+
+Update now before starting? (Y/N):
 ```
 
-**Network timeout (auto-skip)**:
-```
-[2/4] Checking for updates (timeout: 10s)...
-  [Timeout] Could not connect to GitHub within 10 seconds.
-  Skipping update check.
+If you choose **Y**, the script delegates to `check_update.bat` (Windows) or `check_update.sh` (Linux/macOS) for the full update process including backup handling. If you choose **N**, the update is skipped and the application starts with the current version.
 
-Continuing with startup...
+**Network unreachable (auto-skip):**
+
+```text
+[Update] Checking for updates...
+[Update] Network unreachable, skipping.
+
+Starting ACE-Step Gradio Web UI...
 ```
+
+---
+
+## Manual Update
+
+You can run the update check manually at any time, outside of the launch scripts.
+
+**Windows:**
+
+```batch
+check_update.bat
+```
+
+**Linux / macOS:**
+
+```bash
+./check_update.sh
+```
+
+The manual update scripts perform the same 4-step process:
+
+1. Detect git and verify the repository
+2. Fetch from origin with a 10-second timeout
+3. Compare local and remote commits
+4. If an update is available, prompt to apply it (with automatic backup of conflicting files)
 
 ---
 
@@ -116,76 +195,110 @@ Continuing with startup...
 
 ### Automatic Backup
 
-When updating, if you modified files that were also updated remotely, ACE-Step automatically creates a backup.
+When you choose to update and you have locally modified files that also changed on the remote, ACE-Step automatically creates a backup before applying the update.
 
-**Supported file types**:
-- Configuration files: `.bat`, `.yaml`, `.json`, `.ini`
+**Supported file types** (any modified text file is backed up):
+
+- Configuration files: `.bat`, `.sh`, `.yaml`, `.json`, `.ini`
 - Python code: `.py`
 - Documentation: `.md`, `.txt`
-- Any modified text files
 
 ### Backup Process
 
-```
-1. Update check detects conflicts
-   (Local modified + Remote modified)
-   ↓
-2. Creates backup directory
+```text
+1. Update detects locally modified files
+   that also changed on the remote
+   |
+   v
+2. Creates a timestamped backup directory
    .update_backup_YYYYMMDD_HHMMSS/
-   ↓
-3. Backs up conflicting files
-   (Preserves directory structure)
-   ↓
-4. Restores files to remote version
-   ↓
-5. Executes git pull
-   ↓
-6. Shows backup location
+   |
+   v
+3. Copies conflicting files into the backup
+   (preserves directory structure)
+   |
+   v
+4. Resets working tree to the remote version
+   |
+   v
+5. Displays backup location and instructions
 ```
 
-### Example Backup
+### Example
 
-**Your modifications**:
-- `start_gradio_ui.bat` - Changed language to Chinese
-- `acestep/handler.py` - Added debug logging
-- `config.yaml` - Changed model path
+**Your local modifications:**
 
-**Remote updates**:
-- `start_gradio_ui.bat` - Added new features
-- `acestep/handler.py` - Bug fixes
-- `config.yaml` - New parameters
+- `start_gradio_ui.bat` -- Changed language to Chinese
+- `acestep/handler.py` -- Added debug logging
+- `config.yaml` -- Changed model path
 
-**Backup created**:
-```
+**Remote updates:**
+
+- `start_gradio_ui.bat` -- Added new features
+- `acestep/handler.py` -- Bug fixes
+- `config.yaml` -- New parameters
+
+**Backup created:**
+
+```text
 .update_backup_20260205_143022/
-├── start_gradio_ui.bat      (your version)
-├── config.yaml              (your version)
+├── start_gradio_ui.bat          (your version)
+├── config.yaml                  (your version)
 └── acestep/
-    └── handler.py           (your version)
+    └── handler.py               (your version)
 ```
 
-**Current files** (after update):
-```
-start_gradio_ui.bat      (new version from GitHub)
-config.yaml              (new version from GitHub)
+**Working tree after update:**
+
+```text
+start_gradio_ui.bat              (new version from GitHub)
+config.yaml                      (new version from GitHub)
 acestep/
-└── handler.py           (new version from GitHub)
+└── handler.py                   (new version from GitHub)
 ```
+
+Your original files are preserved in the backup directory so you can merge your changes back in.
 
 ---
 
 ## Merging Configurations
 
-### Using merge_config.bat
+After an update that backed up your files, use the merge helper to compare and restore your settings.
 
-Run the merge helper script:
+### Windows: merge_config.bat
+
 ```batch
 merge_config.bat
 ```
 
-**Menu Options**:
+When comparing files, this script opens two Notepad windows side by side -- one with the backup version and one with the current version -- so you can manually copy your settings across.
 
+### Linux / macOS: merge_config.sh
+
+```bash
+./merge_config.sh
 ```
+
+When comparing files, this script uses `colordiff` (if installed) or `diff` to display a unified diff in the terminal, showing exactly what changed between your backed-up version and the new version.
+
+To install colordiff for colored output:
+
+```bash
+# Ubuntu / Debian
+sudo apt install colordiff
+
+# macOS (Homebrew)
+brew install colordiff
+
+# Arch Linux
+sudo pacman -S colordiff
+```
+
+### Menu Options (Both Platforms)
+
+Both `merge_config.bat` and `merge_config.sh` present the same interactive menu:
+
+```text
 ========================================
 ACE-Step Backup Merge Helper
 ========================================
@@ -197,95 +310,30 @@ ACE-Step Backup Merge Helper
 5. Exit
 ```
 
-### Option 1: Compare Files
+| Option | Description |
+|--------|-------------|
+| **1. Compare** | Show differences between your backup and the current (updated) file. On Windows this opens two Notepad windows. On Linux/macOS this prints a unified diff to the terminal. |
+| **2. Restore** | Copy a file from the backup back into the project, overwriting the updated version. Use this only if the new version causes problems. |
+| **3. List** | Display all files stored in backup directories. |
+| **4. Delete** | Permanently remove old backup directories. Only do this after you have finished merging. |
 
-**Best for**: Manually merging changes
+### Merging Common Files
 
-**Steps**:
-1. Select backup directory
-2. Enter filename (e.g., `start_gradio_ui.bat` or `acestep\handler.py`)
-3. Two Notepad windows open side-by-side
-4. Copy your settings from backup to new version
+**Launch scripts** (`start_gradio_ui.bat`, `start_gradio_ui.sh`, etc.):
 
-**Example**:
-```
-Files in backup:
-  - start_gradio_ui.bat
-  - config.yaml
-  - acestep\handler.py
+Look for your custom settings in the backup (language, port, download source, etc.) and copy them into the corresponding lines of the new version.
 
-Enter filename to compare: start_gradio_ui.bat
-
-Opening files for comparison...
-Backup:  .update_backup_20260205_143022\start_gradio_ui.bat
-Current: start_gradio_ui.bat
+```bash
+# Example settings you may want to preserve:
+LANGUAGE="zh"
+PORT=8080
+DOWNLOAD_SOURCE="--download-source modelscope"
 ```
 
-### Option 2: Restore File
+**Configuration files** (`config.yaml`, `.json`):
 
-**Best for**: Completely reverting to your version
+Compare the structures. Keep your custom values, add any new keys from the updated version.
 
-**Warning**: Overwrites current file, loses GitHub updates
-
-**Use only if**: New version has issues or you need old settings
-
-### Option 3: List Files
-
-**Shows**: All backed up files with directory structure
-
-### Option 4: Delete Backups
-
-**Warning**: Permanent deletion
-
-**Only use after**: Successfully merging all configurations
-
----
-
-## Merging Common Files
-
-### start_gradio_ui.bat
-
-**Your settings to preserve**:
-```batch
-set LANGUAGE=zh              # Your language preference
-set DOWNLOAD_SOURCE=--download-source modelscope  # Your download source
-set PORT=8080                # Your custom port
-```
-
-**How to merge**:
-1. Open both versions (Option 1 in merge_config.bat)
-2. Find your custom settings in backup
-3. Copy them to the new version
-4. Save new version
-
-### Python Files
-
-**Example**: `acestep/handler.py`
-
-**Your changes**:
-```python
-# Added debug logging
-logger.setLevel(logging.DEBUG)
-```
-
-**New version changes**:
-```python
-# Bug fix for audio processing
-def process_audio(file):
-    # ... new implementation
-```
-
-**Merge**:
-1. Identify your changes in backup
-2. Identify new changes in current version
-3. Manually combine both changes
-4. Test functionality
-
-### Configuration Files (YAML/JSON)
-
-**Example**: `config.yaml`
-
-**Compare structure**:
 ```yaml
 # Backup (your version)
 model_path: "custom/path"
@@ -294,228 +342,56 @@ custom_setting: true
 # Current (new version)
 model_path: "default/path"
 new_feature: enabled
-```
 
-**Merge**:
-```yaml
-# Final version
-model_path: "custom/path"      # Keep your setting
-custom_setting: true            # Keep your setting
-new_feature: enabled            # Add new feature
-```
-
----
-
-## Best Practices
-
-### Before Updating
-
-1. **Note your changes**:
-   ```batch
-   REM Remember what you modified:
-   REM - Changed LANGUAGE to zh
-   REM - Changed PORT to 8080
-   REM - Set DOWNLOAD_SOURCE to modelscope
-   ```
-
-2. **Backup important files manually** (optional):
-   ```batch
-   copy start_gradio_ui.bat my_config_backup.bat
-   ```
-
-### After Updating
-
-1. **Check backup directory**:
-   ```batch
-   dir /b .update_backup_*
-   ```
-
-2. **Review each file** using merge_config.bat
-
-3. **Test application** after merging
-
-4. **Delete backups** after confirming everything works
-
-### If Update Fails
-
-**Rollback to previous version**:
-```batch
-cd PortableGit\bin
-git log --oneline
-# Note the commit hash before update
-
-# Rollback
-git reset --hard <commit-hash>
-```
-
----
-
-## Troubleshooting
-
-### PortableGit not found
-
-**Solution**: Download and extract to `PortableGit\` folder
-- https://git-scm.com/download/win
-- Choose "Portable" version
-
-### Update check timeout
-
-**Normal behavior**: Automatically skips after 10 seconds
-
-**To disable**:
-```batch
-set CHECK_UPDATE=false
-```
-
-### Network issues / Cannot access GitHub
-
-**If you're behind a firewall or need to use a proxy**, configure proxy using `proxy_config.txt`:
-
-**Method 1: Create proxy_config.txt (Recommended)**
-
-Create a file named `proxy_config.txt` in the project root directory with the following content:
-
-```
-PROXY_ENABLED=1
-PROXY_URL=http://127.0.0.1:7890
-```
-
-**Common proxy examples:**
-
-1. **V2Ray/Clash (Local SOCKS5)**:
-   ```
-   PROXY_ENABLED=1
-   PROXY_URL=socks5://127.0.0.1:1080
-   ```
-
-2. **Corporate HTTP Proxy**:
-   ```
-   PROXY_ENABLED=1
-   PROXY_URL=http://proxy.company.com:8080
-   ```
-
-3. **HTTP Proxy with port**:
-   ```
-   PROXY_ENABLED=1
-   PROXY_URL=http://127.0.0.1:7890
-   ```
-
-**To disable proxy:**
-```
-PROXY_ENABLED=0
-PROXY_URL=
-```
-
-**Method 2: Run check_update.bat with proxy argument**
-
-```batch
-# Configure proxy interactively
-check_update.bat proxy
-
-# Follow the prompts to enter proxy URL
-# Examples shown:
-#   - HTTP proxy:  http://127.0.0.1:7890
-#   - HTTPS proxy: https://proxy.example.com:8080
-#   - SOCKS5:      socks5://127.0.0.1:1080
-```
-
-**Verify proxy configuration:**
-
-After setting up proxy, run update check to test:
-```batch
-check_update.bat
-```
-
-You should see:
-```
-[Proxy] Using proxy server: http://127.0.0.1:7890
-```
-
-**Alternative**: If proxy doesn't work, disable update check:
-```batch
-set CHECK_UPDATE=false
-```
-
-### Merge conflicts
-
-**Solution**: Use merge_config.bat Option 1 to compare files manually
-
-### Lost configuration
-
-**Solution**:
-1. Find backup: `dir /b .update_backup_*`
-2. Use merge_config.bat Option 2 to restore
-3. Or manually copy settings from backup
-
----
-
-## Quick Reference
-
-**Enable updates**:
-```batch
-set CHECK_UPDATE=true
-```
-
-**Manual update check**:
-```batch
-check_update.bat
-```
-
-**Configure proxy**:
-```batch
-check_update.bat proxy
-```
-
-**Test update functionality**:
-```batch
-test_git_update.bat
-```
-
-**Merge configurations**:
-```batch
-merge_config.bat
-```
-
-**List backups**:
-```batch
-dir /b .update_backup_*
-```
-
-**Delete old backups**:
-```batch
-rmdir /s /q .update_backup_YYYYMMDD_HHMMSS
+# Merged result
+model_path: "custom/path"       # Keep your setting
+custom_setting: true             # Keep your setting
+new_feature: enabled             # Add new feature
 ```
 
 ---
 
 ## Testing Update Functionality
 
-Use `test_git_update.bat` to verify your update setup before using it.
+Use the test scripts to verify that your git setup and update mechanism are working correctly before relying on them.
 
-### Running the Test
+**Windows:**
 
 ```batch
 test_git_update.bat
 ```
 
-### Test Output Example
+**Linux / macOS:**
 
+```bash
+./test_git_update.sh
 ```
+
+### What the Tests Check
+
+1. **Git availability**: Verifies that git can be found (PortableGit or system git on Windows; system git on Linux/macOS).
+2. **Repository validity**: Confirms the project directory is a valid git repository.
+3. **Update script presence**: Checks that `check_update.bat` / `check_update.sh` exists.
+4. **Network connectivity**: Attempts an actual fetch from the remote (with timeout).
+
+### Example Test Output
+
+```text
 ========================================
 Test Git Update Check
 ========================================
 
-[Test 1] Checking PortableGit...
-[PASS] PortableGit found
-git version 2.43.0.windows.1
+[Test 1] Checking Git...
+[PASS] Git found
+git version 2.43.0
 
 [Test 2] Checking git repository...
 [PASS] Valid git repository
   Branch: main
   Commit: a1b2c3d
 
-[Test 3] Checking check_update.bat...
-[PASS] check_update.bat found
+[Test 3] Checking update script...
+[PASS] check_update.sh found
 
 [Test 4] Running update check...
 [PASS] Update check completed successfully
@@ -523,23 +399,98 @@ git version 2.43.0.windows.1
 [PASS] All tests completed
 ```
 
-### What the Test Checks
+---
 
-1. **PortableGit Installation**: Verifies `PortableGit\bin\git.exe` exists
-2. **Git Repository**: Confirms project is a valid Git repository
-3. **Update Script**: Checks `check_update.bat` exists
-4. **Network Connectivity**: Attempts actual update check (with timeout)
+## Troubleshooting
 
-### If Test Fails
+### Git not found
 
-**Test 1 Failed** - PortableGit not found:
-- Download from https://git-scm.com/download/win
-- Extract to `PortableGit\` folder
+The update check is silently skipped if git is not available. To enable it, install git for your platform:
 
-**Test 2 Failed** - Not a git repository:
-- Use Git repository version instead of portable package
-- Or initialize Git: See "Setup" section above
+| Platform | Install Command |
+|----------|----------------|
+| **Windows (PortableGit)** | Download from <https://git-scm.com/download/win> and extract to `PortableGit\` in the project root |
+| **Windows (system)** | `winget install --id Git.Git -e` or use the Git for Windows installer |
+| **Ubuntu / Debian** | `sudo apt install git` |
+| **CentOS / RHEL** | `sudo yum install git` |
+| **Arch Linux** | `sudo pacman -S git` |
+| **macOS** | `xcode-select --install` or `brew install git` |
 
-**Test 4 Failed** - Network timeout:
-- Configure proxy: See "Network issues" section above
-- Or acceptable if GitHub is not accessible (update will skip automatically)
+### Network timeout
+
+The fetch operation has a 10-second timeout. If it times out, the update check is skipped automatically and the application starts normally. This is expected behavior on slow or restricted networks.
+
+On macOS, the timeout mechanism uses `gtimeout` from GNU coreutils if available, or falls back to a plain fetch without a timeout. To get proper timeout support:
+
+```bash
+brew install coreutils
+```
+
+### Proxy configuration
+
+**Windows (`check_update.bat`):**
+
+Create a `proxy_config.txt` file in the project root:
+
+```text
+PROXY_ENABLED=1
+PROXY_URL=http://127.0.0.1:7890
+```
+
+Or configure interactively:
+
+```batch
+check_update.bat proxy
+```
+
+Common proxy formats:
+
+| Type | Example |
+|------|---------|
+| HTTP proxy | `http://127.0.0.1:7890` |
+| HTTPS proxy | `https://proxy.company.com:8080` |
+| SOCKS5 proxy | `socks5://127.0.0.1:1080` |
+
+To disable the proxy, set `PROXY_ENABLED=0` in `proxy_config.txt`.
+
+**Linux / macOS:**
+
+Set standard environment variables before running the script:
+
+```bash
+export http_proxy="http://127.0.0.1:7890"
+export https_proxy="http://127.0.0.1:7890"
+./check_update.sh
+```
+
+Or add them to your shell profile (`~/.bashrc`, `~/.zshrc`) for persistence.
+
+### Merge conflicts
+
+If the automatic update fails or produces unexpected results:
+
+1. Check for backup directories: look for `.update_backup_*` folders in the project root.
+2. Use the merge helper (`merge_config.bat` or `./merge_config.sh`) to compare and restore files.
+3. If needed, manually inspect the diff between your backup and the current files.
+
+### Lost configuration after update
+
+1. Find your backup:
+   - **Windows:** `dir /b .update_backup_*`
+   - **Linux / macOS:** `ls -d .update_backup_*`
+2. Use the merge helper (Option 2) to restore specific files, or manually copy settings from the backup.
+
+---
+
+## Quick Reference
+
+| Action | Windows | Linux / macOS |
+|--------|---------|---------------|
+| **Enable update check** | `set CHECK_UPDATE=true` (in `.bat`) | `CHECK_UPDATE="true"` (in `.sh`) |
+| **Disable update check** | `set CHECK_UPDATE=false` (in `.bat`) | `CHECK_UPDATE="false"` (in `.sh`) |
+| **Manual update** | `check_update.bat` | `./check_update.sh` |
+| **Configure proxy** | `check_update.bat proxy` or edit `proxy_config.txt` | `export http_proxy=... && ./check_update.sh` |
+| **Merge configurations** | `merge_config.bat` | `./merge_config.sh` |
+| **Test update setup** | `test_git_update.bat` | `./test_git_update.sh` |
+| **List backups** | `dir /b .update_backup_*` | `ls -d .update_backup_*` |
+| **Delete a backup** | `rmdir /s /q .update_backup_YYYYMMDD_HHMMSS` | `rm -rf .update_backup_YYYYMMDD_HHMMSS` |

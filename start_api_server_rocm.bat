@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-REM ACE-Step Gradio Web UI Launcher - AMD ROCm 7.2
+REM ACE-Step REST API Server Launcher - AMD ROCm 7.2
 REM For AMD RX 7000/6000 series GPUs on Windows 11
 REM Requires: Python 3.12, ROCm PyTorch from repo.radeon.com
 
@@ -24,47 +24,38 @@ REM HuggingFace tokenizer parallelism
 set TOKENIZERS_PARALLELISM=false
 
 REM ==================== Server Configuration ====================
-set PORT=7860
-set SERVER_NAME=127.0.0.1
-REM set SERVER_NAME=0.0.0.0
-REM set SHARE=--share
-
-REM UI language: en, zh, ja
-set LANGUAGE=en
+set HOST=127.0.0.1
+REM set HOST=0.0.0.0
+set PORT=8001
 
 REM ==================== Model Configuration ====================
-set CONFIG_PATH=--config_path acestep-v15-turbo
-set LM_MODEL_PATH=--lm_model_path acestep-5Hz-lm-4B
-
-REM CPU offload: required for 4B LM on GPUs with <=20GB VRAM
-REM Models shuttle between CPU/GPU as needed (DiT stays on GPU, LM/VAE/text_encoder move on demand)
-REM Adds ~8-10s overhead per generation but prevents VRAM oversubscription
-REM Disable if using 1.7B/0.6B LM or if your GPU has >=24GB VRAM
-set OFFLOAD_TO_CPU=--offload_to_cpu true
-
-REM LLM initialization: auto (default), true, false
-REM set INIT_LLM=--init_llm auto
+REM API key for authentication (optional)
+REM set API_KEY=--api-key sk-your-secret-key
 
 REM Download source: auto, huggingface, modelscope
 set DOWNLOAD_SOURCE=
 
-REM Auto-initialize models on startup
-set INIT_SERVICE=--init_service true
+REM LLM (Language Model) initialization settings
+REM By default, LLM is auto-enabled/disabled based on GPU VRAM:
+REM   - <=6GB VRAM: LLM disabled (DiT-only mode)
+REM   - >6GB VRAM: LLM enabled
+REM Values: auto (default), true (force enable), false (force disable)
+set ACESTEP_INIT_LLM=auto
+REM set ACESTEP_INIT_LLM=true
+REM set ACESTEP_INIT_LLM=false
 
-REM LM backend: pt (PyTorch) recommended for ROCm
-set BACKEND=--backend pt
-
-REM API settings
-REM set ENABLE_API=--enable-api
-REM set API_KEY=--api-key sk-your-secret-key
-
-REM Authentication
-REM set AUTH_USERNAME=--auth-username admin
-REM set AUTH_PASSWORD=--auth-password password
+REM LM model path (optional, only used when LLM is enabled)
+REM Available models: acestep-5Hz-lm-0.6B, acestep-5Hz-lm-1.7B, acestep-5Hz-lm-4B
+REM set LM_MODEL_PATH=--lm-model-path acestep-5Hz-lm-0.6B
 
 REM Update check on startup (set to false to disable)
 set CHECK_UPDATE=true
 REM set CHECK_UPDATE=false
+
+REM Skip model loading at startup (models will be lazy-loaded on first request)
+REM Set to true to start server quickly without loading models
+REM set ACESTEP_NO_INIT=false
+REM set ACESTEP_NO_INIT=true
 
 REM ==================== Venv Configuration ====================
 REM Path to the ROCm virtual environment (relative to this script)
@@ -144,7 +135,7 @@ echo.
 :SkipUpdateCheck
 
 echo ============================================
-echo   ACE-Step 1.5 - AMD ROCm 7.2 Edition
+echo   ACE-Step 1.5 API - AMD ROCm 7.2 Edition
 echo ============================================
 echo.
 
@@ -173,26 +164,18 @@ if !ERRORLEVEL! NEQ 0 (
 )
 echo.
 
-echo Starting ACE-Step Gradio Web UI...
-echo Server will be available at: http://%SERVER_NAME%:%PORT%
+echo Starting ACE-Step REST API Server...
+echo API will be available at: http://%HOST%:%PORT%
+echo API Documentation: http://%HOST%:%PORT%/docs
 echo.
 
 REM Build command with optional parameters
-set "CMD=--port %PORT% --server-name %SERVER_NAME% --language %LANGUAGE%"
-if not "%SHARE%"=="" set "CMD=!CMD! %SHARE%"
-if not "%CONFIG_PATH%"=="" set "CMD=!CMD! %CONFIG_PATH%"
-if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
-if not "%OFFLOAD_TO_CPU%"=="" set "CMD=!CMD! %OFFLOAD_TO_CPU%"
-if not "%INIT_LLM%"=="" set "CMD=!CMD! %INIT_LLM%"
-if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
-if not "%INIT_SERVICE%"=="" set "CMD=!CMD! %INIT_SERVICE%"
-if not "%BACKEND%"=="" set "CMD=!CMD! %BACKEND%"
-if not "%ENABLE_API%"=="" set "CMD=!CMD! %ENABLE_API%"
+set "CMD=--host %HOST% --port %PORT%"
 if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
-if not "%AUTH_USERNAME%"=="" set "CMD=!CMD! %AUTH_USERNAME%"
-if not "%AUTH_PASSWORD%"=="" set "CMD=!CMD! %AUTH_PASSWORD%"
+if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
+if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
 
-python -u acestep\acestep_v15_pipeline.py !CMD!
+python -u acestep\api_server.py !CMD!
 
 pause
 endlocal

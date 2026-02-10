@@ -215,10 +215,13 @@ if "%REMOTE_COMMIT%"=="" (
         )
     ) else (
         echo.
-        echo   Continuing with current branch comparison...
-        echo   Note: This comparison may not reflect official updates.
+        echo   Staying on branch '%CURRENT_BRANCH%'. No update performed.
         echo.
-        set CURRENT_BRANCH=!FALLBACK_BRANCH!
+        echo ========================================
+        echo Press any key to close...
+        echo ========================================
+        pause >nul
+        exit /b 0
     )
 )
 
@@ -368,6 +371,79 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                 )
             )
 
+            REM Check for untracked files that could be overwritten
+            set STASHED_UNTRACKED=0
+            set TEMP_UNTRACKED=%TEMP%\acestep_untracked_%RANDOM%.txt
+            "!GIT_PATH!" ls-files --others --exclude-standard 2>nul > "!TEMP_UNTRACKED!"
+
+            REM Check if there are any untracked files
+            set HAS_UNTRACKED=0
+            for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do (
+                set HAS_UNTRACKED=1
+                goto :CheckUntrackedConflicts
+            )
+            :CheckUntrackedConflicts
+
+            if !HAS_UNTRACKED! EQU 1 (
+                REM Get files added in remote
+                set TEMP_REMOTE_ADDED=%TEMP%\acestep_remote_added_%RANDOM%.txt
+                "!GIT_PATH!" diff --name-only --diff-filter=A HEAD..origin/%CURRENT_BRANCH% 2>nul > "!TEMP_REMOTE_ADDED!"
+
+                set HAS_UNTRACKED_CONFLICTS=0
+                for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do (
+                    findstr /x /c:"%%u" "!TEMP_REMOTE_ADDED!" >nul 2>&1
+                    if !ERRORLEVEL! EQU 0 (
+                        if !HAS_UNTRACKED_CONFLICTS! EQU 0 (
+                            echo.
+                            echo ========================================
+                            echo [Warning] Untracked files conflict with update!
+                            echo ========================================
+                            echo.
+                            echo The following untracked files would be overwritten:
+                        )
+                        set HAS_UNTRACKED_CONFLICTS=1
+                        echo   %%u
+                    )
+                )
+
+                del "!TEMP_REMOTE_ADDED!" >nul 2>&1
+
+                if !HAS_UNTRACKED_CONFLICTS! EQU 1 (
+                    echo.
+                    set /p STASH_UNTRACKED_CHOICE="Stash untracked files before updating? (Y/N): "
+                    if /i "!STASH_UNTRACKED_CHOICE!"=="Y" (
+                        echo Stashing all changes including untracked files...
+                        "!GIT_PATH!" stash push --include-untracked -m "pre-update-%RANDOM%" >nul 2>&1
+                        if !ERRORLEVEL! EQU 0 (
+                            set STASHED_UNTRACKED=1
+                            echo [Stash] Changes stashed successfully.
+                        ) else (
+                            echo [Error] Failed to stash changes. Update aborted.
+                            del "!TEMP_UNTRACKED!" >nul 2>&1
+                            echo.
+                            echo ========================================
+                            echo Press any key to close...
+                            echo ========================================
+                            pause >nul
+                            exit /b 1
+                        )
+                    ) else (
+                        echo.
+                        echo Update cancelled. Please move or remove the conflicting files manually.
+                        del "!TEMP_UNTRACKED!" >nul 2>&1
+                        echo.
+                        echo ========================================
+                        echo Press any key to close...
+                        echo ========================================
+                        pause >nul
+                        exit /b 1
+                    )
+                    echo.
+                )
+            )
+
+            del "!TEMP_UNTRACKED!" >nul 2>&1
+
             REM Pull changes
             echo Pulling latest changes...
             REM Force update by resetting to remote branch (discards any remaining local changes)
@@ -402,6 +478,16 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                     )
                 )
 
+                if !STASHED_UNTRACKED! EQU 1 (
+                    echo [Stash] Untracked files were stashed before the update.
+                    echo   To restore them:  git stash pop
+                    echo   To discard them:  git stash drop
+                    echo.
+                    echo   Note: 'git stash pop' may produce merge conflicts if
+                    echo   the update modified the same files. Resolve manually.
+                    echo.
+                )
+
                 echo Please restart the application to use the new version.
                 echo.
                 echo ========================================
@@ -413,6 +499,17 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
                 echo.
                 echo [Error] Update failed.
                 echo Please check the error messages above.
+
+                if !STASHED_UNTRACKED! EQU 1 (
+                    echo.
+                    echo [Stash] Restoring stashed changes...
+                    "!GIT_PATH!" stash pop >nul 2>&1
+                    if !ERRORLEVEL! EQU 0 (
+                        echo [Stash] Changes restored successfully.
+                    ) else (
+                        echo [Stash] Could not auto-restore. Run 'git stash pop' manually.
+                    )
+                )
 
                 REM If backup exists, mention it
                 if defined BACKUP_DIR (

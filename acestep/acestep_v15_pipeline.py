@@ -37,6 +37,7 @@ try:
     from .dataset_handler import DatasetHandler
     from .gradio_ui import create_gradio_interface
     from .gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB
+    from .model_downloader import ensure_lm_model
 except ImportError:
     # When executed as a script: `python acestep/acestep_v15_pipeline.py`
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +48,7 @@ except ImportError:
     from acestep.dataset_handler import DatasetHandler
     from acestep.gradio_ui import create_gradio_interface
     from acestep.gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB
+    from acestep.model_downloader import ensure_lm_model
 
 
 def create_demo(init_params=None, language='en'):
@@ -280,6 +282,22 @@ def main():
                 
                 if args.init_llm and args.lm_model_path:
                     checkpoint_dir = os.path.join(project_root, "checkpoints")
+
+                    # Ensure LM model is downloaded before initialization
+                    prefer_source = None
+                    if args.download_source and args.download_source != "auto":
+                        prefer_source = args.download_source
+                    try:
+                        dl_ok, dl_msg = ensure_lm_model(
+                            model_name=args.lm_model_path,
+                            checkpoints_dir=checkpoint_dir,
+                            prefer_source=prefer_source,
+                        )
+                        if not dl_ok:
+                            print(f"Warning: LM model download failed: {dl_msg}", file=sys.stderr)
+                    except Exception as e:
+                        print(f"Warning: Failed to download LM model: {e}", file=sys.stderr)
+
                     print(f"Initializing 5Hz LM: {args.lm_model_path} on {args.device}...")
                     lm_status, lm_success = llm_handler.initialize(
                         checkpoint_dir=checkpoint_dir,

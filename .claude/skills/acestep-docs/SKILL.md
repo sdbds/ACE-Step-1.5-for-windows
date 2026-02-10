@@ -23,9 +23,9 @@ Documentation skill for ACE-Step music generation system.
 | [GRADIO_GUIDE.md](guides/GRADIO_GUIDE.md) | Web UI usage guide |
 | [INFERENCE.md](guides/INFERENCE.md) | Inference parameters tuning |
 | [GPU_COMPATIBILITY.md](guides/GPU_COMPATIBILITY.md) | GPU/VRAM configuration, hardware recommendations |
-| [ENVIRONMENT_SETUP.md](guides/ENVIRONMENT_SETUP.md) | Environment detection, uv installation, python_embeded setup |
-| [BAT_CONFIGURATION.md](guides/BAT_CONFIGURATION.md) | Configuring startup scripts (language, port, download source, etc.) |
-| [UPDATE_AND_BACKUP.md](guides/UPDATE_AND_BACKUP.md) | **For portable package users**: Git updates, file backup, conflict resolution |
+| [ENVIRONMENT_SETUP.md](guides/ENVIRONMENT_SETUP.md) | Environment detection, uv installation, python_embeded setup (Windows/Linux/macOS) |
+| [SCRIPT_CONFIGURATION.md](guides/SCRIPT_CONFIGURATION.md) | Configuring launch scripts: .bat (Windows) and .sh (Linux/macOS) |
+| [UPDATE_AND_BACKUP.md](guides/UPDATE_AND_BACKUP.md) | Git updates, file backup, conflict resolution (all platforms) |
 
 ### API (for developers)
 | Document | Description |
@@ -42,19 +42,19 @@ Documentation skill for ACE-Step music generation system.
 5. Inference parameter tuning → read [guides/INFERENCE.md](guides/INFERENCE.md)
 6. GPU/VRAM issues → read [guides/GPU_COMPATIBILITY.md](guides/GPU_COMPATIBILITY.md)
 7. Environment setup (uv, python_embeded) → read [guides/ENVIRONMENT_SETUP.md](guides/ENVIRONMENT_SETUP.md)
-8. BAT file configuration → read [guides/BAT_CONFIGURATION.md](guides/BAT_CONFIGURATION.md)
-9. Portable package updates and backup → read [guides/UPDATE_AND_BACKUP.md](guides/UPDATE_AND_BACKUP.md)
+8. Launch script configuration (.bat/.sh) → read [guides/SCRIPT_CONFIGURATION.md](guides/SCRIPT_CONFIGURATION.md)
+9. Updates and backup → read [guides/UPDATE_AND_BACKUP.md](guides/UPDATE_AND_BACKUP.md)
 10. API development → read [api/API.md](api/API.md) or [api/Openrouter_API.md](api/Openrouter_API.md)
 
 ## Common Issues
 
 - **Installation problems**: See getting-started/README.md
 - **VRAM insufficient**: See guides/GPU_COMPATIBILITY.md
-- **Model download failed**: See getting-started/README.md or guides/BAT_CONFIGURATION.md
+- **Model download failed**: See getting-started/README.md or guides/SCRIPT_CONFIGURATION.md
 - **uv not found**: See guides/ENVIRONMENT_SETUP.md
 - **Environment detection issues**: See guides/ENVIRONMENT_SETUP.md
-- **BAT file configuration**: See guides/BAT_CONFIGURATION.md
-- **Portable package update issues**: See guides/UPDATE_AND_BACKUP.md
-- **Update conflicts (portable package)**: See guides/UPDATE_AND_BACKUP.md
+- **BAT/SH script configuration**: See guides/SCRIPT_CONFIGURATION.md
+- **Update and backup**: See guides/UPDATE_AND_BACKUP.md
+- **Update conflicts**: See guides/UPDATE_AND_BACKUP.md
 - **Inference quality issues**: See guides/INFERENCE.md
 - **Gradio UI not starting**: See guides/GRADIO_GUIDE.md
