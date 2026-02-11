@@ -367,6 +367,10 @@
     "enable_normalization_info": "クリッピングを防ぎ、ラウドネスを一定にするために、オーディオ音量をターゲットピークレベルに正規化します。",
     "normalization_db": "ターゲットピーク (dB)",
     "normalization_db_info": "デシベル単位のターゲットピークレベル。-1.0 dBが標準的な安全ピークです。-0.1 dBが最大です。",
-    "advanced_dit_params": "DiT 詳細パラメータ"
+    "advanced_dit_params": "DiT 詳細パラメータ",
+    "latent_shift": "Latent シフト",
+    "latent_shift_info": "VAEデコード前にDiT latentに適用するシフト量。デフォルト0（シフトなし）。負の値（例: -0.04）でクリッピングを軽減できます。",
+    "latent_rescale": "Latent リスケール",
+    "latent_rescale_info": "VAEデコード前にDiT latentに適用するスケール係数。デフォルト1.0（スケーリングなし）。1.0未満の値（例: 0.91）でクリッピングを軽減できます。"
   }
 }

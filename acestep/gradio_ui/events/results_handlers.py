@@ -1777,6 +1777,8 @@ def generate_next_batch_background(
         params.setdefault("lm_batch_chunk_size", 8)
         params.setdefault("track_name", None)
         params.setdefault("complete_track_classes", [])
+        params.setdefault("enable_normalization", True)
+        params.setdefault("normalization_db", -1.0)
         
         # Call generate_with_progress with the saved parameters
         # Note: generate_with_progress is a generator, need to iterate through it
@@ -1828,6 +1830,8 @@ def generate_next_batch_background(
             auto_lrc=params.get("auto_lrc"),
             score_scale=params.get("score_scale"),
             lm_batch_chunk_size=params.get("lm_batch_chunk_size"),
+            enable_normalization=params.get("enable_normalization"),
+            normalization_db=params.get("normalization_db"),
             progress=progress
         )
         

@@ -55,6 +55,8 @@ class GenerationParams:
         # Audio Post-Processing
         enable_normalization: Whether to apply loudness normalization to the output audio.
         normalization_db: Target loudness in dB for normalization (e.g., -1.0 for -1 dBFS peak).
+        latent_shift: Additive shift applied to DiT latents before VAE decode (default 0, no shift).
+        latent_rescale: Multiplicative rescale applied to DiT latents before VAE decode (default 1.0, no rescale).
         
         # Generation Parameters
         inference_steps: Number of diffusion steps (e.g., 8 for turbo, 32–100 for base model).
@@ -114,6 +116,10 @@ class GenerationParams:
     # Audio Post-Processing
     enable_normalization: bool = True
     normalization_db: float = -1.0
+
+    # Latent Post-Processing (before VAE decode)
+    latent_shift: float = 0.0       # Additive shift on DiT latents. Default 0 = no shift.
+    latent_rescale: float = 1.0     # Multiplicative rescale on DiT latents. Default 1.0 = no rescale.
 
     # Advanced Settings
     inference_steps: int = 8

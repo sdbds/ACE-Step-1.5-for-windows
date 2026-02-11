@@ -380,25 +380,28 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
                                 scale=1,
                             )
                     
-                    # Audio Normalization Settings
+                    # Latent Shift / Rescale Settings (Advanced DiT Parameters)
                     with gr.Accordion(t("generation.advanced_dit_params"), open=False):
                          with gr.Row():
-                            # Honor pre-initialized params for normalization
-                            enable_norm_val = init_params.get("enable_normalization", True) if service_pre_initialized else True
-                            norm_db_val = init_params.get("normalization_db", -1.0) if service_pre_initialized else -1.0
+                            # Latent shift and rescale for controlling clipping
+                            latent_shift_val = init_params.get("latent_shift", 0.0) if service_pre_initialized else 0.0
+                            latent_rescale_val = init_params.get("latent_rescale", 1.0) if service_pre_initialized else 1.0
                             
-                            enable_normalization = gr.Checkbox(
-                                label=t("gen.enable_normalization"), 
-                                value=enable_norm_val, 
-                                info=t("gen.enable_normalization_info")
+                            latent_shift = gr.Slider(
+                                label=t("gen.latent_shift"),
+                                minimum=-0.2,
+                                maximum=0.2,
+                                step=0.01,
+                                value=latent_shift_val,
+                                info=t("gen.latent_shift_info")
                             )
-                            normalization_db = gr.Slider(
-                                label=t("gen.normalization_db"), 
-                                minimum=-10.0, 
-                                maximum=0.0, 
-                                step=0.1, 
-                                value=norm_db_val, 
-                                info=t("gen.normalization_db_info")
+                            latent_rescale = gr.Slider(
+                                label=t("gen.latent_rescale"),
+                                minimum=0.5,
+                                maximum=1.5,
+                                step=0.01,
+                                value=latent_rescale_val,
+                                info=t("gen.latent_rescale_info")
                             )
                     
                     # Repainting controls
@@ -782,6 +785,26 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
                     scale=1,
                     visible=not service_mode  # Hidden in service mode
                 )
+            
+            # Audio Normalization Settings (moved from Advanced DiT Parameters)
+            with gr.Row():
+                # Honor pre-initialized params for normalization
+                enable_norm_val = init_params.get("enable_normalization", True) if service_pre_initialized else True
+                norm_db_val = init_params.get("normalization_db", -1.0) if service_pre_initialized else -1.0
+                
+                enable_normalization = gr.Checkbox(
+                    label=t("gen.enable_normalization"), 
+                    value=enable_norm_val, 
+                    info=t("gen.enable_normalization_info")
+                )
+                normalization_db = gr.Slider(
+                    label=t("gen.normalization_db"), 
+                    minimum=-10.0, 
+                    maximum=0.0, 
+                    step=0.1, 
+                    value=norm_db_val, 
+                    info=t("gen.normalization_db_info")
+                )
         
         # Set generate_btn to interactive if service is pre-initialized
         generate_btn_interactive = init_params.get('enable_generate', False) if service_pre_initialized else False
@@ -912,7 +935,10 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
         # GPU info and tier override
         "gpu_info_display": gpu_info_display,
         "tier_dropdown": tier_dropdown,
-        # Normalization Controls (New)
+        # Normalization Controls
         "enable_normalization": enable_normalization,
         "normalization_db": normalization_db,
+        # Latent Shift / Rescale Controls
+        "latent_shift": latent_shift,
+        "latent_rescale": latent_rescale,
     }

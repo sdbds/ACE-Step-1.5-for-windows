@@ -259,6 +259,7 @@
     "tab_train_lora": "🚀 训练 LoRA",
     "quick_start_title": "🚀 快速开始",
     "load_dataset_label": "数据集 JSON 路径",
+    "load_dataset_info": "加载之前保存的数据集",
     "load_btn": "📂 加载",
     "load_status": "加载状态",
     "scan_label": "音频目录路径",
@@ -279,6 +280,9 @@
     "step5_title": "步骤 5：预处理为张量",
     "step5_intro": "**预处理将您的数据集转换为预计算的张量，以便快速训练。**\n\n您可以：\n- 使用上述步骤 1-4 的数据集，**或者**\n- 加载现有的数据集 JSON 文件（如果您已经保存了一个）",
     "step5_details": "此步骤：\n- 将音频编码为 VAE 潜变量\n- 将描述和歌词编码为文本嵌入\n- 运行条件编码器\n- 将所有张量保存到 `.pt` 文件\n\n⚠️ **这需要加载模型，可能需要几分钟。**",
+    "train_section_tensors": "预处理数据集选择",
+    "train_section_lora": "LoRA 设置",
+    "train_section_params": "训练参数",
     "train_tensor_selection_desc": "选择包含预处理张量文件（`.pt` 文件）的目录。\n这些文件在「数据集构建」标签页中使用「预处理」按钮创建。",
     "all_instrumental": "全部为纯音乐",
     "all_instrumental_info": "勾选表示所有曲目均为纯音乐（无人声）",
@@ -362,6 +366,10 @@
     "enable_normalization": "启用归一化",
     "enable_normalization_info": "将音频音量归一化到目标峰值电平，以防止削波或确保一致的响度。",
     "normalization_db": "目标峰值 (dB)",
-    "normalization_db_info": "分贝单位的目标峰值电平。-1.0 dB 是标准安全峰值。-0.1 dB 是最大值。"
+    "normalization_db_info": "分贝单位的目标峰值电平。-1.0 dB 是标准安全峰值。-0.1 dB 是最大值。",
+    "latent_shift": "Latent 偏移",
+    "latent_shift_info": "VAE 解码前对 DiT latent 施加的偏移量。默认 0（不偏移）。负值（如 -0.04）可减少爆音。",
+    "latent_rescale": "Latent 缩放",
+    "latent_rescale_info": "VAE 解码前对 DiT latent 施加的缩放因子。默认 1.0（不缩放）。小于 1.0 的值（如 0.91）可减少爆音。"
   }
 }

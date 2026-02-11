@@ -3441,6 +3441,8 @@ class AceStepHandler(LoraManagerMixin, ProgressMixin):
         infer_method: str = "ode",
         use_tiled_decode: bool = True,
         timesteps: Optional[List[float]] = None,
+        latent_shift: float = 0.0,
+        latent_rescale: float = 1.0,
         progress=None
     ) -> Dict[str, Any]:
         """
@@ -3659,6 +3661,15 @@ class AceStepHandler(LoraManagerMixin, ProgressMixin):
             if progress:
                 progress(0.8, desc="Decoding audio...")
             logger.info("[generate_music] Decoding latents with VAE...")
+            
+            # Apply latent shift and rescale before VAE decode (for anti-clipping control)
+            if latent_shift != 0.0 or latent_rescale != 1.0:
+                logger.info(f"[generate_music] Applying latent post-processing: shift={latent_shift}, rescale={latent_rescale}")
+                if self.debug_stats:
+                    logger.debug(f"[generate_music] Latent BEFORE shift/rescale: min={pred_latents.min():.4f}, max={pred_latents.max():.4f}, mean={pred_latents.mean():.4f}, std={pred_latents.std():.4f}")
+                pred_latents = pred_latents * latent_rescale + latent_shift
+                if self.debug_stats:
+                    logger.debug(f"[generate_music] Latent AFTER shift/rescale: min={pred_latents.min():.4f}, max={pred_latents.max():.4f}, mean={pred_latents.mean():.4f}, std={pred_latents.std():.4f}")
             
             # Decode latents to audio
             start_time = time.time()
