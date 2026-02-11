@@ -33,6 +33,11 @@ There were still some issues with the original backend repository's GPU memory u
 
 <img width="1913" height="813" alt="image" src="https://github.com/user-attachments/assets/68fe0074-c0cb-427a-92e3-ee7b7fe7acd5" />
 
+### 6.We've also added the ability to load Lora/LoKR. Note that Lora reads folders, while LoKR reads safetensors files.
+
+<img width="410" height="408" alt="image" src="https://github.com/user-attachments/assets/9c2bca58-4133-4884-aecf-fabe42bcf5c9" />
+
+
 ## 🔧 Setting up the Environment for Windows
 
   Give unrestricted script access to powershell so venv can work:
