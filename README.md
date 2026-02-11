@@ -18,7 +18,7 @@ https://github.com/fspecii/ace-step-ui
 
 ### 2.Generate a complete record of song parameters, which can be reused at any time.
 
-<img width="410" height="512" alt="image" src="https://github.com/user-attachments/assets/ad959eec-4753-4381-aa28-46ab173c571e" />
+<img width="399" height="517" alt="image" src="https://github.com/user-attachments/assets/42804479-a252-46cd-9032-963f71123536" />
 
 ### 3.All pages are localized into four languages ​​(English, Chinese, Japanese, and Korean).
 
