@@ -13,19 +13,24 @@ https://github.com/fspecii/ace-step-ui
 ## Feather
 
 1. Complete style search and random selection, with a total of 936 styles, synchronized from Suno's explorer.
+2. 
 <img width="412" height="752" alt="image" src="https://github.com/user-attachments/assets/a17ad92c-9cdd-4927-9e0e-5e9848747438" />
 
 2.Generate a complete record of song parameters, which can be reused at any time.
+
 <img width="410" height="512" alt="image" src="https://github.com/user-attachments/assets/ad959eec-4753-4381-aa28-46ab173c571e" />
 
 3.All pages are localized into four languages ​​(English, Chinese, Japanese, and Korean).
+
 <img width="824" height="718" alt="image" src="https://github.com/user-attachments/assets/2b3a81fb-88fe-42a6-81d0-998d52da50c3" />
 
 4.LoRA training support and memory offloading optimization.
 There were still some issues with the original backend repository's GPU memory unloading, so we made significant reconstructions and optimizations. Now we train with the lowest GPU memory and the fastest speed.
+
 <img width="1934" height="832" alt="image" src="https://github.com/user-attachments/assets/88b61873-a6dd-454c-ad97-4ceee5f9a22f" />
 
 5.LoKR training support and reduce training time and improve sound quality
+
 <img width="1913" height="813" alt="image" src="https://github.com/user-attachments/assets/68fe0074-c0cb-427a-92e3-ee7b7fe7acd5" />
 
 ## 🔧 Setting up the Environment for Windows
