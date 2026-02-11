@@ -51,7 +51,7 @@ There were still some issues with the original backend repository's GPU memory u
 Clone the repo with `--recurse-submodules`:
 
 ```
-git clone --recurse-submodules https://github.com/ace-step/ACE-Step-1.5.git
+git clone --recurse-submodules https://github.com/sdbds/ACE-Step-1.5-for-windows.git -b qinglong
 ```
 
 # MUST USE --recurse-submodules
