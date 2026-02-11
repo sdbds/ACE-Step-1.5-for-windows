@@ -61,7 +61,7 @@ Run the following PowerShell script:
 ```powershell
 ./1、install-uv-qinglong.ps1
 ```
-
+### (Optional)
 #### VS Studio 2022 for torch compile
 Download from Microsoft offical link:
 https://aka.ms/vs/17/release/vs_community.exe
