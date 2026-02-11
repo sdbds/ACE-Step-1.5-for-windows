@@ -26,6 +26,7 @@
 |------|------|
 | `profile` | 对单次生成进行详细的计时分析 |
 | `benchmark` | 运行配置矩阵（时长 × 批量 × 思考 × 步数），输出汇总表 |
+| `tier-test` | 通过 `MAX_CUDA_VRAM` 模拟不同显存大小，自动测试所有 GPU 等级 |
 | `understand` | 分析 `understand_music()` API（音频 → 元数据提取） |
 | `create_sample` | 分析 `create_sample()` API（灵感/简单模式） |
 | `format_sample` | 分析 `format_sample()` API（标题+歌词 → 结构化元数据） |
@@ -156,6 +157,84 @@ python profile_inference.py --mode create_sample --instrumental
 python profile_inference.py --mode format_sample
 ```
 
+### 6. `tier-test` — 自动化 GPU 等级测试
+
+使用 `MAX_CUDA_VRAM` 自动模拟不同的 GPU 显存大小，并在每个等级运行生成测试。这是修改 `acestep/gpu_config.py` 后验证所有 GPU 等级是否正常工作的推荐方式。
+
+```bash
+# 测试所有等级 (4, 6, 8, 12, 16, 20, 24 GB)
+python profile_inference.py --mode tier-test
+
+# 测试特定显存大小
+python profile_inference.py --mode tier-test --tiers 6 8 16
+
+# 启用 LM 测试（在支持的等级上）
+python profile_inference.py --mode tier-test --tier-with-lm
+
+# 快速测试：非量化等级跳过 torch.compile
+python profile_inference.py --mode tier-test --tier-skip-compile
+```
+
+**每个等级验证的内容：**
+- 正确的等级检测和 `GPUConfig` 构建
+- 模型初始化（DiT、VAE、文本编码器，可选 LM）
+- 短时间生成（30秒时长，batch=1）无 OOM 完成
+- 自适应 VAE 解码回退（GPU → CPU 卸载 → 完全 CPU）
+- 显存使用保持在模拟限制内
+
+**输出示例：**
+
+```
+TIER TEST RESULTS
+====================================================================================================
+  VRAM    Tier       LM      Duration   Status    Peak VRAM    Notes
+  ──────────────────────────────────────────────────────────────────────────────
+  4GB     tier1      —       30s        ✅ OK     3.8GB        VAE 在 CPU 上解码
+  6GB     tier2      —       30s        ✅ OK     5.4GB        分片 VAE chunk=256
+  8GB     tier4      0.6B    30s        ✅ OK     7.2GB        vllm 后端
+  12GB    tier5      1.7B    30s        ✅ OK     10.8GB       vllm 后端
+  16GB    tier6a     1.7B    30s        ✅ OK     14.5GB       启用卸载
+  20GB    tier6b     1.7B    30s        ✅ OK     17.2GB       无卸载
+  24GB    unlimited  4B      30s        ✅ OK     21.3GB       所有模型在 GPU 上
+```
+
+> **注意**: `tier-test` 模式使用 `torch.cuda.set_per_process_memory_fraction()` 强制执行显存硬上限，即使在高端 GPU（如 A100 80GB）上也能实现真实的模拟。
+
+#### 边界测试
+
+使用 `--tier-boundary` 查找可以安全关闭 INT8 量化和 CPU 卸载的最低显存等级。对每个等级最多测试三种配置：
+
+1. **default** — 等级的标准设置
+2. **no-quant** — 关闭量化，卸载不变
+3. **no-offload** — 不使用量化，也不使用 CPU 卸载
+
+```bash
+# 在所有等级运行边界测试
+python profile_inference.py --mode tier-test --tier-boundary
+
+# 启用 LM 的边界测试
+python profile_inference.py --mode tier-test --tier-boundary --tier-with-lm
+
+# 将边界测试结果保存为 JSON
+python profile_inference.py --mode tier-test --tier-boundary --benchmark-output boundary_results.json
+```
+
+输出包含一个 **边界分析** 摘要，显示每种能力的最低等级。
+
+#### 批次大小边界测试
+
+使用 `--tier-batch-boundary` 查找每个等级的最大安全批次大小。对每个等级，工具会递进测试批次大小 1、2、4、8（在首次 OOM 时停止），同时测试启用 LM 和未启用 LM 的配置：
+
+```bash
+# 运行批次边界测试
+python profile_inference.py --mode tier-test --tier-batch-boundary --tier-with-lm
+
+# 测试特定等级
+python profile_inference.py --mode tier-test --tier-batch-boundary --tier-with-lm --tiers 8 12 16 24
+```
+
+输出包含一个 **批次边界摘要**，显示每个等级在有 LM 和无 LM 配置下的最大成功批次大小。
+
 ---
 
 ## 命令行参数
@@ -209,11 +288,21 @@ python profile_inference.py --mode format_sample
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--mode` | `profile` | 模式：`profile` / `benchmark` / `understand` / `create_sample` / `format_sample` |
+| `--mode` | `profile` | 模式：`profile` / `benchmark` / `tier-test` / `understand` / `create_sample` / `format_sample` |
 | `--no-warmup` | 关闭 | 跳过预热 |
 | `--detailed` | 关闭 | 启用 `cProfile` 函数级分析 |
 | `--llm-debug` | 关闭 | 深度 LLM 调试（token 数量、吞吐量） |
 | `--benchmark-output` | 无 | 保存基准测试结果为 JSON 文件 |
+
+### 等级测试选项
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--tiers` | `4 6 8 12 16 20 24` | 要模拟的显存大小（GB） |
+| `--tier-with-lm` | 关闭 | 在支持的等级上启用 LM 初始化 |
+| `--tier-skip-compile` | 关闭 | 非量化等级跳过 `torch.compile` 以加速迭代 |
+| `--tier-boundary` | 关闭 | 对每个等级测试 no-quant 和 no-offload 变体，查找最低能力边界 |
+| `--tier-batch-boundary` | 关闭 | 对每个等级测试批次大小 1、2、4、8，查找最大安全批次大小 |
 
 ### 输入选项
 
@@ -340,6 +429,10 @@ TIME COSTS BREAKDOWN
 
 4. **使用代表性时长测试** — 短时长（30s）以 LLM 耗时为主；长时长（240s+）以 DiT 耗时为主。
 
-5. **GPU 显存自动适配** — benchmark 模式会自动将时长和批量大小裁剪到 GPU 可处理的范围。
+5. **GPU 显存自动适配** — benchmark 模式会自动将时长和批量大小裁剪到 GPU 可处理的范围，使用 `acestep/gpu_config.py` 中的自适应等级系统。
 
 6. **谨慎使用 `--detailed`** — `cProfile` 会增加开销；仅在需要调查函数级瓶颈时使用。
+
+7. **使用 `tier-test` 进行回归测试** — 修改 GPU 等级配置后，运行 `--mode tier-test` 验证所有等级仍然正常工作。这在更改卸载阈值、时长限制或 LM 模型可用性时尤为重要。
+
+8. **真实模拟低显存** — 使用 `MAX_CUDA_VRAM` 时，系统通过 `set_per_process_memory_fraction()` 强制执行显存硬上限，因此模拟期间的 OOM 错误反映了消费级 GPU 上的真实行为。

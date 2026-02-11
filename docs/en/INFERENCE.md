@@ -1068,11 +1068,19 @@ else:
 
 ### 7. Memory Management
 
-For large batch sizes or long durations:
-- Monitor GPU memory usage
-- Reduce `batch_size` if OOM errors occur
-- Reduce `lm_batch_chunk_size` for LM operations
-- Consider using `offload_to_cpu=True` during initialization
+ACE-Step 1.5 includes automatic VRAM management that adapts to your GPU:
+
+- **Automatic tier detection**: The system detects available VRAM and selects optimal settings (see [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md))
+- **VRAM guard**: Before each inference, the system estimates VRAM requirements and automatically reduces `batch_size` if needed
+- **Adaptive VAE decode**: Three-tier fallback — GPU tiled decode → GPU decode with CPU offload → full CPU decode
+- **Auto chunk sizing**: VAE decode chunk size adapts to free VRAM (64/128/256/512/1024/1536)
+- **Duration/batch clamping**: Values exceeding your tier's limits are automatically clamped with a warning
+
+For manual tuning:
+- Reduce `batch_size` if OOM errors persist
+- Reduce `lm_batch_chunk_size` for LM operations on low-VRAM GPUs
+- Enable `offload_to_cpu=True` during initialization for GPUs with <20GB VRAM
+- Enable `quantization="int8_weight_only"` for GPUs with <20GB VRAM
 
 ### 8. Accessing Time Costs
 
@@ -1094,7 +1102,7 @@ if result.success:
 ### Common Issues
 
 **Issue**: Out of memory errors
-- **Solution**: Reduce `batch_size`, `inference_steps`, or enable CPU offloading
+- **Solution**: The system should automatically handle most OOM scenarios via VRAM guard (batch reduction) and adaptive VAE decode (CPU fallback). If OOM still occurs: reduce `batch_size`, reduce `inference_steps`, enable CPU offloading (`offload_to_cpu=True`), or enable INT8 quantization. See [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md) for recommended settings per VRAM tier.
 
 **Issue**: Poor quality results
 - **Solution**: Increase `inference_steps`, adjust `guidance_scale`, use base model

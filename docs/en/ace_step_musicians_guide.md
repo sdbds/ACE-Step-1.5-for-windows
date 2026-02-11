@@ -138,36 +138,45 @@ A computer with a decent graphics card (GPU). The better the GPU, the faster and
     YOUR GPU MEMORY          WHAT YOU CAN DO
     ─────────────────────────────────────────────────────
 
-    4 GB  (entry level)      Songs up to 3 minutes
+    4 GB  (entry level)      Songs up to 6 minutes
     ▓░░░░░░░░░░░░░░░░░░░    1 song at a time
                              Basic mode only (no Songwriter brain)
 
-    8 GB  (mainstream)       Songs up to 6 minutes
-    ▓▓▓▓░░░░░░░░░░░░░░░░    1-2 songs at a time
-                             Optional lightweight Songwriter brain
+    6-8 GB  (budget)         Songs up to 10 minutes
+    ▓▓▓░░░░░░░░░░░░░░░░░    1-2 songs at a time
+                             Optional lightweight Songwriter brain (0.6B)
 
-    12 GB (sweet spot)       Songs up to 6 minutes
-    ▓▓▓▓▓▓░░░░░░░░░░░░░░    2-4 songs at a time
-                             Full Songwriter brain available
+    8-12 GB (mainstream)     Songs up to 10 minutes
+    ▓▓▓▓▓░░░░░░░░░░░░░░░    2-4 songs at a time
+                             Songwriter brain available (0.6B)
 
-    16 GB (enthusiast)       Songs up to 8 minutes
-    ▓▓▓▓▓▓▓▓░░░░░░░░░░░░    2-4 songs at a time
-                             Larger, smarter Songwriter brain
+    12-16 GB (sweet spot)    Songs up to 10 minutes
+    ▓▓▓▓▓▓▓░░░░░░░░░░░░░    2-4 songs at a time
+                             Full Songwriter brain (1.7B)
 
-    24 GB+ (high end)        Songs up to 10 minutes
+    16-20 GB (enthusiast)    Songs up to 10 minutes
+    ▓▓▓▓▓▓▓▓▓░░░░░░░░░░░    1-4 songs at a time
+                             Larger Songwriter brain (1.7B)
+
+    20-24 GB (high end)      Songs up to 8 minutes
+    ▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░    2-8 songs at a time
+                             All Songwriter brains (0.6B/1.7B/4B), no offload needed
+
+    24 GB+ (pro)             Songs up to 10 minutes
     ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░    Up to 8 songs at a time
-                             All features unlocked
+                             All features unlocked, best quality (4B)
 ```
 
 **Common GPUs and where they land:**
 
 | GPU | Memory | Tier |
 |-----|--------|------|
-| GTX 1050 Ti | 4 GB | Entry |
-| RTX 3060 / 4060 | 8 GB | Mainstream |
-| RTX 3070 / 4070 | 8-12 GB | Sweet spot |
-| RTX 3080 / 4080 | 12-16 GB | Enthusiast |
-| RTX 4090 | 24 GB | High end |
+| GTX 1050 Ti | 4 GB | Entry (Tier 1) |
+| GTX 1660 / RTX 2060 | 6 GB | Budget (Tier 2) |
+| RTX 3060 / 4060 | 8 GB | Mainstream (Tier 4) |
+| RTX 3070 / 4070 | 8-12 GB | Mainstream-Sweet spot (Tier 4-5) |
+| RTX 3080 16GB / 4060 Ti 16GB | 16 GB | Enthusiast (Tier 6a) |
+| RTX 3090 / 4090 | 24 GB | High end / Pro (Tier 6b-Unlimited) |
 | Apple M1/M2/M3 (Mac) | Shared memory | Supported, varies |
 
 **Disk space:** About 100 GB free. The AI models are large files (around 60 GB total) that download automatically the first time you run the software.

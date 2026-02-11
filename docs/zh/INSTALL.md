@@ -468,7 +468,7 @@ ACESTEP_INIT_LLM=false
 | `--init_llm` | auto | LLM 初始化：`true` / `false` / 省略为自动 |
 | `--config_path` | auto | DiT 模型（如 `acestep-v15-turbo`） |
 | `--lm_model_path` | auto | LM 模型（如 `acestep-5Hz-lm-1.7B`） |
-| `--offload_to_cpu` | auto | CPU 卸载（显存 < 16GB 时自动启用） |
+| `--offload_to_cpu` | auto | CPU 卸载（显存 < 20GB 时自动启用） |
 | `--download-source` | auto | 模型源：`auto` / `huggingface` / `modelscope` |
 | `--enable-api` | false | 同时启用 REST API 端点 |
 
@@ -529,16 +529,17 @@ huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/ac
 
 ## 💡 如何选择模型？
 
-ACE-Step 会自动适配你的 GPU 显存：
+ACE-Step 会自动适配你的 GPU 显存。UI 会根据检测到的 GPU 等级预配置所有设置（LM 模型、后端、卸载、量化）：
 
-| GPU 显存 | 推荐 LM 模型 | 说明 |
-|----------|--------------|------|
-| **≤6GB** | 无（仅 DiT） | 默认禁用 LM 以节省显存 |
-| **6-12GB** | `acestep-5Hz-lm-0.6B` | 轻量，平衡性好 |
-| **12-16GB** | `acestep-5Hz-lm-1.7B` | 更好的质量 |
-| **≥16GB** | `acestep-5Hz-lm-4B` | 最佳质量和音频理解能力 |
+| GPU 显存 | 推荐 LM 模型 | 后端 | 说明 |
+|----------|--------------|------|------|
+| **≤6GB** | 无（仅 DiT） | — | 默认禁用 LM；INT8 量化 + 完全 CPU 卸载 |
+| **6-8GB** | `acestep-5Hz-lm-0.6B` | `pt` | 轻量 LM，PyTorch 后端 |
+| **8-16GB** | `0.6B` / `1.7B` | `vllm` | 8-12GB 用 0.6B，12-16GB 用 1.7B |
+| **16-24GB** | `acestep-5Hz-lm-1.7B` | `vllm` | 20GB+ 可用 4B；20GB+ 无需卸载 |
+| **≥24GB** | `acestep-5Hz-lm-4B` | `vllm` | 最佳质量，所有模型无需卸载 |
 
-> 📖 详细 GPU 兼容性信息（时长限制、批量大小、内存优化），请参阅 [GPU 兼容性指南](GPU_COMPATIBILITY.md)。
+> 📖 详细 GPU 兼容性信息（等级表、时长限制、批量大小、自适应 UI 默认设置、显存优化），请参阅 [GPU 兼容性指南](GPU_COMPATIBILITY.md)。
 
 ---
 

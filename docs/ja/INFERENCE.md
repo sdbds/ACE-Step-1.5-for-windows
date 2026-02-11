@@ -709,8 +709,8 @@ caption="速い遅い音楽"  # テンポの矛盾
 
 ### よくある問題
 
-**問題**：メモリ不足エラー
-- **解決策**：`batch_size`、`inference_steps` を減らすか、CPUオフロードを有効化
+**問題**：メモリ不足（OOM）エラー
+- **解決策**：システムは VRAM ガード（バッチ自動削減）とアダプティブ VAE デコード（CPU フォールバック）により、ほとんどの OOM シナリオを自動処理します。それでも OOM が発生する場合：`batch_size` を減らす、`inference_steps` を減らす、CPU オフロード（`offload_to_cpu=True`）を有効化、または INT8 量子化を有効化してください。各 VRAM ティアの推奨設定は [GPU_COMPATIBILITY.md](../ja/GPU_COMPATIBILITY.md) を参照してください。
 
 **問題**：結果の品質が悪い
 - **解決策**：`inference_steps` を増やす、`guidance_scale` を調整、baseモデルを使用

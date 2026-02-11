@@ -62,17 +62,23 @@ The Gradio interface consists of several main sections:
 
 | Setting | Description |
 |---------|-------------|
-| **5Hz LM Model Path** | Select the language model (e.g., `acestep-5Hz-lm-0.6B`, `acestep-5Hz-lm-1.7B`) |
-| **5Hz LM Backend** | `vllm` (faster, recommended) or `pt` (PyTorch, more compatible) |
-| **Initialize 5Hz LM** | Check to load the LM during initialization (required for thinking mode) |
+| **5Hz LM Model Path** | Select the language model. **Available models are filtered by your GPU tier** — e.g., 6-8GB GPUs only show 0.6B, while 24GB+ GPUs show all sizes (0.6B, 1.7B, 4B). |
+| **5Hz LM Backend** | `vllm` (faster, recommended for NVIDIA with ≥8GB VRAM), `pt` (PyTorch, universal fallback), or `mlx` (Apple Silicon). **On GPUs <8GB, the backend is restricted to `pt`/`mlx`** because vllm's KV cache is too memory-hungry. |
+| **Initialize 5Hz LM** | Check to load the LM during initialization (required for thinking mode). **Automatically unchecked and disabled on GPUs ≤6GB** (Tier 1-2). |
+
+> **Adaptive Defaults**: All LM settings are automatically configured based on your GPU's VRAM tier. The recommended LM model, backend, and initialization state are pre-set for optimal performance. You can manually override these, but the system will warn you if your selection is incompatible with your GPU.
 
 ### Performance Options
 
 | Setting | Description |
 |---------|-------------|
 | **Use Flash Attention** | Enable for faster inference (requires flash_attn package) |
-| **Offload to CPU** | Offload models to CPU when idle to save GPU memory |
-| **Offload DiT to CPU** | Specifically offload the DiT model to CPU |
+| **Offload to CPU** | Offload models to CPU when idle to save GPU memory. **Automatically enabled on GPUs <20GB.** |
+| **Offload DiT to CPU** | Specifically offload the DiT model to CPU. **Automatically enabled on GPUs <12GB.** |
+| **INT8 Quantization** | Reduce model VRAM footprint with INT8 weight quantization. **Automatically enabled on GPUs <20GB.** |
+| **Compile Model** | Enable `torch.compile` for optimized inference. **Enabled by default on all tiers** (required when quantization is active). |
+
+> **Tier-Aware Settings**: Offload, quantization, and compile options are automatically set based on your GPU tier. See [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md) for the full tier table.
 
 ### LoRA Adapter
 
@@ -87,7 +93,12 @@ The Gradio interface consists of several main sections:
 
 ### Initialization
 
-Click **Initialize Service** to load the models. The status box will show progress and confirmation.
+Click **Initialize Service** to load the models. The status box will show progress and confirmation, including:
+- The detected GPU tier and VRAM
+- Maximum allowed duration and batch size (adjusted dynamically based on whether LM was initialized)
+- Any warnings about incompatible settings that were automatically corrected
+
+After initialization, the **Audio Duration** and **Batch Size** sliders are automatically updated to reflect the tier's limits.
 
 ---
 
@@ -527,14 +538,18 @@ These options are especially useful when preprocessing takes a long time or you 
 - Make caption more specific
 
 **Out of memory:**
-- Reduce batch size
-- Enable CPU offloading
+- The system includes automatic VRAM management (VRAM guard, adaptive VAE decode, auto batch reduction). If OOM still occurs:
+- Reduce batch size manually
+- Enable CPU offloading (should be auto-enabled for GPUs <20GB)
+- Enable INT8 quantization (should be auto-enabled for GPUs <20GB)
 - Reduce LM batch chunk size
+- See [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md) for recommended settings per tier
 
 **LM not working:**
-- Ensure "Initialize 5Hz LM" was checked during initialization
-- Check that a valid LM model path is selected
-- Verify vllm or PyTorch backend is available
+- Ensure "Initialize 5Hz LM" was checked during initialization (disabled by default on GPUs ≤6GB)
+- Check that a valid LM model path is selected (only tier-compatible models are shown)
+- Verify vllm or PyTorch backend is available (vllm restricted on GPUs <8GB)
+- If the LM checkbox is grayed out, your GPU tier does not support LM — use DiT-only mode
 
 ---
 

@@ -2,13 +2,15 @@
 Test-Time Scaling Module
 Implements perplexity-based scoring for generated audio codes
 """
-import torch
-import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, Any, List
-from loguru import logger
-import yaml
+import contextlib
 import math
 import re
+
+import torch
+import torch.nn.functional as F
+import yaml
+from loguru import logger
+from typing import Tuple, Optional, Dict, Any, List
 
 
 def pmi_score(log_prob_conditional: float, log_prob_unconditional: float) -> float:
@@ -62,6 +64,52 @@ def pmi_to_normalized_score(pmi: float, scale: float = 0.1) -> float:
     return 1.0 / (1.0 + math.exp(-pmi / scale))
 
 
+@contextlib.contextmanager
+def _load_scoring_model_context(llm_handler):
+    """
+    Context manager that loads the HF scoring model to the accelerator device
+    before use and offloads it back to CPU afterwards.
+
+    For the ``pt`` backend the existing ``_load_model_context()`` already
+    handles offloading, so we just delegate to it.  For ``vllm`` / ``mlx``
+    backends, ``get_hf_model_for_scoring()`` caches a *separate* HF model
+    that would otherwise stay on GPU permanently — here we move it to GPU
+    only for the duration of the scoring forward pass and move it back to
+    CPU when done, freeing VRAM for DiT / VAE.
+    """
+    backend = getattr(llm_handler, "llm_backend", "pt")
+
+    if backend == "pt":
+        # pt backend: _load_model_context already handles GPU ↔ CPU
+        with llm_handler._load_model_context():
+            yield
+        return
+
+    # vllm / mlx: manage the cached HF model ourselves
+    model = llm_handler.get_hf_model_for_scoring()
+    if model is None:
+        yield
+        return
+
+    offload = getattr(llm_handler, "offload_to_cpu", False)
+    device = llm_handler.device if hasattr(llm_handler, "device") else "cpu"
+
+    if offload and hasattr(model, "to"):
+        logger.info(f"[scoring] Loading HF scoring model to {device}")
+        model.to(device)
+
+    try:
+        yield
+    finally:
+        if offload and hasattr(model, "to"):
+            logger.info("[scoring] Offloading HF scoring model to CPU")
+            model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+
+
 def _get_logits_and_target_for_scoring(llm_handler, formatted_prompt: str,
                                        target_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -77,7 +125,18 @@ def _get_logits_and_target_for_scoring(llm_handler, formatted_prompt: str,
     """
     model = llm_handler.get_hf_model_for_scoring()
     tokenizer = llm_handler.llm_tokenizer
-    device = llm_handler.device if llm_handler.llm_backend == "pt" else next(model.parameters()).device
+
+    # Determine the device the model is *currently* on (it may be on CPU
+    # if offload_to_cpu is active — _load_scoring_model_context will move
+    # it to the accelerator before the forward pass).
+    backend = getattr(llm_handler, "llm_backend", "pt")
+    if backend == "pt":
+        device = llm_handler.device
+    else:
+        # For vllm/mlx the scoring model may be on CPU right now;
+        # use the handler's target device so tensors land on the right device
+        # once the model is moved there by the context manager.
+        device = llm_handler.device if hasattr(llm_handler, "device") else next(model.parameters()).device
 
     # 1. Tokenize prompt ONLY to get its length (used for slicing later).
     #    We must ensure special tokens are added to count the offset correctly.
@@ -96,18 +155,17 @@ def _get_logits_and_target_for_scoring(llm_handler, formatted_prompt: str,
         return torch.empty(0, device=device), torch.empty(0, device=device)
 
     # 3. Forward Pass (Teacher Forcing)
+    #    _load_scoring_model_context ensures the model is on-device for the
+    #    forward pass and offloaded back to CPU afterwards.
     with torch.no_grad():
-        with llm_handler._load_model_context():
+        with _load_scoring_model_context(llm_handler):
             outputs = model(input_ids=input_ids, attention_mask=full_tokens['attention_mask'])
             all_logits = outputs.logits  # [1, seq_len, vocab_size]
 
-    # 4. Extract Logits and Labels
-    #    We need to predict `input_ids[i]`. The logit for this is at `all_logits[i-1]`.
-    #    Target starts at index `prompt_len`.
-    #    So we need logits from `prompt_len - 1` up to the second to last position.
-
-    target_logits = all_logits[0, prompt_len - 1:-1, :]  # [target_len, vocab_size]
-    target_ids = input_ids[0, prompt_len:]  # [target_len]
+    # 4. Extract Logits and Labels — move to CPU so downstream scoring
+    #    does not keep large vocab-sized tensors on GPU.
+    target_logits = all_logits[0, prompt_len - 1:-1, :].cpu()  # [target_len, vocab_size]
+    target_ids = input_ids[0, prompt_len:].cpu()  # [target_len]
 
     return target_logits, target_ids
 

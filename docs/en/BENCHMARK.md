@@ -26,6 +26,7 @@
 |------|-------------|
 | `profile` | Profile a single generation run with detailed timing breakdown |
 | `benchmark` | Run a matrix of configurations (duration × batch × thinking × steps) and produce a summary table |
+| `tier-test` | Automatically test all GPU tiers by simulating different VRAM sizes via `MAX_CUDA_VRAM` |
 | `understand` | Profile the `understand_music()` API (audio → metadata extraction) |
 | `create_sample` | Profile the `create_sample()` API (inspiration / simple mode) |
 | `format_sample` | Profile the `format_sample()` API (caption + lyrics → structured metadata) |
@@ -156,6 +157,84 @@ Profiles the `format_sample()` API which converts caption + lyrics into structur
 python profile_inference.py --mode format_sample
 ```
 
+### 6. `tier-test` — Automated GPU Tier Testing
+
+Automatically simulates different GPU VRAM sizes using `MAX_CUDA_VRAM` and runs a generation test at each tier. This is the recommended way to validate that all GPU tiers work correctly after modifying `acestep/gpu_config.py`.
+
+```bash
+# Test all tiers (4, 6, 8, 12, 16, 20, 24 GB)
+python profile_inference.py --mode tier-test
+
+# Test specific VRAM sizes
+python profile_inference.py --mode tier-test --tiers 6 8 16
+
+# Test with LM enabled (where the tier supports it)
+python profile_inference.py --mode tier-test --tier-with-lm
+
+# Quick test: skip torch.compile for non-quantized tiers
+python profile_inference.py --mode tier-test --tier-skip-compile
+```
+
+**What it validates per tier:**
+- Correct tier detection and `GPUConfig` construction
+- Model initialization (DiT, VAE, Text Encoder, optionally LM)
+- A short generation run (30s duration, batch=1) completes without OOM
+- Adaptive VAE decode fallback (GPU → CPU offload → full CPU)
+- VRAM usage stays within the simulated limit
+
+**Output example:**
+
+```
+TIER TEST RESULTS
+====================================================================================================
+  VRAM    Tier       LM      Duration   Status    Peak VRAM    Notes
+  ──────────────────────────────────────────────────────────────────────────────
+  4GB     tier1      —       30s        ✅ OK     3.8GB        VAE decoded on CPU
+  6GB     tier2      —       30s        ✅ OK     5.4GB        Tiled VAE chunk=256
+  8GB     tier4      0.6B    30s        ✅ OK     7.2GB        vllm backend
+  12GB    tier5      1.7B    30s        ✅ OK     10.8GB       vllm backend
+  16GB    tier6a     1.7B    30s        ✅ OK     14.5GB       offload enabled
+  20GB    tier6b     1.7B    30s        ✅ OK     17.2GB       no offload
+  24GB    unlimited  4B      30s        ✅ OK     21.3GB       full models on GPU
+```
+
+> **Note**: `tier-test` mode uses `torch.cuda.set_per_process_memory_fraction()` to enforce a hard VRAM cap, making simulations realistic even on high-end GPUs (e.g., A100 80GB).
+
+#### Boundary Testing
+
+Use `--tier-boundary` to find the minimum VRAM tier at which INT8 quantization and CPU offload can be safely disabled. For each tier, up to three configurations are tested:
+
+1. **default** — tier's standard settings
+2. **no-quant** — quantization disabled, offload unchanged
+3. **no-offload** — no quantization AND no CPU offload
+
+```bash
+# Run boundary tests across all tiers
+python profile_inference.py --mode tier-test --tier-boundary
+
+# Boundary test with LM enabled
+python profile_inference.py --mode tier-test --tier-boundary --tier-with-lm
+
+# Save boundary results to JSON
+python profile_inference.py --mode tier-test --tier-boundary --benchmark-output boundary_results.json
+```
+
+The output includes a **Boundary Analysis** summary showing the minimum tier for each capability.
+
+#### Batch Size Boundary Testing
+
+Use `--tier-batch-boundary` to find the maximum safe batch size for each tier. For each tier, the tool progressively tests batch sizes 1, 2, 4, 8 (stopping at first OOM) with both LM-enabled and LM-disabled configurations:
+
+```bash
+# Run batch boundary tests
+python profile_inference.py --mode tier-test --tier-batch-boundary --tier-with-lm
+
+# Test specific tiers
+python profile_inference.py --mode tier-test --tier-batch-boundary --tier-with-lm --tiers 8 12 16 24
+```
+
+The output includes a **Batch Boundary Summary** showing the maximum successful batch size per tier for both with-LM and without-LM configurations.
+
 ---
 
 ## CLI Reference
@@ -209,11 +288,21 @@ python profile_inference.py --mode format_sample
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mode` | `profile` | Mode: `profile` / `benchmark` / `understand` / `create_sample` / `format_sample` |
+| `--mode` | `profile` | Mode: `profile` / `benchmark` / `tier-test` / `understand` / `create_sample` / `format_sample` |
 | `--no-warmup` | off | Skip warmup run |
 | `--detailed` | off | Enable `cProfile` function-level analysis |
 | `--llm-debug` | off | Deep LLM debugging (token count, throughput) |
 | `--benchmark-output` | none | Save benchmark results to JSON file |
+
+### Tier-Test Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tiers` | `4 6 8 12 16 20 24` | VRAM sizes (GB) to simulate |
+| `--tier-with-lm` | off | Enable LM initialization on tiers that support it |
+| `--tier-skip-compile` | off | Skip `torch.compile` for faster iteration on non-quantized tiers |
+| `--tier-boundary` | off | Test each tier with no-quant and no-offload variants to find minimum capability boundaries |
+| `--tier-batch-boundary` | off | Test each tier with batch sizes 1, 2, 4, 8 to find maximum safe batch size |
 
 ### Input Options
 
@@ -340,6 +429,10 @@ TIME COSTS BREAKDOWN
 
 4. **Test with representative durations** — Short durations (30s) are dominated by LLM time; long durations (240s+) are dominated by DiT time.
 
-5. **GPU memory auto-adaptation** — The benchmark mode automatically clamps durations and batch sizes to what your GPU can handle.
+5. **GPU memory auto-adaptation** — The benchmark mode automatically clamps durations and batch sizes to what your GPU can handle, using the adaptive tier system in `acestep/gpu_config.py`.
 
 6. **Use `--detailed` sparingly** — `cProfile` adds overhead; use it only when investigating function-level bottlenecks.
+
+7. **Use `tier-test` for regression testing** — After modifying GPU tier configs, run `--mode tier-test` to verify all tiers still work correctly. This is especially important when changing offload thresholds, duration limits, or LM model availability.
+
+8. **Simulate low VRAM realistically** — When using `MAX_CUDA_VRAM`, the system enforces a hard VRAM cap via `set_per_process_memory_fraction()`, so OOM errors during simulation reflect real behavior on consumer GPUs.

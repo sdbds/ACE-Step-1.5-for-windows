@@ -31,9 +31,51 @@ DEBUG_MAX_MPS_VRAM_ENV = "MAX_MPS_VRAM"
 VRAM_16GB_TOLERANCE_GB = 0.5
 VRAM_16GB_MIN_GB = 16.0 - VRAM_16GB_TOLERANCE_GB  # treat as 16GB class if >= this
 
+# Threshold below which auto_offload is enabled.
+# 16GB GPUs cannot hold DiT + VAE + text_encoder + LM simultaneously without offloading.
+VRAM_AUTO_OFFLOAD_THRESHOLD_GB = 20.0
+
 # PyTorch installation URLs for diagnostics
 PYTORCH_CUDA_INSTALL_URL = "https://download.pytorch.org/whl/cu121"
 PYTORCH_ROCM_INSTALL_URL = "https://download.pytorch.org/whl/rocm6.0"
+
+
+# ===========================================================================
+# Empirical VRAM measurements (GB) -- model weights only, bf16 precision
+# These values should be calibrated using scripts/profile_vram.py
+# ===========================================================================
+
+# Base model weights (loaded once at startup)
+MODEL_VRAM = {
+    "dit_turbo": 4.7,        # DiT turbo model weights (bf16)
+    "dit_base": 4.7,         # DiT base model weights (bf16)
+    "vae": 0.33,             # VAE (AutoencoderOobleck) weights (fp16)
+    "text_encoder": 1.2,     # Qwen3-Embedding-0.6B text encoder (bf16)
+    "silence_latent": 0.01,  # Silence latent tensor
+    "cuda_context": 0.5,     # CUDA context + driver overhead
+}
+
+# LM model weights (bf16) + KV cache estimates
+LM_VRAM = {
+    "0.6B": {"weights": 1.2, "kv_cache_2k": 0.3, "kv_cache_4k": 0.6},
+    "1.7B": {"weights": 3.4, "kv_cache_2k": 0.5, "kv_cache_4k": 1.0},
+    "4B":   {"weights": 8.0, "kv_cache_2k": 0.8, "kv_cache_4k": 1.6},
+}
+
+# DiT inference peak VRAM per batch item (approximate, depends on duration)
+# These are additional activations/intermediates on top of model weights.
+#
+# Profiling on A800 (flash attention) shows only ~0.001-0.004 GB per batch item.
+# Consumer GPUs without flash attention will be higher due to materialised
+# attention matrices.  We use conservative estimates that cover the worst case
+# (no flash attention, long sequences).
+DIT_INFERENCE_VRAM_PER_BATCH = {
+    "turbo": 0.3,   # GB per batch item (no CFG)
+    "base":  0.6,    # GB per batch item (with CFG, 2x forward)
+}
+
+# Safety margin to keep free for OS/driver/fragmentation (GB)
+VRAM_SAFETY_MARGIN_GB = 0.5
 
 
 @dataclass
@@ -53,65 +95,157 @@ class GPUConfig:
     # LM configuration
     init_lm_default: bool  # Whether to initialize LM by default
     available_lm_models: List[str]  # Available LM models for this tier
-
+    recommended_lm_model: str  # Recommended default LM model path (empty if LM not available)
+    
+    # LM backend restriction
+    # "all" = any backend, "pt_mlx_only" = only pt/mlx (no vllm), used for very low VRAM
+    lm_backend_restriction: str  # "all" or "pt_mlx_only"
+    recommended_backend: str  # Recommended default backend: "vllm", "pt", or "mlx"
+    
+    # Offload defaults
+    offload_to_cpu_default: bool  # Whether offload_to_cpu should be enabled by default
+    offload_dit_to_cpu_default: bool  # Whether offload_dit_to_cpu should be enabled by default
+    
+    # Quantization / compile defaults
+    quantization_default: bool  # Whether INT8 quantization should be enabled by default
+    compile_model_default: bool  # Whether torch.compile should be enabled by default
+    
     # LM memory allocation (GB) for each model size
     lm_memory_gb: Dict[str, float]  # e.g., {"0.6B": 3, "1.7B": 8, "4B": 12}
 
 
 # GPU tier configurations
+# tier6 has been split into tier6a (16-20GB) and tier6b (20-24GB) to fix the
+# 16GB regression. 16GB GPUs cannot hold all models simultaneously with the
+# same batch sizes as 24GB GPUs.
 GPU_TIER_CONFIGS = {
     "tier1": {  # <= 4GB
-        "max_duration_with_lm": 180,  # 3 minutes
-        "max_duration_without_lm": 180,  # 3 minutes
-        "max_batch_size_with_lm": 1,
-        "max_batch_size_without_lm": 1,
-        "init_lm_default": False,
-        "available_lm_models": [],
-        "lm_memory_gb": {},
-    },
-    "tier2": {  # 4-6GB
-        "max_duration_with_lm": 360,  # 6 minutes
+        # Offload mode required.  DiT(4.46) barely fits with CUDA context(0.5).
+        # VAE decode falls back to CPU.  Keep durations moderate.
+        "max_duration_with_lm": 240,  # 4 minutes
         "max_duration_without_lm": 360,  # 6 minutes
         "max_batch_size_with_lm": 1,
         "max_batch_size_without_lm": 1,
         "init_lm_default": False,
         "available_lm_models": [],
+        "recommended_lm_model": "",
+        "lm_backend_restriction": "pt_mlx_only",  # vllm KV cache won't fit
+        "recommended_backend": "pt",
+        "offload_to_cpu_default": True,
+        "offload_dit_to_cpu_default": True,
+        "quantization_default": True,  # INT8 essential to fit DiT in ~4GB
+        "compile_model_default": True,
+        "lm_memory_gb": {},
+    },
+    "tier2": {  # 4-6GB
+        # Offload mode.  DiT(4.46) + context(0.5) + activations ≈ 5.0GB.
+        # ~1GB headroom.  Tiled VAE decode fits with chunk=256 (~0.8GB peak).
+        # Duration barely affects peak VRAM (latent tensor is <2MB even at 10min).
+        "max_duration_with_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 600,  # 10 minutes (max supported)
+        "max_batch_size_with_lm": 1,
+        "max_batch_size_without_lm": 1,
+        "init_lm_default": False,
+        "available_lm_models": [],
+        "recommended_lm_model": "",
+        "lm_backend_restriction": "pt_mlx_only",
+        "recommended_backend": "pt",
+        "offload_to_cpu_default": True,
+        "offload_dit_to_cpu_default": True,
+        "quantization_default": True,
+        "compile_model_default": True,
         "lm_memory_gb": {},
     },
     "tier3": {  # 6-8GB
-        "max_duration_with_lm": 240,  # 4 minutes with LM
-        "max_duration_without_lm": 360,  # 6 minutes without LM
-        "max_batch_size_with_lm": 1,
+        # Offload mode.  DiT(4.46) + context(0.5) ≈ 5.0GB.
+        # ~1.5-3GB headroom allows LM 0.6B (1.2+0.6=1.8GB) and batch=2.
+        # vllm KV cache is tight; pt backend is safer for 0.6B on this tier.
+        "max_duration_with_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 600,  # 10 minutes (max supported)
+        "max_batch_size_with_lm": 2,
         "max_batch_size_without_lm": 2,
-        "init_lm_default": False,  # Don't init by default due to limited memory
+        "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B"],
+        "recommended_lm_model": "acestep-5Hz-lm-0.6B",
+        "lm_backend_restriction": "pt_mlx_only",  # vllm KV cache too greedy for <8GB
+        "recommended_backend": "pt",
+        "offload_to_cpu_default": True,
+        "offload_dit_to_cpu_default": True,
+        "quantization_default": True,
+        "compile_model_default": True,
         "lm_memory_gb": {"0.6B": 3},
     },
     "tier4": {  # 8-12GB
-        "max_duration_with_lm": 240,  # 4 minutes with LM
-        "max_duration_without_lm": 360,  # 6 minutes without LM
+        # Can keep DiT + 0.6B LM simultaneously on GPU (4.46+1.2+0.6=6.26GB).
+        # Offload VAE/TextEnc.  Plenty of room for inference activations.
+        "max_duration_with_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 600,  # 10 minutes (max supported)
         "max_batch_size_with_lm": 2,
         "max_batch_size_without_lm": 4,
-        "init_lm_default": False,  # Don't init by default
+        "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B"],
+        "recommended_lm_model": "acestep-5Hz-lm-0.6B",
+        "lm_backend_restriction": "all",  # vllm fits with 0.6B
+        "recommended_backend": "vllm",
+        "offload_to_cpu_default": True,
+        "offload_dit_to_cpu_default": True,
+        "quantization_default": True,
+        "compile_model_default": True,
         "lm_memory_gb": {"0.6B": 3},
     },
     "tier5": {  # 12-16GB
-        "max_duration_with_lm": 240,  # 4 minutes with LM
-        "max_duration_without_lm": 360,  # 6 minutes without LM
-        "max_batch_size_with_lm": 2,
+        # DiT + 1.7B LM (4.46+3.45+0.44=8.35GB) fits comfortably.
+        # VAE decode is batch-sequential so batch size doesn't affect VAE VRAM.
+        "max_duration_with_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 600,  # 10 minutes (max supported)
+        "max_batch_size_with_lm": 4,
         "max_batch_size_without_lm": 4,
         "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B"],
+        "recommended_lm_model": "acestep-5Hz-lm-1.7B",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
+        "offload_to_cpu_default": True,
+        "offload_dit_to_cpu_default": False,  # 12-16GB can keep DiT on GPU
+        "quantization_default": True,
+        "compile_model_default": True,
         "lm_memory_gb": {"0.6B": 3, "1.7B": 8},
     },
-    "tier6": {  # 16-24GB
+    "tier6a": {  # 16-20GB (e.g., RTX 4060 Ti 16GB, RTX 3080 16GB)
+        # On 16GB GPUs: DiT(INT8, ~2.4GB) + LM 1.7B(~7.6GB peak with offload) = ~10GB peak
+        # Empirical batch tests (60s, turbo): noLM-4→13.3GB, LM-2→11.9GB, LM-4→~13.5GB
+        # With CPU offload, LM is offloaded after inference → DiT batch has full 16GB budget.
         "max_duration_with_lm": 480,  # 8 minutes
-        "max_duration_without_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 600,  # 10 minutes (max supported)
         "max_batch_size_with_lm": 4,
         "max_batch_size_without_lm": 8,
         "init_lm_default": True,
+        "available_lm_models": ["acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B"],
+        "recommended_lm_model": "acestep-5Hz-lm-1.7B",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
+        "offload_to_cpu_default": True,  # Still offload VAE/TextEnc to save VRAM for LM
+        "offload_dit_to_cpu_default": False,
+        "quantization_default": True,
+        "compile_model_default": True,
+        "lm_memory_gb": {"0.6B": 3, "1.7B": 8},
+    },
+    "tier6b": {  # 20-24GB (e.g., RTX 3090, RTX 4090)
+        # 20-24GB: no offload, no quantization. DiT(bf16, ~4.7GB) + LM 1.7B(~3.4GB) = ~8.1GB
+        # Remaining ~12-16GB easily fits batch=8. VAE decode is batch-sequential.
+        "max_duration_with_lm": 480,  # 8 minutes
+        "max_duration_without_lm": 480,  # 8 minutes
+        "max_batch_size_with_lm": 8,
+        "max_batch_size_without_lm": 8,
+        "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-4B"],
+        "recommended_lm_model": "acestep-5Hz-lm-1.7B",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
+        "offload_to_cpu_default": False,  # 20-24GB can hold all models
+        "offload_dit_to_cpu_default": False,
+        "quantization_default": False,  # Enough VRAM, quantization optional
+        "compile_model_default": True,
         "lm_memory_gb": {"0.6B": 3, "1.7B": 8, "4B": 12},
     },
     "unlimited": {  # >= 24GB
@@ -121,9 +255,19 @@ GPU_TIER_CONFIGS = {
         "max_batch_size_without_lm": 8,
         "init_lm_default": True,
         "available_lm_models": ["acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-1.7B", "acestep-5Hz-lm-4B"],
+        "recommended_lm_model": "acestep-5Hz-lm-4B",
+        "lm_backend_restriction": "all",
+        "recommended_backend": "vllm",
+        "offload_to_cpu_default": False,
+        "offload_dit_to_cpu_default": False,
+        "quantization_default": False,  # Plenty of VRAM
+        "compile_model_default": True,
         "lm_memory_gb": {"0.6B": 3, "1.7B": 8, "4B": 12},
     },
 }
+
+# Backward compatibility alias: code that references "tier6" gets tier6b behavior
+GPU_TIER_CONFIGS["tier6"] = GPU_TIER_CONFIGS["tier6b"]
 
 
 def get_gpu_memory_gb() -> float:
@@ -145,6 +289,38 @@ def get_gpu_memory_gb() -> float:
         try:
             simulated_gb = float(debug_vram)
             logger.warning(f"⚠️ DEBUG MODE: Simulating GPU memory as {simulated_gb:.1f}GB (set via {DEBUG_MAX_CUDA_VRAM_ENV} environment variable)")
+            # Also enforce a hard VRAM cap via PyTorch so that the allocator
+            # cannot use more than the simulated amount.  This makes the
+            # simulation realistic — without it, models still load into the
+            # real (larger) GPU memory and nvitop shows much higher usage.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    total_bytes = torch.cuda.get_device_properties(0).total_memory
+                    total_gb = total_bytes / (1024 ** 3)
+                    if simulated_gb < total_gb:
+                        # When simulating a smaller GPU on a larger one, the host
+                        # GPU's CUDA context is typically much bigger (e.g. A100
+                        # ~1.4GB vs GTX 1060 ~0.3GB).  Using the host context
+                        # would over-penalise the allocator budget.
+                        #
+                        # Instead we use a *reference* context size that matches
+                        # what the target-class GPU would actually have.  Consumer
+                        # GPUs (≤24GB) typically have 0.3-0.5GB context overhead.
+                        REFERENCE_CONTEXT_GB = MODEL_VRAM.get("cuda_context", 0.5)
+                        allocator_budget_gb = max(0.5, simulated_gb - REFERENCE_CONTEXT_GB)
+                        fraction = allocator_budget_gb / total_gb
+                        # Clamp to [0.01, 1.0] to satisfy PyTorch constraints
+                        fraction = max(0.01, min(1.0, fraction))
+                        torch.cuda.set_per_process_memory_fraction(fraction)
+                        logger.warning(
+                            f"⚠️ DEBUG MODE: Set CUDA memory fraction to {fraction:.4f} "
+                            f"(allocator_budget={allocator_budget_gb:.2f}GB, "
+                            f"ref_context={REFERENCE_CONTEXT_GB:.2f}GB, target={simulated_gb:.1f}GB, "
+                            f"total={total_gb:.1f}GB) to enforce hard VRAM cap"
+                        )
+            except Exception as e:
+                logger.warning(f"⚠️ DEBUG MODE: Could not enforce CUDA memory cap: {e}")
             return simulated_gb
         except ValueError:
             logger.warning(f"Invalid {DEBUG_MAX_CUDA_VRAM_ENV} value: {debug_vram}, ignoring")
@@ -312,7 +488,7 @@ def get_gpu_tier(gpu_memory_gb: float) -> str:
         gpu_memory_gb: GPU memory in GB
 
     Returns:
-        Tier string: "tier1", "tier2", "tier3", "tier4", "tier5", "tier6", or "unlimited"
+        Tier string: "tier1", "tier2", "tier3", "tier4", "tier5", "tier6a", "tier6b", or "unlimited"
     """
     if gpu_memory_gb <= 0:
         # CPU mode - use tier1 limits
@@ -327,10 +503,13 @@ def get_gpu_tier(gpu_memory_gb: float) -> str:
         return "tier4"
     elif gpu_memory_gb < VRAM_16GB_MIN_GB:
         return "tier5"
-    elif gpu_memory_gb <= 24:
+    elif gpu_memory_gb < VRAM_AUTO_OFFLOAD_THRESHOLD_GB:
+        # 16-20GB range: tier6a (constrained, needs offload)
         if gpu_memory_gb < 16.0:
             logger.info(f"Detected {gpu_memory_gb:.2f}GB VRAM — treating as 16GB class GPU")
-        return "tier6"
+        return "tier6a"
+    elif gpu_memory_gb <= 24:
+        return "tier6b"
     else:
         return "unlimited"
 
@@ -360,6 +539,13 @@ def get_gpu_config(gpu_memory_gb: Optional[float] = None) -> GPUConfig:
         max_batch_size_without_lm=config["max_batch_size_without_lm"],
         init_lm_default=config["init_lm_default"],
         available_lm_models=config["available_lm_models"],
+        recommended_lm_model=config.get("recommended_lm_model", ""),
+        lm_backend_restriction=config.get("lm_backend_restriction", "all"),
+        recommended_backend=config.get("recommended_backend", "vllm"),
+        offload_to_cpu_default=config.get("offload_to_cpu_default", True),
+        offload_dit_to_cpu_default=config.get("offload_dit_to_cpu_default", True),
+        quantization_default=config.get("quantization_default", True),
+        compile_model_default=config.get("compile_model_default", True),
         lm_memory_gb=config["lm_memory_gb"],
     )
 
@@ -369,8 +555,8 @@ def get_lm_model_size(model_path: str) -> str:
     Extract LM model size from model path.
 
     Args:
-        model_path: Model path string (e.g., "acestep-5Hz-lm-0.6B")
-
+        model_path: Model path string (e.g., "acestep-5Hz-lm-0.6B", "acestep-5Hz-lm-0.6B-v4-fix")
+        
     Returns:
         Model size string: "0.6B", "1.7B", or "4B"
     """
@@ -385,44 +571,358 @@ def get_lm_model_size(model_path: str) -> str:
         return "0.6B"
 
 
+def is_lm_model_size_allowed(disk_model_name: str, tier_available_models: List[str]) -> bool:
+    """
+    Check if a disk LM model is allowed by the tier's available models list.
+    
+    Uses size-based matching so that variants like "acestep-5Hz-lm-0.6B-v4-fix"
+    are correctly matched against "acestep-5Hz-lm-0.6B" in the tier config.
+    
+    Args:
+        disk_model_name: Actual model directory name on disk (e.g., "acestep-5Hz-lm-0.6B-v4-fix")
+        tier_available_models: List of tier-allowed model base names (e.g., ["acestep-5Hz-lm-0.6B"])
+        
+    Returns:
+        True if the model's size class is allowed by the tier
+    """
+    if not tier_available_models:
+        return False
+    model_size = get_lm_model_size(disk_model_name)
+    for tier_model in tier_available_models:
+        if model_size == get_lm_model_size(tier_model):
+            return True
+    return False
+
+
+def find_best_lm_model_on_disk(recommended_model: str, disk_models: List[str]) -> Optional[str]:
+    """
+    Find the best matching disk model for a recommended tier model.
+    
+    If the exact recommended model exists on disk, return it.
+    Otherwise, find a disk model with the same size class (e.g., "0.6B").
+    Prefers models with version suffixes (e.g., "-v4-fix") as they are likely newer.
+    
+    Args:
+        recommended_model: Tier-recommended model name (e.g., "acestep-5Hz-lm-0.6B")
+        disk_models: List of model names actually on disk
+        
+    Returns:
+        Best matching disk model name, or None if no match
+    """
+    if not recommended_model or not disk_models:
+        return disk_models[0] if disk_models else None
+    
+    # Exact match first
+    if recommended_model in disk_models:
+        return recommended_model
+    
+    # Size-based match: find all disk models with same size
+    target_size = get_lm_model_size(recommended_model)
+    candidates = [m for m in disk_models if get_lm_model_size(m) == target_size]
+    
+    if candidates:
+        # Prefer the one with the longest name (likely has version suffix = newer)
+        return max(candidates, key=len)
+    
+    # No match for recommended size; return first available disk model
+    return disk_models[0] if disk_models else None
+
+
 def get_lm_gpu_memory_ratio(model_path: str, total_gpu_memory_gb: float) -> Tuple[float, float]:
     """
     Calculate GPU memory utilization ratio for LM model.
-
+    
+    This function now uses *actually free* VRAM (via torch.cuda.mem_get_info)
+    when available, instead of computing the ratio purely from total VRAM.
+    This is critical because DiT, VAE, and text encoder are already loaded
+    when the LM initializes, so the "available" memory is much less than total.
+    
     Args:
         model_path: LM model path (e.g., "acestep-5Hz-lm-0.6B")
-        total_gpu_memory_gb: Total GPU memory in GB
-
+        total_gpu_memory_gb: Total GPU memory in GB (used as fallback)
+        
     Returns:
         Tuple of (gpu_memory_utilization_ratio, target_memory_gb)
     """
     model_size = get_lm_model_size(model_path)
     
-    # Model weight memory (approximate) for each model size
-    model_weight_memory = {
-        "0.6B": 3.0,
-        "1.7B": 8.0,
-        "4B": 12.0,
-    }
+    # Use empirical LM VRAM measurements for target memory
+    lm_info = LM_VRAM.get(model_size, LM_VRAM["0.6B"])
+    lm_weights_gb = lm_info["weights"]
+    lm_kv_cache_gb = lm_info["kv_cache_4k"]
     
-    target_gb = model_weight_memory.get(model_size, 3.0)
+    # Total target = model weights + KV cache + small overhead
+    target_gb = lm_weights_gb
+    total_target_gb = lm_weights_gb + lm_kv_cache_gb + 0.3  # 0.3 GB overhead
     
-    # gpu_memory_utilization in nano-vllm caps the TOTAL GPU memory usage
-    # (model weights + KV cache + overhead). If we set it to just the model
-    # weight size, there is almost no room left for KV cache and inference
-    # fails with "Insufficient KV cache" errors.
-    # We therefore add generous headroom so the KV cache can hold at least
-    # max_model_len (4096) tokens comfortably.
-    total_target_gb = target_gb * 1.5  # 50% headroom for KV cache + overhead
+    # Try to use actual free memory for a more accurate ratio
+    free_gb = None
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            actual_total_gb = total_bytes / (1024**3)
+            
+            # If MAX_CUDA_VRAM is set, use the simulated values instead
+            # because set_per_process_memory_fraction limits actual allocation
+            debug_vram = os.environ.get(DEBUG_MAX_CUDA_VRAM_ENV)
+            if debug_vram is not None:
+                try:
+                    simulated_gb = float(debug_vram)
+                    if simulated_gb < actual_total_gb:
+                        # Use reference context (matching set_per_process_memory_fraction)
+                        ref_context_gb = MODEL_VRAM.get("cuda_context", 0.5)
+                        allocator_budget_gb = max(0.5, simulated_gb - ref_context_gb)
+                        reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+                        free_gb = max(0, allocator_budget_gb - reserved_gb)
+                        actual_total_gb = simulated_gb
+                except (ValueError, TypeError):
+                    pass
+            
+            # The ratio is relative to total GPU memory (nano-vllm convention),
+            # but we compute it so that the LM only claims what's actually free
+            # minus a safety margin for DiT inference activations.
+            # Reserve at least 1.5 GB for DiT inference activations
+            dit_reserve_gb = 1.5
+            usable_for_lm = max(0, free_gb - dit_reserve_gb - VRAM_SAFETY_MARGIN_GB)
+            
+            # Cap to what the LM actually needs
+            usable_for_lm = min(usable_for_lm, total_target_gb)
+            
+            # Convert to ratio of total GPU memory
+            # nano-vllm uses: target_total_usage = total * gpu_memory_utilization
+            # We want: (total * ratio) = current_usage + usable_for_lm
+            current_usage_gb = actual_total_gb - free_gb
+            desired_total_usage = current_usage_gb + usable_for_lm
+            ratio = desired_total_usage / actual_total_gb
+            
+            ratio = min(0.9, max(0.1, ratio))
+            
+            logger.info(
+                f"[get_lm_gpu_memory_ratio] model={model_size}, free={free_gb:.2f}GB, "
+                f"current_usage={current_usage_gb:.2f}GB, lm_target={total_target_gb:.2f}GB, "
+                f"usable_for_lm={usable_for_lm:.2f}GB, ratio={ratio:.3f}"
+            )
+            return ratio, target_gb
+    except Exception as e:
+        logger.warning(f"[get_lm_gpu_memory_ratio] Failed to query free VRAM: {e}, using fallback")
     
-    # For large GPUs (>=24GB), don't restrict memory too much
+    # Fallback: compute ratio from total VRAM (less accurate)
     if total_gpu_memory_gb >= 24:
         ratio = min(0.9, max(0.2, total_target_gb / total_gpu_memory_gb))
     else:
-        # For smaller GPUs, strictly limit memory usage
         ratio = min(0.9, max(0.1, total_target_gb / total_gpu_memory_gb))
     
     return ratio, target_gb
+
+
+def compute_adaptive_config(total_vram_gb: float, dit_type: str = "turbo") -> GPUConfig:
+    """
+    Compute GPU configuration based on what actually fits in VRAM.
+    
+    This is a VRAM-budget-based approach: instead of hard-coded tier boundaries,
+    we calculate how much memory each component needs and determine what fits.
+    
+    Args:
+        total_vram_gb: Total GPU VRAM in GB
+        dit_type: "turbo" or "base" (affects inference VRAM due to CFG)
+        
+    Returns:
+        GPUConfig with parameters that fit within the VRAM budget
+    """
+    # Calculate base VRAM usage (always loaded)
+    dit_key = f"dit_{dit_type}" if f"dit_{dit_type}" in MODEL_VRAM else "dit_turbo"
+    base_usage = (
+        MODEL_VRAM[dit_key]
+        + MODEL_VRAM["vae"]
+        + MODEL_VRAM["text_encoder"]
+        + MODEL_VRAM["cuda_context"]
+        + MODEL_VRAM["silence_latent"]
+        + VRAM_SAFETY_MARGIN_GB
+    )
+    
+    available = total_vram_gb - base_usage
+    
+    if available <= 0:
+        # Not enough for even base models - CPU offload required
+        return get_gpu_config(total_vram_gb)
+    
+    # Determine which LM models fit
+    available_lm_models = []
+    lm_memory_gb = {}
+    
+    for size_key in ["0.6B", "1.7B", "4B"]:
+        lm_info = LM_VRAM[size_key]
+        lm_total = lm_info["weights"] + lm_info["kv_cache_4k"]
+        # LM needs to fit with some room left for inference activations
+        inference_per_batch = DIT_INFERENCE_VRAM_PER_BATCH.get(dit_type, 0.8)
+        if lm_total + inference_per_batch <= available:
+            model_name = f"acestep-5Hz-lm-{size_key}"
+            available_lm_models.append(model_name)
+            lm_memory_gb[size_key] = lm_info["weights"] + lm_info["kv_cache_4k"]
+    
+    # Determine max batch sizes
+    inference_per_batch = DIT_INFERENCE_VRAM_PER_BATCH.get(dit_type, 0.8)
+    
+    # Without LM: all available VRAM goes to inference
+    max_batch_no_lm = max(1, int(available / inference_per_batch))
+    max_batch_no_lm = min(max_batch_no_lm, 8)  # Cap at 8
+    
+    # With LM: subtract the largest available LM from available
+    if available_lm_models:
+        largest_lm_size = list(lm_memory_gb.keys())[-1]
+        lm_usage = lm_memory_gb[largest_lm_size]
+        remaining_for_inference = available - lm_usage
+        max_batch_with_lm = max(1, int(remaining_for_inference / inference_per_batch))
+        max_batch_with_lm = min(max_batch_with_lm, 8)
+    else:
+        max_batch_with_lm = max_batch_no_lm
+    
+    # Determine duration limits based on available VRAM
+    # Longer durations need more VRAM for latents
+    if total_vram_gb >= 24:
+        max_dur_lm = 600
+        max_dur_no_lm = 600
+    elif total_vram_gb >= 20:
+        max_dur_lm = 480
+        max_dur_no_lm = 480
+    elif total_vram_gb >= 16:
+        max_dur_lm = 360
+        max_dur_no_lm = 480
+    elif total_vram_gb >= 12:
+        max_dur_lm = 240
+        max_dur_no_lm = 360
+    elif total_vram_gb >= 8:
+        max_dur_lm = 240
+        max_dur_no_lm = 360
+    else:
+        max_dur_lm = 180
+        max_dur_no_lm = 180
+    
+    tier = get_gpu_tier(total_vram_gb)
+    tier_config = GPU_TIER_CONFIGS.get(tier, {})
+    
+    return GPUConfig(
+        tier=tier,
+        gpu_memory_gb=total_vram_gb,
+        max_duration_with_lm=max_dur_lm,
+        max_duration_without_lm=max_dur_no_lm,
+        max_batch_size_with_lm=max_batch_with_lm,
+        max_batch_size_without_lm=max_batch_no_lm,
+        init_lm_default=bool(available_lm_models),
+        available_lm_models=available_lm_models,
+        recommended_lm_model=tier_config.get("recommended_lm_model", available_lm_models[0] if available_lm_models else ""),
+        lm_backend_restriction=tier_config.get("lm_backend_restriction", "all"),
+        recommended_backend=tier_config.get("recommended_backend", "vllm"),
+        offload_to_cpu_default=tier_config.get("offload_to_cpu_default", True),
+        offload_dit_to_cpu_default=tier_config.get("offload_dit_to_cpu_default", True),
+        quantization_default=tier_config.get("quantization_default", True),
+        compile_model_default=tier_config.get("compile_model_default", True),
+        lm_memory_gb=lm_memory_gb,
+    )
+
+
+def get_effective_free_vram_gb(device_index: int = 0) -> float:
+    """
+    Get the effective free VRAM in GB, accounting for per-process memory fraction.
+    
+    torch.cuda.mem_get_info() reports *device-level* free memory, which ignores
+    the per-process cap set by torch.cuda.set_per_process_memory_fraction().
+    
+    This function computes:
+        effective_free = min(device_free, process_allowed - process_allocated)
+    
+    where process_allowed = total_memory * memory_fraction.
+    
+    Returns 0 if no GPU is available or on error.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 0.0
+        
+        device_free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        
+        # Check if a per-process memory fraction has been set
+        # We detect this by checking MAX_CUDA_VRAM env var (our simulation mechanism)
+        debug_vram = os.environ.get(DEBUG_MAX_CUDA_VRAM_ENV)
+        if debug_vram is not None:
+            try:
+                simulated_gb = float(debug_vram)
+                total_gb = total_bytes / (1024 ** 3)
+                if simulated_gb < total_gb:
+                    # Per-process cap is active.
+                    # Use the same reference context as set_per_process_memory_fraction.
+                    ref_context_gb = MODEL_VRAM.get("cuda_context", 0.5)
+                    allocator_budget_gb = max(0.5, simulated_gb - ref_context_gb)
+                    allocator_budget_bytes = allocator_budget_gb * (1024 ** 3)
+                    reserved_bytes = torch.cuda.memory_reserved(device_index)
+                    # Free = what the allocator is allowed minus what it has reserved
+                    process_free = allocator_budget_bytes - reserved_bytes
+                    effective_free = min(device_free_bytes, process_free)
+                    return max(0.0, effective_free / (1024 ** 3))
+            except (ValueError, TypeError):
+                pass
+        
+        return device_free_bytes / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def get_available_vram_gb() -> float:
+    """
+    Get currently available (free) GPU VRAM in GB.
+    Returns 0 if no GPU is available or on error.
+    
+    This is an alias for get_effective_free_vram_gb() that accounts for
+    per-process memory fraction caps.
+    """
+    return get_effective_free_vram_gb()
+
+
+def estimate_inference_vram(
+    batch_size: int,
+    duration_s: float,
+    dit_type: str = "turbo",
+    with_lm: bool = False,
+    lm_size: str = "0.6B",
+) -> float:
+    """
+    Estimate total VRAM needed for a generation request.
+    
+    Args:
+        batch_size: Number of samples to generate
+        duration_s: Audio duration in seconds
+        dit_type: "turbo" or "base"
+        with_lm: Whether LM is loaded
+        lm_size: LM model size if with_lm is True
+        
+    Returns:
+        Estimated VRAM in GB
+    """
+    # Base model weights
+    dit_key = f"dit_{dit_type}" if f"dit_{dit_type}" in MODEL_VRAM else "dit_turbo"
+    base = (
+        MODEL_VRAM[dit_key]
+        + MODEL_VRAM["vae"]
+        + MODEL_VRAM["text_encoder"]
+        + MODEL_VRAM["cuda_context"]
+    )
+    
+    # DiT inference activations (scales with batch size and duration)
+    per_batch = DIT_INFERENCE_VRAM_PER_BATCH.get(dit_type, 0.8)
+    # Duration scaling: longer audio = more latent frames = more memory
+    duration_factor = max(1.0, duration_s / 60.0)  # Normalize to 60s baseline
+    inference = per_batch * batch_size * duration_factor
+    
+    # LM memory
+    lm_mem = 0.0
+    if with_lm and lm_size in LM_VRAM:
+        lm_info = LM_VRAM[lm_size]
+        lm_mem = lm_info["weights"] + lm_info["kv_cache_4k"]
+    
+    return base + inference + lm_mem + VRAM_SAFETY_MARGIN_GB
 
 
 def check_duration_limit(

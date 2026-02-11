@@ -70,6 +70,9 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["cfg_interval_start"],
             generation_section["cfg_interval_end"],
             generation_section["task_type"],
+            # GPU-config-aware limits (updated after initialization)
+            generation_section["audio_duration"],
+            generation_section["batch_size_input"],
         ]
     )
     

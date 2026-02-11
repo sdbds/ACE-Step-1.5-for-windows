@@ -468,7 +468,7 @@ ACESTEP_INIT_LLM=false
 | `--init_llm` | auto | LLM 初期化：`true` / `false` / 省略で自動 |
 | `--config_path` | auto | DiT モデル（例：`acestep-v15-turbo`） |
 | `--lm_model_path` | auto | LM モデル（例：`acestep-5Hz-lm-1.7B`） |
-| `--offload_to_cpu` | auto | CPU オフロード（VRAM < 16GB で自動有効化） |
+| `--offload_to_cpu` | auto | CPU オフロード（GPU ティアに基づいて自動設定） |
 | `--download-source` | auto | モデルソース：`auto` / `huggingface` / `modelscope` |
 | `--enable-api` | false | Gradio UI と同時に REST API エンドポイントを有効化 |
 
@@ -529,16 +529,17 @@ huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/ac
 
 ## 💡 どのモデルを選ぶべき？
 
-ACE-Step は GPU の VRAM に自動適応します：
+ACE-Step は GPU の VRAM に自動適応します。UI は検出された GPU ティアに基づいてすべての設定（LM モデル、バックエンド、オフロード、量子化）を事前構成します：
 
-| GPU VRAM | 推奨 LM モデル | 備考 |
-|----------|---------------|------|
-| **≤6GB** | なし（DiTのみ） | メモリ節約のため LM はデフォルトで無効 |
-| **6-12GB** | `acestep-5Hz-lm-0.6B` | 軽量、バランスが良い |
-| **12-16GB** | `acestep-5Hz-lm-1.7B` | より高品質 |
-| **≥16GB** | `acestep-5Hz-lm-4B` | 最高品質と音声理解能力 |
+| GPU VRAM | 推奨 LM モデル | バックエンド | 備考 |
+|----------|---------------|-------------|------|
+| **≤6GB** | なし（DiTのみ） | — | LM はデフォルトで無効；INT8 量子化 + 完全 CPU オフロード |
+| **6-8GB** | `acestep-5Hz-lm-0.6B` | `pt` | 軽量 LM、PyTorch バックエンド |
+| **8-16GB** | `0.6B` / `1.7B` | `vllm` | 8-12GB は 0.6B、12-16GB は 1.7B |
+| **16-24GB** | `acestep-5Hz-lm-1.7B` | `vllm` | 20GB+ で 4B 利用可能；20GB+ でオフロード不要 |
+| **≥24GB** | `acestep-5Hz-lm-4B` | `vllm` | 最高品質、すべてのモデルがオフロードなしで動作 |
 
-> 📖 GPU 互換性の詳細（時間制限、バッチサイズ、メモリ最適化）は [GPU 互換性ガイド](GPU_COMPATIBILITY.md) を参照してください。
+> 📖 GPU 互換性の詳細（ティアテーブル、時間制限、バッチサイズ、アダプティブ UI デフォルト、メモリ最適化）は [GPU 互換性ガイド](GPU_COMPATIBILITY.md) を参照してください。
 
 ---
 

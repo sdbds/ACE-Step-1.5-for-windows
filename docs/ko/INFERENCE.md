@@ -267,3 +267,4 @@ result = generate_music(dit_handler, llm_handler, params, config, save_dir="/out
 2. **Turbo 모델 활용**: 빠른 반복 작업에는 `turbo` 모델을 사용하는 것이 효율적입니다.
 3. **Thinking 모드**: 더 논리적인 음악 구조가 필요할 때 `thinking=True`를 사용하되, 메모리가 부족하면 끌 수 있습니다.
 4. **결과 반복**: 배치 크기를 2-4로 설정하여 여러 버전을 한 번에 듣고 최적의 결과를 고르는 것이 좋습니다.
+5. **메모리 관리**: ACE-Step 1.5는 자동 VRAM 관리를 포함합니다 — VRAM 가드(자동 배치 축소), 적응형 VAE 디코딩(CPU 대체), 자동 청크 크기 조정. OOM이 발생하면 시스템이 자동으로 처리합니다. 각 VRAM 티어의 권장 설정은 [GPU_COMPATIBILITY.md](../ko/GPU_COMPATIBILITY.md)를 참조하세요.

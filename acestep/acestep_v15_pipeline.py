@@ -36,7 +36,7 @@ try:
     from .llm_inference import LLMHandler
     from .dataset_handler import DatasetHandler
     from .gradio_ui import create_gradio_interface
-    from .gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB
+    from .gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB, VRAM_AUTO_OFFLOAD_THRESHOLD_GB
     from .model_downloader import ensure_lm_model
 except ImportError:
     # When executed as a script: `python acestep/acestep_v15_pipeline.py`
@@ -47,7 +47,7 @@ except ImportError:
     from acestep.llm_inference import LLMHandler
     from acestep.dataset_handler import DatasetHandler
     from acestep.gradio_ui import create_gradio_interface
-    from acestep.gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB
+    from acestep.gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB, VRAM_AUTO_OFFLOAD_THRESHOLD_GB
     from acestep.model_downloader import ensure_lm_model
 
 
@@ -93,7 +93,11 @@ def main():
     set_global_gpu_config(gpu_config)  # Set global config for use across modules
     
     gpu_memory_gb = gpu_config.gpu_memory_gb
-    auto_offload = gpu_memory_gb > 0 and gpu_memory_gb < VRAM_16GB_MIN_GB
+    # Enable auto-offload for GPUs below 20 GB.  16 GB GPUs cannot hold all
+    # models simultaneously (DiT ~4.7 + VAE ~0.3 + text_enc ~1.2 + LM ≥1.2 +
+    # activations) so they *must* offload.  The old threshold of 16 GB caused
+    # 16 GB GPUs to never offload, leading to OOM.
+    auto_offload = gpu_memory_gb > 0 and gpu_memory_gb < VRAM_AUTO_OFFLOAD_THRESHOLD_GB
     
     # Print GPU configuration info
     print(f"\n{'='*60}")
@@ -110,9 +114,9 @@ def main():
     print(f"{'='*60}\n")
     
     if auto_offload:
-        print(f"Auto-enabling CPU offload (GPU < 16GB)")
+        print(f"Auto-enabling CPU offload (GPU {gpu_memory_gb:.1f}GB < {VRAM_AUTO_OFFLOAD_THRESHOLD_GB}GB threshold)")
     elif gpu_memory_gb > 0:
-        print(f"CPU offload disabled by default (GPU >= 16GB)")
+        print(f"CPU offload disabled by default (GPU {gpu_memory_gb:.1f}GB >= {VRAM_AUTO_OFFLOAD_THRESHOLD_GB}GB threshold)")
     else:
         print("No GPU detected, running on CPU")
 
@@ -204,6 +208,19 @@ def main():
         if 0 < gpu_memory_gb <= 24:
             args.offload_to_cpu = True
             print(f"Auto-enabling CPU offload (4B LM model requires offloading on {gpu_memory_gb:.0f}GB GPU)")
+
+    # Safety: on 16GB GPUs, prevent selecting LM models that are too large.
+    # Even with offloading, a 4B LM (8 GB weights + KV cache) leaves almost no
+    # headroom for DiT activations on a 16 GB card.
+    if args.lm_model_path and 0 < gpu_memory_gb < VRAM_AUTO_OFFLOAD_THRESHOLD_GB:
+        if "4B" in args.lm_model_path:
+            # Downgrade to 1.7B if available
+            fallback = args.lm_model_path.replace("4B", "1.7B")
+            print(
+                f"WARNING: 4B LM model is too large for {gpu_memory_gb:.0f}GB GPU. "
+                f"Downgrading to 1.7B variant: {fallback}"
+            )
+            args.lm_model_path = fallback
 
     try:
         init_params = None

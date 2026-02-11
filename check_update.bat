@@ -101,30 +101,31 @@ set FETCH_SUCCESS=0
 "!GIT_PATH!" fetch origin --quiet 2>nul
 if %ERRORLEVEL% EQU 0 (
     set FETCH_SUCCESS=1
-) else (
-    REM Try with timeout using a temp marker file
-    set TEMP_MARKER=%TEMP%\acestep_git_fetch_%RANDOM%.tmp
-
-    REM Start fetch in background
-    set "FETCH_CMD=!GIT_PATH! fetch origin --quiet"
-    start /b "" cmd /c "!FETCH_CMD! >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
-
-    REM Wait with timeout
-    set /a COUNTER=0
-    :WaitLoop
-    if exist "!TEMP_MARKER!" (
-        set FETCH_SUCCESS=1
-        del "!TEMP_MARKER!" >nul 2>&1
-        goto :FetchDone
-    )
-
-    timeout /t 1 /nobreak >nul
-    set /a COUNTER+=1
-    if !COUNTER! LSS %TIMEOUT_SECONDS% goto :WaitLoop
-
-    REM Timeout reached
-    echo   [Timeout] Could not connect to GitHub within %TIMEOUT_SECONDS% seconds.
 )
+if !FETCH_SUCCESS! EQU 1 goto :FetchDone
+
+REM Try with timeout using a temp marker file
+set TEMP_MARKER=%TEMP%\acestep_git_fetch_%RANDOM%.tmp
+
+REM Start fetch in background
+set "FETCH_CMD=!GIT_PATH! fetch origin --quiet"
+start /b "" cmd /c "!FETCH_CMD! >nul 2>&1 && echo SUCCESS > "!TEMP_MARKER!""
+
+REM Wait with timeout
+set /a COUNTER=0
+:WaitLoop
+if exist "!TEMP_MARKER!" (
+    set FETCH_SUCCESS=1
+    del "!TEMP_MARKER!" >nul 2>&1
+    goto :FetchDone
+)
+
+timeout /t 1 /nobreak >nul
+set /a COUNTER+=1
+if !COUNTER! LSS %TIMEOUT_SECONDS% goto :WaitLoop
+
+REM Timeout reached
+echo   [Timeout] Could not connect to GitHub within %TIMEOUT_SECONDS% seconds.
 
 :FetchDone
 if %FETCH_SUCCESS% EQU 0 (
@@ -378,11 +379,7 @@ if "%CURRENT_COMMIT%"=="%REMOTE_COMMIT%" (
 
             REM Check if there are any untracked files
             set HAS_UNTRACKED=0
-            for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do (
-                set HAS_UNTRACKED=1
-                goto :CheckUntrackedConflicts
-            )
-            :CheckUntrackedConflicts
+            for /f "usebackq delims=" %%u in ("!TEMP_UNTRACKED!") do set HAS_UNTRACKED=1
 
             if !HAS_UNTRACKED! EQU 1 (
                 REM Get files added in remote

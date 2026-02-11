@@ -229,4 +229,6 @@ If none of the above solutions work:
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
-| `MAX_CUDA_VRAM` | Override detected VRAM (testing) | `8` (simulate 8GB GPU) |
+| `MAX_CUDA_VRAM` | Override detected VRAM for tier simulation (also enforces hard VRAM cap via `set_per_process_memory_fraction`) | `8` (simulate 8GB GPU) |
+
+> **Note on `MAX_CUDA_VRAM`**: When set, this variable not only changes the tier detection logic but also calls `torch.cuda.set_per_process_memory_fraction()` to enforce a hard VRAM limit. This means OOM errors during simulation are realistic and reflect actual behavior on GPUs with that amount of VRAM. See [GPU_COMPATIBILITY.md](GPU_COMPATIBILITY.md) for the full tier table.

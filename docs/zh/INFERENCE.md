@@ -975,13 +975,21 @@ else:
         # ... 处理音频文件
 ```
 
-### 7. 内存管理
+### 7. 显存管理
 
-对于大批量大小或长时长：
-- 监控 GPU 内存使用
-- 如果出现 OOM 错误，减少 `batch_size`
-- 减少 `lm_batch_chunk_size` 用于 LM 操作
-- 考虑在初始化期间使用 `offload_to_cpu=True`
+ACE-Step 1.5 包含自动显存管理，可适应您的 GPU：
+
+- **自动等级检测**: 系统检测可用显存并选择最佳设置（详见 [GPU_COMPATIBILITY.md](../zh/GPU_COMPATIBILITY.md)）
+- **显存守卫**: 每次推理前，系统估算显存需求，必要时自动减小 `batch_size`
+- **自适应 VAE 解码**: 三级回退 — GPU 分片解码 → GPU 解码+CPU 卸载 → 完全 CPU 解码
+- **自动分片大小**: VAE 解码分片大小根据空闲显存自适应调整（64/128/256/512/1024/1536）
+- **时长/批次裁剪**: 超出等级限制的值会自动裁剪并显示警告
+
+手动调优：
+- 如果仍然出现 OOM 错误，减少 `batch_size`
+- 低显存 GPU 上减少 `lm_batch_chunk_size` 用于 LM 操作
+- 显存 <20GB 时启用 `offload_to_cpu=True`
+- 显存 <20GB 时启用 `quantization="int8_weight_only"`
 
 ---
 
@@ -989,8 +997,8 @@ else:
 
 ### 常见问题
 
-**问题**：内存不足错误
-- **解决方案**：减少 `batch_size`、`inference_steps`，或启用 CPU 卸载
+**问题**：显存不足 (OOM) 错误
+- **解决方案**：系统应通过显存守卫（自动减小批次）和自适应 VAE 解码（CPU 回退）自动处理大多数 OOM 场景。如果仍然出现 OOM：减少 `batch_size`、减少 `inference_steps`、启用 CPU 卸载（`offload_to_cpu=True`）或启用 INT8 量化。详见 [GPU_COMPATIBILITY.md](../zh/GPU_COMPATIBILITY.md) 了解各显存等级的推荐设置。
 
 **问题**：结果质量差
 - **解决方案**：增加 `inference_steps`，调整 `guidance_scale`，使用 base 模型
