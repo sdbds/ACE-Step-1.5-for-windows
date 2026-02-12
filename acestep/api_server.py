@@ -43,7 +43,7 @@ import tempfile
 import urllib.parse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -645,6 +645,8 @@ class AutoLabelRequest(BaseModel):
     transcribe_lyrics: bool = Field(default=False, description="Transcribe lyrics from audio")
     only_unlabeled: bool = Field(default=False, description="Only label unlabeled samples")
 
+    lm_model_path: Optional[str] = Field(default=None, description="Optional LM model path to use for labeling (temporary switch)")
+
     save_path: Optional[str] = Field(default=None, description="Optional dataset JSON path to persist progress during auto-label")
 
     chunk_size: int = Field(default=16, ge=1, description="Chunk size for batch audio encoding")
@@ -694,6 +696,157 @@ class UpdateSampleRequest(BaseModel):
 
 class PreprocessDatasetRequest(BaseModel):
     output_dir: str = Field(..., description="Output directory for preprocessed tensors")
+    skip_existing: bool = Field(default=False, description="Skip tensors that already exist (by sample id filename)")
+
+
+def _stop_tensorboard(app: FastAPI) -> None:
+    """Stop TensorBoard process if running."""
+    try:
+        proc = getattr(app.state, "tensorboard_process", None)
+    except Exception:
+        proc = None
+
+    if proc is None:
+        return
+
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        app.state.tensorboard_process = None
+    except Exception:
+        pass
+
+
+def _start_tensorboard(app: FastAPI, logdir: str) -> Optional[str]:
+    """(Re)start TensorBoard with the given logdir and return URL if successful."""
+    try:
+        import subprocess
+
+        tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
+        _stop_tensorboard(app)
+
+        app.state.tensorboard_process = subprocess.Popen(
+            [
+                "tensorboard",
+                "--logdir",
+                logdir,
+                "--port",
+                str(tensorboard_port),
+                "--bind_all",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return f"http://localhost:{tensorboard_port}"
+    except Exception:
+        return None
+
+
+@contextmanager
+def _temporary_llm_model(app: FastAPI, llm: "LLMHandler", lm_model_path: Optional[str]):
+    """Temporarily switch LLM model for a critical section and restore afterward.
+
+    This is intentionally best-effort and conservative:
+    - If lm_model_path is empty/None -> no-op
+    - If LLM isn't initialized -> no-op (handlers already validate this)
+    - Uses app.state._llm_init_lock to serialize LLM re-inits
+    """
+    desired = (lm_model_path or "").strip()
+    if not desired:
+        yield
+        return
+
+    if llm is None or not getattr(llm, "llm_initialized", False):
+        yield
+        return
+
+    lock = getattr(app.state, "_llm_init_lock", None)
+    if lock is None:
+        yield
+        return
+
+    with lock:
+        prev_params = getattr(llm, "last_init_params", None)
+        prev_model = (prev_params or {}).get("lm_model_path") if isinstance(prev_params, dict) else None
+        if prev_model and prev_model.strip() == desired:
+            yield
+            return
+
+        project_root = _get_project_root()
+        checkpoint_dir = os.path.join(project_root, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        lm_model_name = _get_model_name(desired)
+        if lm_model_name:
+            try:
+                _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+            except Exception:
+                pass
+
+        restore_params = prev_params if isinstance(prev_params, dict) else None
+
+        ok_switched = False
+        try:
+            new_params = dict(restore_params) if restore_params else {
+                "checkpoint_dir": checkpoint_dir,
+                "backend": os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower() or "vllm",
+                "device": os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto")),
+                "offload_to_cpu": _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False),
+                "dtype": None,
+            }
+            new_params["checkpoint_dir"] = checkpoint_dir
+            new_params["lm_model_path"] = desired
+
+            status, ok = llm.initialize(**new_params)
+            if ok:
+                ok_switched = True
+                try:
+                    app.state._llm_initialized = True
+                    app.state._llm_init_error = None
+                except Exception:
+                    pass
+            else:
+                try:
+                    app.state._llm_initialized = False
+                    app.state._llm_init_error = status
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                app.state._llm_initialized = False
+                app.state._llm_init_error = str(e)
+            except Exception:
+                pass
+
+        try:
+            yield
+        finally:
+            if not ok_switched:
+                return
+            if not restore_params:
+                return
+            try:
+                llm.initialize(**restore_params)
+                try:
+                    app.state._llm_initialized = True
+                    app.state._llm_init_error = None
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    app.state._llm_initialized = False
+                    app.state._llm_init_error = str(e)
+                except Exception:
+                    pass
 
 
 class StartTrainingRequest(BaseModel):
@@ -935,6 +1088,243 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _device_to_str(device: torch.device) -> str:
+    if device.type in ("cuda", "xpu") and device.index is not None:
+        return f"{device.type}:{device.index}"
+    return device.type
+
+
+def _first_param_device(module: Any) -> Optional[torch.device]:
+    if module is None:
+        return None
+    try:
+        p = next(module.parameters(), None)
+        return getattr(p, "device", None) if p is not None else None
+    except Exception:
+        return None
+
+
+def _unwrap_module(module: Any) -> Any:
+    """Best-effort unwrap for Lightning/Fabric/DDP wrapped modules.
+
+    Fabric wraps modules with an object exposing `_forward_module`.
+    DDP-style wrappers often expose `.module`.
+    """
+    cur = module
+    for _ in range(8):
+        if cur is None:
+            return cur
+        inner = None
+        if hasattr(cur, "_forward_module"):
+            inner = getattr(cur, "_forward_module", None)
+        elif hasattr(cur, "__wrapped__"):
+            inner = getattr(cur, "__wrapped__", None)
+        elif hasattr(cur, "wrapped_module"):
+            inner = getattr(cur, "wrapped_module", None)
+        elif hasattr(cur, "module"):
+            inner = getattr(cur, "module", None)
+        elif hasattr(cur, "_orig_mod"):
+            inner = getattr(cur, "_orig_mod", None)
+
+        if inner is None or inner is cur:
+            break
+        cur = inner
+    return cur
+
+
+class _RuntimeComponentManager:
+    """Best-effort reversible offload/unload helper for long-running tasks.
+
+    IMPORTANT: This code must never permanently destroy handler components.
+    Offload = move module weights to CPU and restore later.
+    Unload  = drop LLM weights and restore by re-initialization.
+    """
+
+    def __init__(self, handler: AceStepHandler, llm: Optional[LLMHandler] = None, app_state: Any = None):
+        self.handler = handler
+        self.llm = llm
+        self.app_state = app_state
+
+        self._decoder_restore_device: Optional[str] = None
+        self._vae_restore_device: Optional[str] = None
+        self._text_encoder_restore_device: Optional[str] = None
+        self._model_encoder_restore_device: Optional[str] = None
+
+        self._llm_restore_params: Optional[Dict[str, Any]] = None
+        self.decoder_moved = False
+        self.vae_moved = False
+        self.text_encoder_moved = False
+        self.model_encoder_moved = False
+        self.llm_unloaded = False
+
+    def _recursive_to_device(self, module: Any, device: str, dtype: Optional[torch.dtype] = None) -> None:
+        if module is None:
+            return
+        if hasattr(self.handler, "_recursive_to_device"):
+            self.handler._recursive_to_device(module, device, dtype)
+            return
+        if dtype is None:
+            module.to(device)
+        else:
+            module.to(device).to(dtype)
+
+    def _empty_cache(self) -> None:
+        try:
+            if hasattr(self.handler, "_empty_cache"):
+                self.handler._empty_cache()
+                return
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def move_decoder_to(self, device: str) -> None:
+        model = getattr(self.handler, "model", None)
+        dec = getattr(model, "decoder", None) if model is not None else None
+        if dec is None:
+            return
+        dev = _first_param_device(dec)
+        cur = _device_to_str(dev) if dev is not None else "cpu"
+        if cur == device:
+            return
+        if self._decoder_restore_device is None:
+            self._decoder_restore_device = cur
+        self._recursive_to_device(dec, device, getattr(self.handler, "dtype", None))
+        self.decoder_moved = True
+        self._empty_cache()
+
+    def offload_decoder_to_cpu(self) -> None:
+        self.move_decoder_to("cpu")
+
+    def offload_vae_to_cpu(self) -> None:
+        vae = getattr(self.handler, "vae", None)
+        if vae is None:
+            return
+        dev = _first_param_device(vae)
+        cur = _device_to_str(dev) if dev is not None else "cpu"
+        if cur == "cpu":
+            return
+        if self._vae_restore_device is None:
+            self._vae_restore_device = cur
+        dtype = None
+        try:
+            dtype = self.handler._get_vae_dtype("cpu")
+        except Exception:
+            dtype = None
+        self._recursive_to_device(vae, "cpu", dtype)
+        self.vae_moved = True
+        self._empty_cache()
+
+    def offload_text_encoder_to_cpu(self) -> None:
+        te = getattr(self.handler, "text_encoder", None)
+        if te is None:
+            return
+        dev = _first_param_device(te)
+        cur = _device_to_str(dev) if dev is not None else "cpu"
+        if cur == "cpu":
+            return
+        if self._text_encoder_restore_device is None:
+            self._text_encoder_restore_device = cur
+        self._recursive_to_device(te, "cpu", getattr(self.handler, "dtype", None))
+        self.text_encoder_moved = True
+        self._empty_cache()
+
+    def offload_model_encoder_to_cpu(self) -> None:
+        model = getattr(self.handler, "model", None)
+        enc = getattr(model, "encoder", None) if model is not None else None
+        if enc is None:
+            return
+        dev = _first_param_device(enc)
+        cur = _device_to_str(dev) if dev is not None else "cpu"
+        if cur == "cpu":
+            return
+        if self._model_encoder_restore_device is None:
+            self._model_encoder_restore_device = cur
+        self._recursive_to_device(enc, "cpu", getattr(self.handler, "dtype", None))
+        self.model_encoder_moved = True
+        self._empty_cache()
+
+    def unload_llm(self) -> None:
+        if self.llm is None:
+            return
+        if not getattr(self.llm, "llm_initialized", False):
+            return
+
+        self._llm_restore_params = getattr(self.llm, "last_init_params", None)
+        try:
+            self.llm.unload()
+            self.llm_unloaded = True
+            if self.app_state is not None:
+                try:
+                    self.app_state._llm_initialized = False
+                    self.app_state._llm_init_error = None
+                except Exception:
+                    pass
+        finally:
+            self._empty_cache()
+
+    def restore(self) -> None:
+        try:
+            if self._decoder_restore_device is not None:
+                self.move_decoder_to(self._decoder_restore_device)
+
+            if self._vae_restore_device is not None:
+                vae = getattr(self.handler, "vae", None)
+                if vae is not None:
+                    dtype = None
+                    try:
+                        dtype = self.handler._get_vae_dtype(self._vae_restore_device)
+                    except Exception:
+                        dtype = None
+                    self._recursive_to_device(vae, self._vae_restore_device, dtype)
+                    self._empty_cache()
+
+            if self._text_encoder_restore_device is not None:
+                te = getattr(self.handler, "text_encoder", None)
+                if te is not None:
+                    self._recursive_to_device(te, self._text_encoder_restore_device, getattr(self.handler, "dtype", None))
+                    self._empty_cache()
+
+            if self._model_encoder_restore_device is not None:
+                model = getattr(self.handler, "model", None)
+                enc = getattr(model, "encoder", None) if model is not None else None
+                if enc is not None:
+                    self._recursive_to_device(enc, self._model_encoder_restore_device, getattr(self.handler, "dtype", None))
+                    self._empty_cache()
+
+            if self.llm is not None and self.llm_unloaded and self._llm_restore_params is not None:
+                # Best-effort restore; if it fails keep the error in app.state.
+                try:
+                    status, ok = self.llm.initialize(**self._llm_restore_params)
+                    if self.app_state is not None:
+                        try:
+                            if ok:
+                                self.app_state._llm_initialized = True
+                                self.app_state._llm_init_error = None
+                            else:
+                                self.app_state._llm_initialized = False
+                                self.app_state._llm_init_error = status
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if self.app_state is not None:
+                        try:
+                            self.app_state._llm_initialized = False
+                            self.app_state._llm_init_error = str(e)
+                        except Exception:
+                            pass
+        finally:
+            self._empty_cache()
 
 
 
@@ -1754,7 +2144,7 @@ def create_app() -> FastAPI:
                     keyscale=key_scale,
                     timesignature=time_signature,
                     duration=audio_duration if audio_duration else -1.0,
-                    inference_steps=req.inference_steps,
+                    inference_steps=actual_inference_steps,
                     seed=req.seed,
                     guidance_scale=req.guidance_scale,
                     use_adg=req.use_adg,
@@ -2353,7 +2743,7 @@ def create_app() -> FastAPI:
                 lm_backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
                 if lm_backend not in {"vllm", "pt", "mlx"}:
                     lm_backend = "vllm"
-                lm_device = os.getenv("ACESTEP_LM_DEVICE", device)
+                lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
 
                 # Auto-determine LM offload based on GPU config
                 lm_offload_env = os.getenv("ACESTEP_LM_OFFLOAD_TO_CPU")
@@ -2434,205 +2824,6 @@ def create_app() -> FastAPI:
 
     @app.post("/release_task")
     async def create_music_generate_job(request: Request, authorization: Optional[str] = Header(None)):
-        content_type = (request.headers.get("content-type") or "").lower()
-        temp_files: list[str] = []
-
-        def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
-            """Build GenerateMusicRequest from parsed parameters."""
-            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
-            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
-            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
-            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
-            return GenerateMusicRequest(
-                prompt=p.str("prompt"),
-                lyrics=p.str("lyrics"),
-                thinking=p.bool("thinking"),
-                analysis_only=p.bool("analysis_only"),
-                full_analysis_only=p.bool("full_analysis_only"),
-                sample_mode=p.bool("sample_mode"),
-                sample_query=p.str("sample_query"),
-                use_format=p.bool("use_format"),
-                model=p.str("model") or None,
-                bpm=p.int("bpm"),
-                key_scale=p.str("key_scale"),
-                time_signature=p.str("time_signature"),
-                audio_duration=p.float("audio_duration"),
-                vocal_language=p.str("vocal_language", "en"),
-                inference_steps=p.int("inference_steps", 8),
-                guidance_scale=p.float("guidance_scale", 7.0),
-                use_random_seed=p.bool("use_random_seed", True),
-                seed=p.int("seed", -1),
-                batch_size=p.int("batch_size"),
-                repainting_start=p.float("repainting_start", 0.0),
-                repainting_end=p.float("repainting_end"),
-                instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
-                audio_cover_strength=p.float("audio_cover_strength", 1.0),
-                reference_audio_path=ref_audio,
-                src_audio_path=src_audio,
-                task_type=p.str("task_type", "text2music"),
-                use_adg=p.bool("use_adg"),
-                cfg_interval_start=p.float("cfg_interval_start", 0.0),
-                cfg_interval_end=p.float("cfg_interval_end", 1.0),
-                infer_method=p.str("infer_method", "ode"),
-                shift=p.float("shift", 3.0),
-                audio_format=p.str("audio_format", "mp3"),
-                use_tiled_decode=p.bool("use_tiled_decode", True),
-                lm_model_path=p.str("lm_model_path") or None,
-                lm_backend=p.str("lm_backend", "vllm"),
-                lm_temperature=p.float("lm_temperature", LM_DEFAULT_TEMPERATURE),
-                lm_cfg_scale=p.float("lm_cfg_scale", LM_DEFAULT_CFG_SCALE),
-                lm_top_k=p.int("lm_top_k"),
-                lm_top_p=p.float("lm_top_p", LM_DEFAULT_TOP_P),
-                lm_repetition_penalty=p.float("lm_repetition_penalty", 1.0),
-                lm_negative_prompt=p.str("lm_negative_prompt", "NO USER INPUT"),
-                constrained_decoding=p.bool("constrained_decoding", True),
-                constrained_decoding_debug=p.bool("constrained_decoding_debug"),
-                use_cot_caption=p.bool("use_cot_caption", True),
-                use_cot_language=p.bool("use_cot_language", True),
-                is_format_caption=p.bool("is_format_caption"),
-                allow_lm_batch=p.bool("allow_lm_batch", True),
-                **kwargs,
-            )
-
-        if content_type.startswith("application/json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-            
-            # Explicitly validate manual string paths from JSON input
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.endswith("+json"):
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise HTTPException(status_code=400, detail="JSON payload must be an object")
-            verify_token_from_request(body, authorization)
-            
-            p = RequestParser(body)
-            req = _build_request(
-                p,
-                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-            )
-
-        elif content_type.startswith("multipart/form-data"):
-            form = await request.form()
-            form_dict = {k: v for k, v in form.items() if not hasattr(v, 'read')}
-            verify_token_from_request(form_dict, authorization)
-
-            # Support both naming conventions: ref_audio/reference_audio, ctx_audio/src_audio
-            ref_up = form.get("ref_audio") or form.get("reference_audio")
-            ctx_up = form.get("ctx_audio") or form.get("src_audio")
-
-            reference_audio_path = None
-            src_audio_path = None
-
-            if isinstance(ref_up, StarletteUploadFile):
-                reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
-                temp_files.append(reference_audio_path)
-            else:
-                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-
-            if isinstance(ctx_up, StarletteUploadFile):
-                src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
-                temp_files.append(src_audio_path)
-            else:
-                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-
-            req = _build_request(
-                RequestParser(dict(form)),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        elif content_type.startswith("application/x-www-form-urlencoded"):
-            form = await request.form()
-            form_dict = dict(form)
-            verify_token_from_request(form_dict, authorization)
-            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
-            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
-            req = _build_request(
-                RequestParser(form_dict),
-                reference_audio_path=reference_audio_path,
-                src_audio_path=src_audio_path,
-            )
-
-        else:
-            raw = await request.body()
-            raw_stripped = raw.lstrip()
-            # Best-effort: accept missing/incorrect Content-Type if payload is valid JSON.
-            if raw_stripped.startswith(b"{") or raw_stripped.startswith(b"["):
-                try:
-                    body = json.loads(raw.decode("utf-8"))
-                    if isinstance(body, dict):
-                        verify_token_from_request(body, authorization)
-                        p = RequestParser(body)
-                        req = _build_request(
-                            p,
-                            reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
-                            src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
-                        )
-                    else:
-                        raise HTTPException(status_code=400, detail="JSON payload must be an object")
-                except HTTPException:
-                    raise
-                except Exception:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid JSON body (hint: set 'Content-Type: application/json')",
-                    )
-            # Best-effort: parse key=value bodies even if Content-Type is missing.
-            elif raw_stripped and b"=" in raw:
-                parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
-                flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
-                verify_token_from_request(flat, authorization)
-                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
-                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
-                req = _build_request(
-                    RequestParser(flat),
-                    reference_audio_path=reference_audio_path,
-                    src_audio_path=src_audio_path,
-                )
-            else:
-                raise HTTPException(
-                    status_code=415,
-                    detail=(
-                        f"Unsupported Content-Type: {content_type or '(missing)'}; "
-                        "use application/json, application/x-www-form-urlencoded, or multipart/form-data"
-                    ),
-                )
-
-        rec = store.create()
-
-        q: asyncio.Queue = app.state.job_queue
-        if q.full():
-            for p in temp_files:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-            raise HTTPException(status_code=429, detail="Server busy: queue is full")
-
-        if temp_files:
-            async with app.state.job_temp_files_lock:
-                app.state.job_temp_files[rec.job_id] = temp_files
-
-        async with app.state.pending_lock:
-            app.state.pending_ids.append(rec.job_id)
-            position = len(app.state.pending_ids)
-
-        await q.put((rec.job_id, req))
-        return _wrap_response({"task_id": rec.job_id, "status": "queued", "queue_position": position})
-
-    @app.post("/query_result")
-    async def query_result(request: Request, authorization: Optional[str] = Header(None)):
-        """Batch query job results"""
         content_type = (request.headers.get("content-type") or "").lower()
 
         if "json" in content_type:
@@ -3184,107 +3375,96 @@ def create_app() -> FastAPI:
         if llm is None or not llm.llm_initialized:
             raise HTTPException(status_code=500, detail="LLM not initialized")
 
-        # Offload decoder to CPU during labeling to save VRAM
-        # Auto-labeling only needs: VAE + model.tokenize + LLM (no decoder required)
-        decoder_on_gpu = False
-        if handler.model is not None and hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
-            try:
-                # Check if decoder is on GPU
-                first_param = next(handler.model.decoder.parameters(), None)
-                if first_param is not None and first_param.device.type != "cpu":
-                    decoder_on_gpu = True
-                    import gc
-                    handler.model.decoder = handler.model.decoder.to("cpu")
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            except Exception:
-                pass
+        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
+        mgr.offload_decoder_to_cpu()
 
         try:
-            resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
-            resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
-            resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
+            with _temporary_llm_model(app, llm, request.lm_model_path):
+                resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
+                resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
+                resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
 
-            if resolved_save_path:
-                try:
-                    dataset = {
-                        "metadata": builder.metadata.to_dict(),
-                        "samples": [s.to_dict() for s in builder.samples],
+                if resolved_save_path:
+                    try:
+                        dataset = {
+                            "metadata": builder.metadata.to_dict(),
+                            "samples": [s.to_dict() for s in builder.samples],
+                        }
+                        _atomic_write_json(resolved_save_path, dataset)
+                    except Exception:
+                        logger.exception("Auto-label initial save failed")
+
+                def sample_labeled_callback(sample_idx: int, sample, status: str):
+                    if resolved_save_path is None:
+                        return
+                    if "✅" not in status:
+                        return
+
+                    try:
+                        if resolved_jsonl_path is not None:
+                            _append_jsonl(
+                                resolved_jsonl_path,
+                                {
+                                    "ts": time.time(),
+                                    "index": sample_idx,
+                                    "status": status,
+                                    "sample": sample.to_dict(),
+                                },
+                            )
+                        dataset = {
+                            "metadata": builder.metadata.to_dict(),
+                            "samples": [s.to_dict() for s in builder.samples],
+                        }
+                        _atomic_write_json(resolved_save_path, dataset)
+                    except Exception:
+                        logger.exception("Auto-label incremental save failed")
+
+                samples, status = builder.label_all_samples(
+                    dit_handler=handler,
+                    llm_handler=llm,
+                    format_lyrics=request.format_lyrics,
+                    transcribe_lyrics=request.transcribe_lyrics,
+                    skip_metas=request.skip_metas,
+                    only_unlabeled=request.only_unlabeled,
+                    chunk_size=request.chunk_size,
+                    batch_size=request.batch_size,
+                    progress_callback=None,
+                    sample_labeled_callback=sample_labeled_callback,
+                )
+
+                # Return full sample data with all metadata
+                samples_data = [
+                    {
+                        "index": i,
+                        "filename": s.filename,
+                        "audio_path": s.audio_path,
+                        "duration": s.duration,
+                        "caption": s.caption,
+                        "genre": s.genre,
+                        "prompt_override": s.prompt_override,
+                        "lyrics": s.lyrics,
+                        "bpm": s.bpm,
+                        "keyscale": s.keyscale,
+                        "timesignature": s.timesignature,
+                        "language": s.language,
+                        "is_instrumental": s.is_instrumental,
+                        "labeled": s.labeled,
                     }
-                    _atomic_write_json(resolved_save_path, dataset)
-                except Exception:
-                    logger.exception("Auto-label initial save failed")
+                    for i, s in enumerate(builder.samples)
+                ]
 
-            def sample_labeled_callback(sample_idx: int, sample, status: str):
-                if resolved_save_path is None:
-                    return
-                if "✅" not in status:
-                    return
-                try:
-                    if resolved_jsonl_path is not None:
-                        _append_jsonl(
-                            resolved_jsonl_path,
-                            {
-                                "ts": time.time(),
-                                "index": sample_idx,
-                                "status": status,
-                                "sample": sample.to_dict(),
-                            },
-                        )
-                    dataset = {
-                        "metadata": builder.metadata.to_dict(),
-                        "samples": [s.to_dict() for s in builder.samples],
-                    }
-                    _atomic_write_json(resolved_save_path, dataset)
-                except Exception:
-                    logger.exception("Auto-label incremental save failed")
+                if mgr.decoder_moved:
+                    status += "\nℹ️ Decoder was temporarily offloaded during labeling and restored afterward."
 
-            samples, status = builder.label_all_samples(
-                dit_handler=handler,
-                llm_handler=llm,
-                format_lyrics=request.format_lyrics,
-                transcribe_lyrics=request.transcribe_lyrics,
-                skip_metas=request.skip_metas,
-                only_unlabeled=request.only_unlabeled,
-                chunk_size=request.chunk_size,
-                batch_size=request.batch_size,
-                progress_callback=None,
-                sample_labeled_callback=sample_labeled_callback,
-            )
-
-            # Return full sample data with all metadata
-            samples_data = [
-                {
-                    "index": i,
-                    "filename": s.filename,
-                    "audio_path": s.audio_path,
-                    "duration": s.duration,
-                    "caption": s.caption,
-                    "genre": s.genre,
-                    "prompt_override": s.prompt_override,
-                    "lyrics": s.lyrics,
-                    "bpm": s.bpm,
-                    "keyscale": s.keyscale,
-                    "timesignature": s.timesignature,
-                    "language": s.language,
-                    "is_instrumental": s.is_instrumental,
-                    "labeled": s.labeled,
-                }
-                for i, s in enumerate(builder.samples)
-            ]
-
-            # Add note about decoder offloading
-            if decoder_on_gpu:
-                status += "\n⚠️ Decoder offloaded to CPU to save VRAM. It will be automatically reloaded to GPU when training starts."
-
-            return _wrap_response({
-                "message": status,
-                "labeled_count": builder.get_labeled_count(),
-                "samples": samples_data
-            })
+                return _wrap_response({
+                    "message": status,
+                    "labeled_count": builder.get_labeled_count(),
+                    "samples": samples_data
+                })
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Auto-label failed: {str(e)}")
+        finally:
+            mgr.restore()
 
     @app.post("/v1/dataset/auto_label_async")
     async def auto_label_dataset_async(request: AutoLabelRequest, _: None = Depends(verify_api_key)):
@@ -3354,126 +3534,115 @@ def create_app() -> FastAPI:
 
         # Background labeling function
         def run_labeling():
+            mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
+            mgr.offload_decoder_to_cpu()
+
             try:
-                # Offload decoder to CPU
-                decoder_on_gpu = False
-                if handler.model is not None and hasattr(handler.model, 'decoder') and handler.model.decoder is not None:
-                    try:
-                        first_param = next(handler.model.decoder.parameters(), None)
-                        if first_param is not None and first_param.device.type != "cpu":
-                            decoder_on_gpu = True
-                            import gc
-                            handler.model.decoder = handler.model.decoder.to("cpu")
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-
-                # Progress callback
-                def progress_callback(msg: str):
-                    with _auto_label_lock:
-                        task = _auto_label_tasks.get(task_id)
-                        if task:
-                            task.progress = msg
-                            task.updated_at = time.time()
-                            import re
-                            match = re.match(r'^(?:VAE encoding|Tokenizing|Labeling|Encoding) (\d+)/(\d+)', msg)
-                            if match:
-                                task.current = int(match.group(1))
-                                task.total = int(match.group(2))
-
-                resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
-
-                def sample_labeled_callback(sample_idx: int, sample, status: str):
-                    if "✅" not in status:
-                        return
-
-                    with _auto_label_lock:
-                        task = _auto_label_tasks.get(task_id)
-                        if task:
-                            task.progress = status
-                            task.last_updated_index = sample_idx
-                            task.last_updated_sample = sample.to_dict()
-                            task.updated_at = time.time()
-
-                    if resolved_save_path is None:
-                        return
-                    try:
-                        if resolved_jsonl_path is not None:
-                            _append_jsonl(
-                                resolved_jsonl_path,
-                                {
-                                    "ts": time.time(),
-                                    "index": sample_idx,
-                                    "status": status,
-                                    "sample": sample.to_dict(),
-                                },
-                            )
-                        dataset = {
-                            "metadata": builder.metadata.to_dict(),
-                            "samples": [s.to_dict() for s in builder.samples],
-                        }
-                        _atomic_write_json(resolved_save_path, dataset)
-                    except Exception:
-                        logger.exception("Auto-label incremental save failed")
+                with _temporary_llm_model(app, llm, request.lm_model_path):
+                    # Progress callback
+                    def progress_callback(msg: str):
                         with _auto_label_lock:
                             task = _auto_label_tasks.get(task_id)
                             if task:
-                                task.progress = "⚠️ Auto-label incremental save failed (see server logs)"
+                                task.progress = msg
+                                task.updated_at = time.time()
+                                import re
+                                match = re.match(r'^(?:VAE encoding|Tokenizing|Labeling|Encoding) (\d+)/(\d+)', msg)
+                                if match:
+                                    task.current = int(match.group(1))
+                                    task.total = int(match.group(2))
+
+                    resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
+
+                    def sample_labeled_callback(sample_idx: int, sample, status: str):
+                        if "✅" not in status:
+                            return
+
+                        with _auto_label_lock:
+                            task = _auto_label_tasks.get(task_id)
+                            if task:
+                                task.progress = status
+                                task.last_updated_index = sample_idx
+                                task.last_updated_sample = sample.to_dict()
                                 task.updated_at = time.time()
 
-                # Run labeling
-                samples, status = builder.label_all_samples(
-                    dit_handler=handler,
-                    llm_handler=llm,
-                    format_lyrics=request.format_lyrics,
-                    transcribe_lyrics=request.transcribe_lyrics,
-                    skip_metas=request.skip_metas,
-                    only_unlabeled=request.only_unlabeled,
-                    chunk_size=request.chunk_size,
-                    batch_size=request.batch_size,
-                    progress_callback=progress_callback,
-                    sample_labeled_callback=sample_labeled_callback,
-                )
+                        if resolved_save_path is None:
+                            return
+                        try:
+                            if resolved_jsonl_path is not None:
+                                _append_jsonl(
+                                    resolved_jsonl_path,
+                                    {
+                                        "ts": time.time(),
+                                        "index": sample_idx,
+                                        "status": status,
+                                        "sample": sample.to_dict(),
+                                    },
+                                )
+                            dataset = {
+                                "metadata": builder.metadata.to_dict(),
+                                "samples": [s.to_dict() for s in builder.samples],
+                            }
+                            _atomic_write_json(resolved_save_path, dataset)
+                        except Exception:
+                            logger.exception("Auto-label incremental save failed")
+                            with _auto_label_lock:
+                                task = _auto_label_tasks.get(task_id)
+                                if task:
+                                    task.progress = "⚠️ Auto-label incremental save failed (see server logs)"
+                                    task.updated_at = time.time()
 
-                # Prepare result
-                samples_data = [
-                    {
-                        "index": i,
-                        "filename": s.filename,
-                        "audio_path": s.audio_path,
-                        "duration": s.duration,
-                        "caption": s.caption,
-                        "genre": s.genre,
-                        "prompt_override": s.prompt_override,
-                        "lyrics": s.lyrics,
-                        "bpm": s.bpm,
-                        "keyscale": s.keyscale,
-                        "timesignature": s.timesignature,
-                        "language": s.language,
-                        "is_instrumental": s.is_instrumental,
-                        "labeled": s.labeled,
-                    }
-                    for i, s in enumerate(builder.samples)
-                ]
+                    # Run labeling
+                    samples, status = builder.label_all_samples(
+                        dit_handler=handler,
+                        llm_handler=llm,
+                        format_lyrics=request.format_lyrics,
+                        transcribe_lyrics=request.transcribe_lyrics,
+                        skip_metas=request.skip_metas,
+                        only_unlabeled=request.only_unlabeled,
+                        chunk_size=request.chunk_size,
+                        batch_size=request.batch_size,
+                        progress_callback=progress_callback,
+                        sample_labeled_callback=sample_labeled_callback,
+                    )
 
-                if decoder_on_gpu:
-                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM."
-
-                # Update task status
-                with _auto_label_lock:
-                    task = _auto_label_tasks.get(task_id)
-                    if task:
-                        task.status = "completed"
-                        task.progress = status
-                        task.current = task.total
-                        task.updated_at = time.time()
-                        task.result = {
-                            "message": status,
-                            "labeled_count": builder.get_labeled_count(),
-                            "samples": samples_data
+                    # Prepare result
+                    samples_data = [
+                        {
+                            "index": i,
+                            "filename": s.filename,
+                            "audio_path": s.audio_path,
+                            "duration": s.duration,
+                            "caption": s.caption,
+                            "genre": s.genre,
+                            "prompt_override": s.prompt_override,
+                            "lyrics": s.lyrics,
+                            "bpm": s.bpm,
+                            "keyscale": s.keyscale,
+                            "timesignature": s.timesignature,
+                            "language": s.language,
+                            "is_instrumental": s.is_instrumental,
+                            "labeled": s.labeled,
                         }
+                        for i, s in enumerate(builder.samples)
+                    ]
+
+                    if mgr.decoder_moved:
+                        status += "\nℹ️ Decoder was temporarily offloaded during labeling and restored afterward."
+
+                    # Update task status
+                    with _auto_label_lock:
+                        task = _auto_label_tasks.get(task_id)
+                        if task:
+                            task.status = "completed"
+                            task.progress = status
+                            task.current = task.total
+                            task.updated_at = time.time()
+                            task.result = {
+                                "message": status,
+                                "labeled_count": builder.get_labeled_count(),
+                                "samples": samples_data
+                            }
             except Exception as e:
                 with _auto_label_lock:
                     task = _auto_label_tasks.get(task_id)
@@ -3482,6 +3651,8 @@ def create_app() -> FastAPI:
                         task.error = str(e)
                         task.progress = f"Failed: {str(e)}"
                         task.updated_at = time.time()
+            finally:
+                mgr.restore()
 
         # Start background task
         import threading
@@ -3634,34 +3805,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="Model not initialized")
 
         preprocess_notes = []
-
-        decoder_offloaded = False
-        if handler.model is not None and hasattr(handler.model, "decoder") and handler.model.decoder is not None:
-            try:
-                first_param = next(handler.model.decoder.parameters(), None)
-                if first_param is not None and first_param.device.type != "cpu":
-                    handler.model.decoder = handler.model.decoder.to("cpu")
-                    decoder_offloaded = True
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            except Exception as e:
-                preprocess_notes.append(f"⚠️ Failed to offload decoder: {str(e)}")
-
-        # Unload LLM before preprocessing to free VRAM (preprocessing doesn't need LLM)
         llm: LLMHandler = app.state.llm_handler
-        llm_was_loaded = False
-        if llm and llm.llm_initialized:
-            llm_was_loaded = True
-            try:
-                llm.unload()
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                preprocess_notes.append(f"⚠️ Failed to unload LLM: {str(e)}")
+        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
+        mgr.offload_decoder_to_cpu()
+        mgr.unload_llm()
 
         try:
             # Run preprocessing in thread pool to avoid blocking event loop
@@ -3669,55 +3816,28 @@ def create_app() -> FastAPI:
                 builder.preprocess_to_tensors,
                 dit_handler=handler,
                 output_dir=request.output_dir.strip(),
+                skip_existing=request.skip_existing,
                 progress_callback=None,
             )
 
             if status.startswith("✅"):
-                # Unload VAE, text encoder, and model encoder after preprocessing
-                # Training only needs the decoder since all latents are pre-computed
-                components_unloaded = []
-
-                try:
-                    if handler.vae is not None:
-                        handler.vae = None
-                        components_unloaded.append("VAE")
-
-                    if handler.text_encoder is not None:
-                        handler.text_encoder = None
-                        handler.text_tokenizer = None
-                        components_unloaded.append("Text Encoder")
-
-                    if handler.model is not None and handler.model.encoder is not None:
-                        handler.model.encoder = None
-                        components_unloaded.append("Model Encoder")
-
-                    if components_unloaded:
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                # Add notes about unloading
-                if llm_was_loaded:
-                    status += "\n⚠️ LLM has been unloaded."
-                if decoder_offloaded:
-                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM for preprocessing."
+                if mgr.llm_unloaded:
+                    status += "\nℹ️ LLM was temporarily unloaded during preprocessing and restored afterward."
+                if mgr.decoder_moved:
+                    status += "\nℹ️ Decoder was temporarily offloaded during preprocessing and restored afterward."
                 if preprocess_notes:
                     status += "\n" + "\n".join(preprocess_notes)
-                if components_unloaded:
-                    status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
 
                 return _wrap_response({
                     "message": status,
                     "output_dir": request.output_dir,
                     "num_tensors": len(output_paths)
                 })
-            else:
-                return _wrap_response(None, code=400, error=status)
+            return _wrap_response(None, code=400, error=status)
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Preprocessing failed: {str(e)}")
+        finally:
+            mgr.restore()
 
     @app.post("/v1/dataset/preprocess_async")
     async def preprocess_dataset_async(request: PreprocessDatasetRequest, _: None = Depends(verify_api_key)):
@@ -3759,36 +3879,12 @@ def create_app() -> FastAPI:
 
         # Background preprocessing function
         def run_preprocessing():
+            mgr = _RuntimeComponentManager(handler=handler, llm=app.state.llm_handler, app_state=app.state)
+
             try:
                 preprocess_notes = []
-
-                decoder_offloaded = False
-                if handler.model is not None and hasattr(handler.model, "decoder") and handler.model.decoder is not None:
-                    try:
-                        first_param = next(handler.model.decoder.parameters(), None)
-                        if first_param is not None and first_param.device.type != "cpu":
-                            handler.model.decoder = handler.model.decoder.to("cpu")
-                            decoder_offloaded = True
-                            import gc
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                    except Exception as e:
-                        preprocess_notes.append(f"⚠️ Failed to offload decoder: {str(e)}")
-
-                # Unload LLM before preprocessing
-                llm: LLMHandler = app.state.llm_handler
-                llm_was_loaded = False
-                if llm and llm.llm_initialized:
-                    llm_was_loaded = True
-                    try:
-                        llm.unload()
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception as e:
-                        preprocess_notes.append(f"⚠️ Failed to unload LLM: {str(e)}")
+                mgr.offload_decoder_to_cpu()
+                mgr.unload_llm()
 
                 # Progress callback
                 def progress_callback(msg: str):
@@ -3806,42 +3902,16 @@ def create_app() -> FastAPI:
                 output_paths, status = builder.preprocess_to_tensors(
                     dit_handler=handler,
                     output_dir=request.output_dir.strip(),
+                    skip_existing=request.skip_existing,
                     progress_callback=progress_callback,
                 )
 
-                # Unload VAE, text encoder, and model encoder after preprocessing
-                components_unloaded = []
-                try:
-                    if handler.vae is not None:
-                        handler.vae = None
-                        components_unloaded.append("VAE")
-
-                    if handler.text_encoder is not None:
-                        handler.text_encoder = None
-                        handler.text_tokenizer = None
-                        components_unloaded.append("Text Encoder")
-
-                    if handler.model is not None and handler.model.encoder is not None:
-                        handler.model.encoder = None
-                        components_unloaded.append("Model Encoder")
-
-                    if components_unloaded:
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                except Exception:
-                    pass
-
-                # Add notes about unloading
-                if llm_was_loaded:
-                    status += "\n⚠️ LLM has been unloaded."
-                if decoder_offloaded:
-                    status += "\n⚠️ Decoder offloaded to CPU to save VRAM for preprocessing."
+                if mgr.llm_unloaded:
+                    status += "\nℹ️ LLM was temporarily unloaded during preprocessing and restored afterward."
+                if mgr.decoder_moved:
+                    status += "\nℹ️ Decoder was temporarily offloaded during preprocessing and restored afterward."
                 if preprocess_notes:
                     status += "\n" + "\n".join(preprocess_notes)
-                if components_unloaded:
-                    status += f"\n⚠️ {', '.join(components_unloaded)} unloaded to save VRAM for training."
 
                 # Update task status
                 with _preprocess_lock:
@@ -3862,6 +3932,8 @@ def create_app() -> FastAPI:
                         task.status = "failed"
                         task.error = str(e)
                         task.progress = f"Failed: {str(e)}"
+            finally:
+                mgr.restore()
 
         # Start background task
         import threading
@@ -3991,25 +4063,59 @@ def create_app() -> FastAPI:
             import gc
             reloaded = []
 
-            # Reload LLM if needed
-            if llm and not llm.llm_initialized:
-                project_root = _get_project_root()
-                checkpoint_dir = os.path.join(project_root, "checkpoints")
-                lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
-                backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
-                lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
-                lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-
-                status, ok = llm.initialize(
-                    checkpoint_dir=checkpoint_dir,
-                    lm_model_path=lm_model_path,
-                    backend=backend,
-                    device=lm_device,
-                    offload_to_cpu=lm_offload,
-                    dtype=handler.dtype,
+            # Reload full handler stack if critical components were destroyed.
+            # This is the only reliable recovery path from legacy code that set
+            # handler.vae/text_encoder/model.encoder = None.
+            params = getattr(handler, "last_init_params", None) or None
+            if params and (handler.model is None or handler.vae is None or handler.text_encoder is None):
+                status, ok = handler.initialize_service(
+                    project_root=params["project_root"],
+                    config_path=params["config_path"],
+                    device=params["device"],
+                    use_flash_attention=params["use_flash_attention"],
+                    compile_model=params["compile_model"],
+                    offload_to_cpu=params["offload_to_cpu"],
+                    offload_dit_to_cpu=params["offload_dit_to_cpu"],
+                    quantization=params.get("quantization"),
+                    prefer_source=params.get("prefer_source"),
+                    use_mlx_dit=params.get("use_mlx_dit", True),
                 )
                 if ok:
+                    reloaded.append("DiT/VAE/Text Encoder")
+
+            # Reload LLM if needed
+            if llm and not llm.llm_initialized:
+                llm_params = getattr(llm, "last_init_params", None)
+                if llm_params is None:
+                    project_root = _get_project_root()
+                    checkpoint_dir = os.path.join(project_root, "checkpoints")
+                    lm_model_path = os.getenv("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B").strip()
+                    backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
+                    lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
+                    lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
+                    llm_params = {
+                        "checkpoint_dir": checkpoint_dir,
+                        "lm_model_path": lm_model_path,
+                        "backend": backend,
+                        "device": lm_device,
+                        "offload_to_cpu": lm_offload,
+                        "dtype": None,
+                    }
+
+                status, ok = llm.initialize(**llm_params)
+                if ok:
                     reloaded.append("LLM")
+                    try:
+                        app.state._llm_initialized = True
+                        app.state._llm_init_error = None
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        app.state._llm_initialized = False
+                        app.state._llm_init_error = status
+                    except Exception:
+                        pass
 
             # Reload model components if needed
             if handler.model is not None:
@@ -4052,50 +4158,18 @@ def create_app() -> FastAPI:
                 detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
             )
 
-        # If decoder is on CPU (e.g., after auto-labeling), move it back to GPU
-        try:
-            first_param = next(handler.model.decoder.parameters(), None)
-            if first_param is not None and first_param.device.type == "cpu":
-                handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # If a previous run wrapped the decoder via Lightning Fabric, unwrap it.
+        handler.model.decoder = _unwrap_module(handler.model.decoder)
 
-        # Unload unnecessary components before training to free VRAM
-        # Training only needs decoder - all inputs are pre-computed tensors
-        try:
-            import gc
-            components_unloaded = []
-
-            # Unload LLM
-            llm: LLMHandler = app.state.llm_handler
-            if llm and llm.llm_initialized:
-                llm.unload()
-                components_unloaded.append("LLM")
-
-            # Unload VAE
-            if handler.vae is not None:
-                handler.vae = None
-                components_unloaded.append("VAE")
-
-            # Unload text encoder
-            if handler.text_encoder is not None:
-                handler.text_encoder = None
-                handler.text_tokenizer = None
-                components_unloaded.append("Text Encoder")
-
-            # Unload model encoder (training only uses decoder)
-            if handler.model is not None and hasattr(handler.model, 'encoder') and handler.model.encoder is not None:
-                handler.model.encoder = None
-                components_unloaded.append("Model Encoder")
-
-            if components_unloaded:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # Dynamic component management: offload what training doesn't need,
+        # then restore after training completes/stops.
+        llm: LLMHandler = app.state.llm_handler
+        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
+        mgr.move_decoder_to(str(handler.device))
+        mgr.offload_vae_to_cpu()
+        mgr.offload_text_encoder_to_cpu()
+        mgr.offload_model_encoder_to_cpu()
+        mgr.unload_llm()
 
         try:
             from acestep.training.trainer import LoRATrainer
@@ -4168,23 +4242,10 @@ def create_app() -> FastAPI:
                 "epochs": request.train_epochs,
             }
 
+            training_state["_component_manager"] = mgr
+
             # Start TensorBoard server if not already running
-            if not hasattr(app.state, 'tensorboard_process') or app.state.tensorboard_process is None:
-                try:
-                    import subprocess
-                    tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
-                    app.state.tensorboard_process = subprocess.Popen(
-                        ["tensorboard", "--logdir", request.lora_output_dir, "--port", str(tensorboard_port), "--bind_all"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
-                except Exception:
-                    # TensorBoard not available or failed to start
-                    training_state["tensorboard_url"] = None
-            else:
-                tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
-                training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+            training_state["tensorboard_url"] = _start_tensorboard(app, tensorboard_logdir)
 
             def _run_training_sync():
                 """Run training synchronously in thread pool."""
@@ -4243,6 +4304,20 @@ def create_app() -> FastAPI:
                 except Exception as e:
                     training_state["is_training"] = False
                     training_state["error"] = str(e)
+                finally:
+                    # Restore components regardless of stop/failure.
+                    try:
+                        if handler.model is not None and getattr(handler.model, "decoder", None) is not None:
+                            handler.model.decoder = _unwrap_module(handler.model.decoder)
+                            handler.model.decoder.eval()
+                    except Exception:
+                        pass
+                    try:
+                        cm = training_state.pop("_component_manager", None)
+                        if cm is not None:
+                            cm.restore()
+                    except Exception:
+                        pass
 
             # Run in thread pool to avoid blocking event loop
             executor: ThreadPoolExecutor = app.state.executor
@@ -4262,6 +4337,10 @@ def create_app() -> FastAPI:
 
         except Exception as e:
             training_state["is_training"] = False
+            try:
+                mgr.restore()
+            except Exception:
+                pass
             return _wrap_response(None, code=500, error=f"Failed to start training: {str(e)}")
 
     @app.post("/v1/training/start_lokr")
@@ -4282,45 +4361,16 @@ def create_app() -> FastAPI:
                 detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
             )
 
-        # Move decoder to GPU if on CPU
-        try:
-            first_param = next(handler.model.decoder.parameters(), None)
-            if first_param is not None and first_param.device.type == "cpu":
-                handler.model.decoder = handler.model.decoder.to(handler.device).to(handler.dtype)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # If a previous run wrapped the decoder via Lightning Fabric, unwrap it.
+        handler.model.decoder = _unwrap_module(handler.model.decoder)
 
-        # Unload unnecessary components to free VRAM
-        try:
-            import gc
-            components_unloaded = []
-
-            llm: LLMHandler = app.state.llm_handler
-            if llm and llm.llm_initialized:
-                llm.unload()
-                components_unloaded.append("LLM")
-
-            if handler.vae is not None:
-                handler.vae = None
-                components_unloaded.append("VAE")
-
-            if handler.text_encoder is not None:
-                handler.text_encoder = None
-                handler.text_tokenizer = None
-                components_unloaded.append("Text Encoder")
-
-            if handler.model is not None and hasattr(handler.model, 'encoder') and handler.model.encoder is not None:
-                handler.model.encoder = None
-                components_unloaded.append("Model Encoder")
-
-            if components_unloaded:
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        except Exception:
-            pass
+        llm: LLMHandler = app.state.llm_handler
+        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
+        mgr.move_decoder_to(str(handler.device))
+        mgr.offload_vae_to_cpu()
+        mgr.offload_text_encoder_to_cpu()
+        mgr.offload_model_encoder_to_cpu()
+        mgr.unload_llm()
 
         try:
             from acestep.training.trainer import LoKRTrainer
@@ -4329,10 +4379,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
 
         try:
+            _factor = request.lokr_factor
+            if _factor != -1:
+                _factor = int(_factor)
+                if _factor == 0:
+                    _factor = 1
+                _factor = min(_factor, 8)
+
             lokr_config = LoKRConfigClass(
                 linear_dim=request.lokr_linear_dim,
                 linear_alpha=request.lokr_linear_alpha,
-                factor=request.lokr_factor,
+                factor=_factor,
                 decompose_both=request.lokr_decompose_both,
                 use_tucker=request.lokr_use_tucker,
                 use_scalar=request.lokr_use_scalar,
@@ -4386,22 +4443,9 @@ def create_app() -> FastAPI:
                 "epochs": request.train_epochs,
             }
 
-            # Start TensorBoard server if not already running
-            if not hasattr(app.state, 'tensorboard_process') or app.state.tensorboard_process is None:
-                try:
-                    import subprocess
-                    tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
-                    app.state.tensorboard_process = subprocess.Popen(
-                        ["tensorboard", "--logdir", request.output_dir, "--port", str(tensorboard_port), "--bind_all"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
-                except Exception:
-                    training_state["tensorboard_url"] = None
-            else:
-                tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
-                training_state["tensorboard_url"] = f"http://localhost:{tensorboard_port}"
+            training_state["_component_manager"] = mgr
+
+            training_state["tensorboard_url"] = _start_tensorboard(app, tensorboard_logdir)
 
             def _run_lokr_training_sync():
                 """Run LoKR training synchronously in thread pool."""
@@ -4452,6 +4496,19 @@ def create_app() -> FastAPI:
                 except Exception as e:
                     training_state["is_training"] = False
                     training_state["error"] = str(e)
+                finally:
+                    try:
+                        if handler.model is not None and getattr(handler.model, "decoder", None) is not None:
+                            handler.model.decoder = _unwrap_module(handler.model.decoder)
+                            handler.model.decoder.eval()
+                    except Exception:
+                        pass
+                    try:
+                        cm = training_state.get("_component_manager")
+                        if cm is not None:
+                            cm.restore()
+                    except Exception:
+                        pass
 
             executor: ThreadPoolExecutor = app.state.executor
             executor.submit(_run_lokr_training_sync)
@@ -4465,6 +4522,10 @@ def create_app() -> FastAPI:
 
         except Exception as e:
             training_state["is_training"] = False
+            try:
+                mgr.restore()
+            except Exception:
+                pass
             return _wrap_response(None, code=500, error=f"Failed to start LoKR training: {str(e)}")
 
     @app.post("/v1/training/stop")
@@ -4476,6 +4537,28 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="No training in progress")
 
         training_state["should_stop"] = True
+        try:
+            _stop_tensorboard(app)
+        except Exception:
+            pass
+
+        # Clear UI-visible state immediately so the frontend doesn't mix old
+        # logs/status when switching adapter types.
+        # IMPORTANT: do NOT remove keys that the running training thread may
+        # still touch; reset them to safe values instead.
+        try:
+            training_state["current_step"] = 0
+            training_state["current_loss"] = None
+            training_state["status"] = "Stopping..."
+            training_state["loss_history"] = []
+            training_state["training_log"] = ""
+            training_state["tensorboard_url"] = None
+            training_state["tensorboard_logdir"] = None
+            training_state["steps_per_second"] = 0.0
+            training_state["estimated_time_remaining"] = 0.0
+            training_state["error"] = None
+        except Exception:
+            pass
 
         return _wrap_response({"message": "Stopping training..."})
 

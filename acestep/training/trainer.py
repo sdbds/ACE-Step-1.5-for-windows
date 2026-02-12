@@ -71,24 +71,6 @@ def _maybe_enable_gradient_checkpointing(module: Any) -> bool:
     if not hasattr(target, "gradient_checkpointing_enable"):
         return False
 
-    if not hasattr(target, "supports_gradient_checkpointing"):
-        try:
-            setattr(target, "supports_gradient_checkpointing", True)
-        except Exception:
-            return False
-
-    if not hasattr(target, "_set_gradient_checkpointing"):
-        try:
-            import types
-
-            def _set_gradient_checkpointing(self, submodule, value: bool = False):
-                if hasattr(submodule, "gradient_checkpointing"):
-                    submodule.gradient_checkpointing = value
-
-            target._set_gradient_checkpointing = types.MethodType(_set_gradient_checkpointing, target)
-        except Exception:
-            return False
-
     try:
         target.gradient_checkpointing_enable()
     except Exception:
@@ -185,7 +167,10 @@ def _iter_module_wrappers(module: nn.Module) -> List[nn.Module]:
     return modules
 
 
-def _configure_training_memory_features(decoder: nn.Module) -> Tuple[bool, bool, bool]:
+def _configure_training_memory_features(
+    decoder: nn.Module,
+    enable_gradient_checkpointing: bool,
+) -> Tuple[bool, bool, bool]:
     """
     Enable gradient checkpointing and disable use_cache across wrapped decoder modules.
 
@@ -197,22 +182,16 @@ def _configure_training_memory_features(decoder: nn.Module) -> Tuple[bool, bool,
     input_grads_enabled = False
 
     for mod in _iter_module_wrappers(decoder):
-        if hasattr(mod, "gradient_checkpointing_enable"):
+        if enable_gradient_checkpointing:
             try:
-                mod.gradient_checkpointing_enable()
-                checkpointing_enabled = True
-            except Exception:
-                pass
-        elif hasattr(mod, "gradient_checkpointing"):
-            try:
-                mod.gradient_checkpointing = True
-                checkpointing_enabled = True
+                if _maybe_enable_gradient_checkpointing(mod):
+                    checkpointing_enabled = True
             except Exception:
                 pass
 
         # PEFT + gradient checkpointing can require input embeddings to have
         # gradients enabled, otherwise loss may be detached (no grad_fn).
-        if hasattr(mod, "enable_input_require_grads"):
+        if enable_gradient_checkpointing and checkpointing_enabled and hasattr(mod, "enable_input_require_grads"):
             try:
                 mod.enable_input_require_grads()
                 hook_enabled = bool(getattr(mod, "_acestep_input_grads_hook_enabled", False))
@@ -525,6 +504,7 @@ class PreprocessedLoKRModule(nn.Module):
 
         if check_lycoris_available():
             self.model, self.lycoris_net, self.lokr_info = inject_lokr_into_dit(model, lokr_config)
+            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
             logger.info(f"LoKR injected: {self.lokr_info.get('trainable_params', 0):,} trainable params")
         else:
             self.model = model
@@ -668,7 +648,10 @@ class LoRATrainer:
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
             )
-            ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(self.module.model.decoder)
+            ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(
+                self.module.model.decoder,
+                enable_gradient_checkpointing=bool(self.training_config.gradient_checkpointing),
+            )
             # DiT decoder does not expose token embeddings like causal LMs.
             # Force grad-carrying inputs for checkpointed segments to avoid
             # detached losses regardless of wrapper hook availability.
@@ -1246,7 +1229,10 @@ class LoKRTrainer:
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
             )
-            ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(self.module.model.decoder)
+            ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(
+                self.module.model.decoder,
+                enable_gradient_checkpointing=bool(self.training_config.gradient_checkpointing),
+            )
             self.module.force_input_grads_for_checkpointing = ckpt_enabled
             logger.info(
                 f"Training memory features: gradient_checkpointing={ckpt_enabled}, "

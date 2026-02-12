@@ -29,6 +29,7 @@ class PreprocessMixin:
         dit_handler,
         output_dir: str,
         max_duration: float = 240.0,
+        skip_existing: bool = False,
         progress_callback=None,
     ) -> Tuple[List[str], str]:
         """Preprocess all labeled samples to tensor files for efficient training."""
@@ -48,6 +49,7 @@ class PreprocessMixin:
         output_paths: List[str] = []
         success_count = 0
         fail_count = 0
+        skip_count = 0
 
         model = dit_handler.model
         vae = dit_handler.vae
@@ -115,6 +117,13 @@ class PreprocessMixin:
                 debug_log_verbose_for("dataset", f"sample[{i}] id={sample.id} file={sample.filename}")
                 if progress_callback:
                     progress_callback(f"Preprocessing {i+1}/{len(labeled_samples)}: {sample.filename}")
+
+                output_path = os.path.join(output_dir, f"{sample.id}.pt")
+                if skip_existing and os.path.exists(output_path):
+                    output_paths.append(output_path)
+                    success_count += 1
+                    skip_count += 1
+                    continue
 
                 use_genre = i in genre_indices
 
@@ -214,8 +223,6 @@ class PreprocessMixin:
                         "is_instrumental": sample.is_instrumental,
                     },
                 }
-
-                output_path = os.path.join(output_dir, f"{sample.id}.pt")
                 t0 = debug_start_verbose_for("dataset", f"torch.save[{i}]")
                 torch.save(output_data, output_path)
                 debug_end_verbose_for("dataset", f"torch.save[{i}]", t0)
@@ -239,6 +246,8 @@ class PreprocessMixin:
         debug_end_verbose_for("dataset", "save_manifest", t0)
 
         status = f"✅ Preprocessed {success_count}/{len(labeled_samples)} samples to {output_dir}"
+        if skip_count > 0:
+            status += f" ({skip_count} skipped)"
         if fail_count > 0:
             status += f" ({fail_count} failed)"
 

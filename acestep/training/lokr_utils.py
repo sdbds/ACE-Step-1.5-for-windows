@@ -51,6 +51,18 @@ def inject_lokr_into_dit(
 
     decoder = model.decoder
 
+    prev_net = getattr(decoder, "_lycoris_net", None)
+    if prev_net is not None:
+        try:
+            if hasattr(prev_net, "restore"):
+                prev_net.restore()
+        except Exception:
+            pass
+        try:
+            delattr(decoder, "_lycoris_net")
+        except Exception:
+            pass
+
     # Freeze all non-LoKR parameters BEFORE injection so newly created LoKR params
     # are not accidentally frozen.
     for _, param in model.named_parameters():
@@ -110,8 +122,7 @@ def inject_lokr_into_dit(
 
     # Register LyCORIS network on the decoder so its parameters are discoverable
     # via decoder/model .parameters() traversal (optimizer/clipping/statistics).
-    if not hasattr(decoder, "_lycoris_net"):
-        decoder._lycoris_net = lycoris_net
+    decoder._lycoris_net = lycoris_net
 
     # Enable gradients for LoKR parameters.
     # LyCORIS may not expose all trainable params via lycoris_net.parameters(),
