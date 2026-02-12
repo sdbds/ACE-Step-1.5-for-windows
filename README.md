@@ -62,11 +62,18 @@ Run the following PowerShell script:
 ./1、install-uv-qinglong.ps1
 ```
 ### (Optional)
+
 #### VS Studio 2022 for torch compile
 Download from Microsoft offical link:
 https://aka.ms/vs/17/release/vs_community.exe
 
 Install C++ desktop and language package with English(especially for asian computer)
+
+### FFMPEG
+
+https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.0-latest-win64-gpl-shared-8.0.zip
+
+use shared version for ffmpeg
 
 ### Linux
 1. First install PowerShell:
