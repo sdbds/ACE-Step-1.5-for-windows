@@ -8,6 +8,7 @@ Uses PEFT (Parameter-Efficient Fine-Tuning) library for LoRA implementation.
 import os
 from typing import Optional, List, Dict, Any, Tuple
 from loguru import logger
+import types
 
 import torch
 import torch.nn as nn
@@ -95,8 +96,61 @@ def inject_lora_into_dit(
     if not PEFT_AVAILABLE:
         raise ImportError("PEFT library is required for LoRA training. Install with: pip install peft")
     
-    # Get the decoder (DiT model)
+    # Get the decoder (DiT model). Previous failed training runs may leave
+    # Fabric/PEFT wrappers attached; unwrap to a clean base module first.
     decoder = model.decoder
+    while hasattr(decoder, "_forward_module"):
+        decoder = decoder._forward_module
+    if hasattr(decoder, "base_model"):
+        base_model = decoder.base_model
+        if hasattr(base_model, "model"):
+            decoder = base_model.model
+        else:
+            decoder = base_model
+    if hasattr(decoder, "model") and isinstance(decoder.model, nn.Module):
+        decoder = decoder.model
+    model.decoder = decoder
+
+    # PEFT may call enable_input_require_grads() when is_gradient_checkpointing
+    # is true. AceStepDiTModel doesn't implement get_input_embeddings, so the
+    # default implementation raises NotImplementedError. Guard this path.
+    if hasattr(decoder, "enable_input_require_grads"):
+        orig_enable_input_require_grads = decoder.enable_input_require_grads
+
+        def _safe_enable_input_require_grads(self):
+            try:
+                result = orig_enable_input_require_grads()
+                try:
+                    self._acestep_input_grads_hook_enabled = True
+                except Exception:
+                    pass
+                return result
+            except NotImplementedError:
+                try:
+                    self._acestep_input_grads_hook_enabled = False
+                except Exception:
+                    pass
+                if not getattr(self, "_acestep_input_grads_warning_emitted", False):
+                    logger.info(
+                        "Skipping enable_input_require_grads for decoder: "
+                        "get_input_embeddings is not implemented (expected for DiT)"
+                    )
+                    try:
+                        self._acestep_input_grads_warning_emitted = True
+                    except Exception:
+                        pass
+                return None
+
+        decoder.enable_input_require_grads = types.MethodType(
+            _safe_enable_input_require_grads, decoder
+        )
+
+    # Avoid PEFT auto-prep path on non-embedding diffusion decoder.
+    if hasattr(decoder, "is_gradient_checkpointing"):
+        try:
+            decoder.is_gradient_checkpointing = False
+        except Exception:
+            pass
     
     # Create PEFT LoRA config
     peft_lora_config = LoraConfig(

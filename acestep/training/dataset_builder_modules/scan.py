@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 from loguru import logger
 
-from .audio_io import get_audio_duration, load_lyrics_file
+from .audio_io import get_audio_duration, load_caption_file, load_lyrics_file
 from .csv_metadata import load_csv_metadata
 from .models import AudioSample, SUPPORTED_AUDIO_FORMATS
 
@@ -39,17 +39,23 @@ class ScanMixin:
 
         csv_metadata = load_csv_metadata(directory)
         csv_count = 0
+        caption_count = 0
         lyrics_count = 0
 
         for audio_path in audio_files:
             try:
                 duration = get_audio_duration(audio_path)
+                caption_content, has_caption_file = load_caption_file(audio_path)
                 lyrics_content, has_lyrics_file = load_lyrics_file(audio_path)
+
+                if has_caption_file:
+                    caption_count += 1
+                if has_lyrics_file:
+                    lyrics_count += 1
 
                 is_instrumental = self.metadata.all_instrumental
                 if has_lyrics_file:
                     is_instrumental = False
-                    lyrics_count += 1
 
                 sample = AudioSample(
                     audio_path=audio_path,
@@ -57,9 +63,12 @@ class ScanMixin:
                     duration=duration,
                     is_instrumental=is_instrumental,
                     custom_tag=self.metadata.custom_tag,
+                    caption=caption_content if has_caption_file else "",
                     lyrics=lyrics_content if has_lyrics_file else "[Instrumental]",
                     raw_lyrics=lyrics_content if has_lyrics_file else "",
                 )
+                if has_caption_file:
+                    sample.labeled = True
 
                 if csv_metadata and sample.filename in csv_metadata:
                     meta = csv_metadata[sample.filename]
@@ -79,8 +88,10 @@ class ScanMixin:
         self.metadata.num_samples = len(self.samples)
 
         status = f"✅ Found {len(self.samples)} audio files in {directory}"
+        if caption_count > 0:
+            status += f"\n   📋 Detected {caption_count} captions (.caption.txt)"
         if lyrics_count > 0:
-            status += f"\n   📝 {lyrics_count} files have accompanying lyrics (.txt)"
+            status += f"\n   📝 Detected {lyrics_count} lyrics (.lyrics.txt / .txt)"
         if csv_count > 0:
             status += f"\n   📊 {csv_count} files have metadata from CSV"
 

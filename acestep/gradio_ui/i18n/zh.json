@@ -53,10 +53,16 @@
     "compile_model_info": "使用 torch.compile 优化模型（量化必需）",
     "quantization_label": "INT8 量化",
     "quantization_info": "启用 INT8 仅权重量化以减少显存占用（需要启用编译模型）",
+    "mlx_dit_label": "MLX DiT (Apple Silicon)",
+    "mlx_dit_info_enabled": "使用原生 MLX 加速 DiT 扩散推理（比 MPS 更快）",
+    "mlx_dit_info_disabled": "MLX 不可用（需要 macOS + Apple Silicon + mlx 包）",
     "init_btn": "初始化服务",
     "status_label": "状态",
     "language_label": "界面语言",
-    "language_info": "选择界面语言"
+    "language_info": "选择界面语言",
+    "gpu_auto_tier": "自动检测层级",
+    "tier_label": "GPU 层级覆盖",
+    "tier_info": "手动选择 GPU 层级以调整优化默认值（卸载、量化、后端等）"
   },
   "generation": {
     "required_inputs": "📝 必需输入",
@@ -104,6 +110,12 @@
     "instrumental_label": "纯音乐",
     "format_btn": "格式化",
     "optional_params": "⚙️ 可选参数",
+    "optional_music_props": "🎵 音乐属性",
+    "optional_gen_settings": "📐 生成设置",
+    "advanced_dit_section": "🎛️ DiT 扩散参数",
+    "advanced_lm_section": "🤖 LM 生成参数",
+    "advanced_output_section": "🔊 音频输出与后处理",
+    "advanced_automation_section": "⚡ 自动化与批量",
     "vocal_language_label": "人声语言(可选)",
     "vocal_language_info": "纯音乐使用 `unknown`",
     "bpm_label": "BPM(可选)",
@@ -150,8 +162,8 @@
     "lm_negative_prompt_label": "LM 负面提示",
     "lm_negative_prompt_placeholder": "输入CFG的负面提示(默认: NO USER INPUT)",
     "lm_negative_prompt_info": "负面提示(当LM CFG比例 > 1.0时使用)",
-    "cot_metas_label": "CoT 元数据",
-    "cot_metas_info": "使用LM生成CoT元数据(取消勾选以跳过LM CoT生成)",
+    "cot_metas_label": "CoT メタデータ",
+    "cot_metas_info": "LMを使用してCoTメタデータを生成(チェックを外すとLM CoT生成をスキップ)",
     "cot_language_label": "CoT 语言",
     "cot_language_info": "在CoT中生成语言(思维链)",
     "constrained_debug_label": "约束解码调试",
@@ -174,7 +186,8 @@
     "parallel_thinking_label": "并行思考",
     "generate_btn": "🎵 生成音乐",
     "autogen_label": "自动生成",
-    "caption_rewrite_label": "描述重写"
+    "caption_rewrite_label": "描述重写",
+    "advanced_dit_params": "DiT 高级参数"
   },
   "results": {
     "title": "🎵 结果",
@@ -252,6 +265,7 @@
     "tab_train_lora": "🚀 训练 LoRA",
     "quick_start_title": "🚀 快速开始",
     "load_dataset_label": "数据集 JSON 路径",
+    "load_dataset_info": "加载之前保存的数据集",
     "load_btn": "📂 加载",
     "load_status": "加载状态",
     "scan_label": "音频目录路径",
@@ -272,6 +286,9 @@
     "step5_title": "步骤 5：预处理为张量",
     "step5_intro": "**预处理将您的数据集转换为预计算的张量，以便快速训练。**\n\n您可以：\n- 使用上述步骤 1-4 的数据集，**或者**\n- 加载现有的数据集 JSON 文件（如果您已经保存了一个）",
     "step5_details": "此步骤：\n- 将音频编码为 VAE 潜变量\n- 将描述和歌词编码为文本嵌入\n- 运行条件编码器\n- 将所有张量保存到 `.pt` 文件\n\n⚠️ **这需要加载模型，可能需要几分钟。**",
+    "train_section_tensors": "预处理数据集选择",
+    "train_section_lora": "LoRA 设置",
+    "train_section_params": "训练参数",
     "train_tensor_selection_desc": "选择包含预处理张量文件（`.pt` 文件）的目录。\n这些文件在「数据集构建」标签页中使用「预处理」按钮创建。",
     "all_instrumental": "全部为纯音乐",
     "all_instrumental_info": "勾选表示所有曲目均为纯音乐（无人声）",
@@ -350,5 +367,15 @@
     "export_path": "导出路径",
     "export_lora_btn": "📦 导出 LoRA",
     "export_status": "导出状态"
+  },
+  "gen": {
+    "enable_normalization": "启用归一化",
+    "enable_normalization_info": "将音频音量归一化到目标峰值电平，以防止削波或确保一致的响度。",
+    "normalization_db": "目标峰值 (dB)",
+    "normalization_db_info": "分贝单位的目标峰值电平。-1.0 dB 是标准安全峰值。-0.1 dB 是最大值。",
+    "latent_shift": "Latent 偏移",
+    "latent_shift_info": "VAE 解码前对 DiT latent 施加的偏移量。默认 0（不偏移）。负值（如 -0.04）可减少爆音。",
+    "latent_rescale": "Latent 缩放",
+    "latent_rescale_info": "VAE 解码前对 DiT latent 施加的缩放因子。默认 1.0（不缩放）。小于 1.0 的值（如 0.91）可减少爆音。"
   }
 }

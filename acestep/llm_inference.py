@@ -25,8 +25,9 @@ from acestep.constrained_logits_processor import MetadataConstrainedLogitsProces
 from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION
 from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
 
-# VRAM thresholds for skipping vLLM/CUDA graphs on 16GB GPUs to avoid OOM/fragmentation
-VRAM_SAFE_TOTAL_GB = 16.0
+# Minimum free VRAM (GB) required to attempt vLLM initialization.
+# vLLM's KV cache allocator adapts to available memory, so we only need a
+# basic sanity check — not a hard total-VRAM gate.
 VRAM_SAFE_FREE_GB = 2.0
 
 
@@ -561,9 +562,9 @@ class LLMHandler:
                             free_gb = (total_bytes - torch.cuda.memory_reserved(0)) / (1024**3)
                     except Exception:
                         free_gb = 0.0
-                if device == "cuda" and (total_gb <= VRAM_SAFE_TOTAL_GB or free_gb < VRAM_SAFE_FREE_GB):
+                if device == "cuda" and free_gb < VRAM_SAFE_FREE_GB:
                     logger.warning(
-                        f"vLLM disabled due to VRAM safety constraints (total={total_gb:.2f}GB, free={free_gb:.2f}GB) — falling back to PyTorch backend"
+                        f"vLLM disabled due to insufficient free VRAM (total={total_gb:.2f}GB, free={free_gb:.2f}GB, need>={VRAM_SAFE_FREE_GB}GB free) — falling back to PyTorch backend"
                     )
                     success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
                     if not success:

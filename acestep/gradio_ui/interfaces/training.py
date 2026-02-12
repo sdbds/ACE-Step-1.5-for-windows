@@ -498,12 +498,8 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
                         max_lines=15,
                         scale=1,
                     )
-                    training_loss_plot = gr.LinePlot(
-                        x="step",
-                        y="loss",
-                        title=t("training.training_loss_title"),
-                        x_title=t("training.step"),
-                        y_title=t("training.loss"),
+                    training_loss_plot = gr.Plot(
+                        label=t("training.training_loss_title"),
                         scale=1,
                     )
                 

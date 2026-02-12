@@ -53,10 +53,16 @@
     "compile_model_info": "torch.compileでモデルを最適化（量子化に必要）",
     "quantization_label": "INT8 量子化",
     "quantization_info": "INT8重み量子化を有効にしてVRAMを節約（モデルのコンパイルが必要）",
+    "mlx_dit_label": "MLX DiT (Apple Silicon)",
+    "mlx_dit_info_enabled": "Apple SiliconでMLXネイティブDiT拡散を使用（MPSより高速）",
+    "mlx_dit_info_disabled": "MLXは利用不可（macOS + Apple Silicon + mlxパッケージが必要）",
     "init_btn": "サービスを初期化",
     "status_label": "ステータス",
     "language_label": "UI言語",
-    "language_info": "インターフェース言語を選択"
+    "language_info": "インターフェース言語を選択",
+    "gpu_auto_tier": "自動検出ティア",
+    "tier_label": "GPU ティアの手動選択",
+    "tier_info": "GPUティアを手動で選択して最適化のデフォルト（オフロード、量子化、バックエンドなど）を調整します"
   },
   "generation": {
     "required_inputs": "📝 必須入力",
@@ -104,6 +110,12 @@
     "instrumental_label": "インストゥルメンタル",
     "format_btn": "フォーマット",
     "optional_params": "⚙️ オプションパラメータ",
+    "optional_music_props": "🎵 音楽プロパティ",
+    "optional_gen_settings": "📐 生成設定",
+    "advanced_dit_section": "🎛️ DiT 拡散パラメータ",
+    "advanced_lm_section": "🤖 LM 生成パラメータ",
+    "advanced_output_section": "🔊 オーディオ出力と後処理",
+    "advanced_automation_section": "⚡ 自動化とバッチ",
     "vocal_language_label": "ボーカル言語(オプション)",
     "vocal_language_info": "インストには`unknown`を使用",
     "bpm_label": "BPM(オプション)",
@@ -174,7 +186,8 @@
     "parallel_thinking_label": "並列思考",
     "generate_btn": "🎵 音楽を生成",
     "autogen_label": "自動生成",
-    "caption_rewrite_label": "キャプション書き換え"
+    "caption_rewrite_label": "キャプション書き換え",
+    "advanced_dit_params": "DiT 詳細パラメータ"
   },
   "results": {
     "title": "🎵 結果",
@@ -354,5 +367,16 @@
     "export_path": "エクスポートパス",
     "export_lora_btn": "📦 LoRA をエクスポート",
     "export_status": "エクスポート状態"
+  },
+  "gen": {
+    "enable_normalization": "ノーマライズを有効にする",
+    "enable_normalization_info": "クリッピングを防ぎ、ラウドネスを一定にするために、オーディオ音量をターゲットピークレベルに正規化します。",
+    "normalization_db": "ターゲットピーク (dB)",
+    "normalization_db_info": "デシベル単位のターゲットピークレベル。-1.0 dBが標準的な安全ピークです。-0.1 dBが最大です。",
+    "advanced_dit_params": "DiT 詳細パラメータ",
+    "latent_shift": "Latent シフト",
+    "latent_shift_info": "VAEデコード前にDiT latentに適用するシフト量。デフォルト0（シフトなし）。負の値（例: -0.04）でクリッピングを軽減できます。",
+    "latent_rescale": "Latent リスケール",
+    "latent_rescale_info": "VAEデコード前にDiT latentに適用するスケール係数。デフォルト1.0（スケーリングなし）。1.0未満の値（例: 0.91）でクリッピングを軽減できます。"
   }
 }
