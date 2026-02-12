@@ -9,7 +9,7 @@ import os
 import time
 import random
 import math
-from typing import Optional, Dict, Any, Tuple, Generator
+from typing import Optional, List, Dict, Any, Tuple, Generator
 from loguru import logger
 
 import torch
