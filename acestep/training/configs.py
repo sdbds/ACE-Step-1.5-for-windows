@@ -5,7 +5,7 @@ Contains dataclasses for LoRA and training configurations.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
@@ -120,7 +120,7 @@ class TrainingConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     persistent_workers: bool = True
-    pin_memory_device: Optional[str] = None
+    pin_memory_device: str = ""
     
     # Logging
     log_every_n_steps: int = 10

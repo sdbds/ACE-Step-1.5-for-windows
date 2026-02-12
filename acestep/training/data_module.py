@@ -177,7 +177,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         pin_memory: bool = True,
         prefetch_factor: int = 2,
         persistent_workers: bool = True,
-        pin_memory_device: Optional[str] = None,
+        pin_memory_device: str = "",
         val_split: float = 0.0,
     ):
         """Initialize the data module.
@@ -226,7 +226,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         """Create training dataloader."""
         prefetch_factor = None if self.num_workers == 0 else self.prefetch_factor
         persistent_workers = False if self.num_workers == 0 else self.persistent_workers
-        pin_memory_device = self.pin_memory_device if self.pin_memory else None
+        pin_memory_device = self.pin_memory_device if self.pin_memory else ""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -246,7 +246,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
             return None
         prefetch_factor = None if self.num_workers == 0 else self.prefetch_factor
         persistent_workers = False if self.num_workers == 0 else self.persistent_workers
-        pin_memory_device = self.pin_memory_device if self.pin_memory else None
+        pin_memory_device = self.pin_memory_device if self.pin_memory else ""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,

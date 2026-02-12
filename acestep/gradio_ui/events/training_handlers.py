@@ -669,14 +669,14 @@ def start_training(
             pin_memory = True
             prefetch_factor = 2
             persistent_workers = True
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "bf16"
         elif device_type == "mps":
             num_workers = 0
             pin_memory = False
             prefetch_factor = 2
             persistent_workers = False
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "fp16"
         else:
             cpu_count = os.cpu_count() or 2
@@ -684,7 +684,7 @@ def start_training(
             pin_memory = False
             prefetch_factor = 2
             persistent_workers = num_workers > 0
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "fp32"
 
         logger.info(
@@ -947,21 +947,21 @@ def start_lokr_training(
             pin_memory = True
             prefetch_factor = 2
             persistent_workers = True
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "bf16"
         elif device_type == "mps":
             num_workers = 0
             pin_memory = False
             prefetch_factor = 2
             persistent_workers = False
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "fp16"
         else:
             num_workers = 0
             pin_memory = False
             prefetch_factor = 2
             persistent_workers = False
-            pin_memory_device = None
+            pin_memory_device = ""
             mixed_precision = "fp32"
 
         lokr_config = LoKRConfigClass(
