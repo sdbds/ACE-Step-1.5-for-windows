@@ -521,6 +521,8 @@ class PreprocessedLoKRModule(nn.Module):
         self.lycoris_net = None
         self.lokr_info = {}
 
+        self.force_input_grads_for_checkpointing = False
+
         if check_lycoris_available():
             self.model, self.lycoris_net, self.lokr_info = inject_lokr_into_dit(model, lokr_config)
             logger.info(f"LoKR injected: {self.lokr_info.get('trainable_params', 0):,} trainable params")
@@ -563,6 +565,8 @@ class PreprocessedLoKRModule(nn.Module):
             t, r = sample_discrete_timestep(bsz, self.timesteps_tensor)
             t_ = t.unsqueeze(-1).unsqueeze(-1)
             xt = t_ * x1 + (1.0 - t_) * x0
+            if self.force_input_grads_for_checkpointing:
+                xt = xt.requires_grad_(True)
 
             decoder_outputs = self.model.decoder(
                 hidden_states=xt,
@@ -1241,6 +1245,12 @@ class LoKRTrainer:
                 training_config=self.training_config,
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
+            )
+            ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(self.module.model.decoder)
+            self.module.force_input_grads_for_checkpointing = ckpt_enabled
+            logger.info(
+                f"Training memory features: gradient_checkpointing={ckpt_enabled}, "
+                f"use_cache_disabled={cache_disabled}, input_grads_enabled={input_grads_enabled}"
             )
 
             data_module = PreprocessedDataModule(
