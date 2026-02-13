@@ -1236,23 +1236,17 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             self.use_lora = False
             self.lora_scale = 1.0
 
-            # Free old model
-            old_model = self.model
-            self.model = None
-            if old_model is not None:
-                del old_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
             # Load new DiT model
             if use_flash_attention and self.is_flash_attention_available():
                 attn_implementation = "flash_attention_2"
             else:
                 attn_implementation = "sdpa"
 
+            new_model = None
+
             try:
                 logger.info(f"[switch_dit_model] Loading DiT model: {config_path} (attn={attn_implementation})")
-                self.model = AutoModel.from_pretrained(
+                new_model = AutoModel.from_pretrained(
                     acestep_v15_checkpoint_path,
                     trust_remote_code=True,
                     attn_implementation=attn_implementation,
@@ -1262,7 +1256,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 logger.warning(f"[switch_dit_model] Failed with {attn_implementation}: {e}")
                 if attn_implementation == "sdpa":
                     attn_implementation = "eager"
-                    self.model = AutoModel.from_pretrained(
+                    new_model = AutoModel.from_pretrained(
                         acestep_v15_checkpoint_path,
                         trust_remote_code=True,
                         attn_implementation=attn_implementation
@@ -1270,24 +1264,58 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 else:
                     raise e
 
-            self.model.config._attn_implementation = attn_implementation
-            self.config = self.model.config
+            if new_model is None:
+                return "❌ Error switching model: new model failed to load", False
 
-            # Move to device
+            new_model.config._attn_implementation = attn_implementation
+
+            old_model = self.model
+
+            target_device = "cpu"
             if not self.offload_to_cpu:
-                self.model = self.model.to(self.device).to(self.dtype)
+                target_device = self.device
             else:
                 if not self.offload_dit_to_cpu:
-                    self.model = self.model.to(self.device).to(self.dtype)
-                else:
-                    self.model = self.model.to("cpu").to(self.dtype)
-            self.model.eval()
+                    target_device = self.device
 
-            # Reload silence latent
+            if str(target_device).startswith("cuda") and old_model is not None:
+                try:
+                    old_model = old_model.to("cpu")
+                    self.model = old_model
+                except Exception as move_err:
+                    logger.warning(f"[switch_dit_model] Failed to move old model to CPU before switching: {move_err}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            try:
+                if target_device == "cpu":
+                    new_model = new_model.to("cpu").to(self.dtype)
+                else:
+                    new_model = new_model.to(target_device).to(self.dtype)
+            except Exception as move_new_err:
+                if str(target_device).startswith("cuda") and old_model is not None:
+                    try:
+                        old_model = old_model.to(self.device).to(self.dtype)
+                        self.model = old_model
+                    except Exception as restore_err:
+                        logger.warning(f"[switch_dit_model] Failed to restore old model after switch failure: {restore_err}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                raise move_new_err
+
+            new_model.eval()
+
             silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
             if os.path.exists(silence_latent_path):
                 self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
                 self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
+
+            self.model = new_model
+            self.config = self.model.config
+            if old_model is not None:
+                del old_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             logger.info(f"[switch_dit_model] Switched to {config_path} on {self.device}")
             return f"✅ Switched to {config_path}", True
