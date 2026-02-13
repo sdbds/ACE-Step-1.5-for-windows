@@ -4223,18 +4223,24 @@ def create_app() -> FastAPI:
             os.makedirs(tensorboard_logdir, exist_ok=True)
 
             import time
+            run_id = str(uuid4())
             training_state["is_training"] = True
             training_state["should_stop"] = False
+            training_state["run_id"] = run_id
             training_state["trainer"] = trainer
             training_state["tensor_dir"] = request.tensor_dir
             training_state["tensorboard_logdir"] = tensorboard_logdir
+            training_state["current_step"] = 0
+            training_state["current_loss"] = None
+            training_state["status"] = "Starting..."
             training_state["loss_history"] = []  # Track loss history for plotting
-            training_state["training_log"] = ""  # Accumulated log text for frontend
+            training_state["training_log"] = "Starting..."  # Accumulated log text for frontend
             training_state["start_time"] = time.time()  # Track training start time
             training_state["current_epoch"] = 0
             training_state["last_step_time"] = time.time()  # For speed calculation
             training_state["steps_per_second"] = 0.0
             training_state["estimated_time_remaining"] = 0.0
+            training_state["error"] = None
             training_state["config"] = {
                 "lora_rank": request.lora_rank,
                 "lora_alpha": request.lora_alpha,
@@ -4250,7 +4256,14 @@ def create_app() -> FastAPI:
             def _run_training_sync():
                 """Run training synchronously in thread pool."""
                 try:
+                    local_run_id = run_id
+                    if training_state.get("training_log"):
+                        training_state["training_log"] += "\n🚀 Training thread started"
+                    else:
+                        training_state["training_log"] = "🚀 Training thread started"
                     for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
+                        if training_state.get("run_id") != local_run_id:
+                            break
                         training_state["current_step"] = step
                         training_state["current_loss"] = loss
                         training_state["status"] = status
@@ -4263,39 +4276,41 @@ def create_app() -> FastAPI:
                                 training_state["loss_history"] = training_state["loss_history"][-1000:]
 
                             # Extract epoch from status (e.g., "Epoch 1/1000, Step 5, Loss: 0.1234")
-                            import re
-                            epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
-                            if epoch_match:
-                                training_state["current_epoch"] = int(epoch_match.group(1))
+                        import re
+                        epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
+                        if epoch_match:
+                            training_state["current_epoch"] = int(epoch_match.group(1))
 
                             # Calculate training speed and ETA
-                            current_time = time.time()
-                            if step > 1:  # Skip first step for more accurate measurement
-                                elapsed_since_last = current_time - training_state["last_step_time"]
-                                if elapsed_since_last > 0:
-                                    training_state["steps_per_second"] = 1.0 / elapsed_since_last
+                        current_time = time.time()
+                        if step > 1:
+                            elapsed_since_last = current_time - training_state["last_step_time"]
+                            if elapsed_since_last > 0:
+                                training_state["steps_per_second"] = 1.0 / elapsed_since_last
 
                                     # Calculate ETA based on total steps
-                                    total_epochs = training_state["config"]["epochs"]
+                                total_epochs = training_state["config"]["epochs"]
                                     # Estimate total steps (rough estimate)
-                                    if training_state["current_epoch"] > 0:
-                                        steps_per_epoch = step / training_state["current_epoch"]
-                                        total_steps = int(steps_per_epoch * total_epochs)
-                                        remaining_steps = total_steps - step
-                                        training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
+                                if training_state["current_epoch"] > 0:
+                                    steps_per_epoch = step / training_state["current_epoch"]
+                                    total_steps = int(steps_per_epoch * total_epochs)
+                                    remaining_steps = total_steps - step
+                                    training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
 
-                            training_state["last_step_time"] = current_time
+                        training_state["last_step_time"] = current_time
 
-                            # Accumulate training log
+                        if loss is not None and loss == loss:
                             log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
-                            if training_state["training_log"]:
-                                training_state["training_log"] += "\n" + log_entry
-                            else:
-                                training_state["training_log"] = log_entry
+                        else:
+                            log_entry = f"Step {step}: {status}"
+                        if training_state["training_log"]:
+                            training_state["training_log"] += "\n" + log_entry
+                        else:
+                            training_state["training_log"] = log_entry
                             # Keep last 100 lines to avoid unbounded growth
-                            log_lines = training_state["training_log"].split("\n")
-                            if len(log_lines) > 100:
-                                training_state["training_log"] = "\n".join(log_lines[-100:])
+                        log_lines = training_state["training_log"].split("\n")
+                        if len(log_lines) > 100:
+                            training_state["training_log"] = "\n".join(log_lines[-100:])
 
                         if training_state.get("should_stop", False):
                             break
@@ -4319,9 +4334,8 @@ def create_app() -> FastAPI:
                     except Exception:
                         pass
 
-            # Run in thread pool to avoid blocking event loop
-            executor: ThreadPoolExecutor = app.state.executor
-            executor.submit(_run_training_sync)
+            import threading
+            threading.Thread(target=_run_training_sync, daemon=True).start()
 
             message = "Training started"
             if fp8_status:
@@ -4418,18 +4432,24 @@ def create_app() -> FastAPI:
             os.makedirs(tensorboard_logdir, exist_ok=True)
 
             import time as _time
+            run_id = str(uuid4())
             training_state["is_training"] = True
             training_state["should_stop"] = False
+            training_state["run_id"] = run_id
             training_state["trainer"] = trainer
             training_state["tensor_dir"] = request.tensor_dir
             training_state["tensorboard_logdir"] = tensorboard_logdir
+            training_state["current_step"] = 0
+            training_state["current_loss"] = None
+            training_state["status"] = "Starting..."
             training_state["loss_history"] = []
-            training_state["training_log"] = ""
+            training_state["training_log"] = "Starting..."
             training_state["start_time"] = _time.time()
             training_state["current_epoch"] = 0
             training_state["last_step_time"] = _time.time()
             training_state["steps_per_second"] = 0.0
             training_state["estimated_time_remaining"] = 0.0
+            training_state["error"] = None
             training_state["config"] = {
                 "adapter_type": "lokr",
                 "lokr_linear_dim": request.lokr_linear_dim,
@@ -4450,7 +4470,14 @@ def create_app() -> FastAPI:
             def _run_lokr_training_sync():
                 """Run LoKR training synchronously in thread pool."""
                 try:
+                    local_run_id = run_id
+                    if training_state.get("training_log"):
+                        training_state["training_log"] += "\n🚀 Training thread started"
+                    else:
+                        training_state["training_log"] = "🚀 Training thread started"
                     for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
+                        if training_state.get("run_id") != local_run_id:
+                            break
                         training_state["current_step"] = step
                         training_state["current_loss"] = loss
                         training_state["status"] = status
@@ -4460,34 +4487,37 @@ def create_app() -> FastAPI:
                             if len(training_state["loss_history"]) > 1000:
                                 training_state["loss_history"] = training_state["loss_history"][-1000:]
 
-                            import re
-                            epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
-                            if epoch_match:
-                                training_state["current_epoch"] = int(epoch_match.group(1))
+                        import re
+                        epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
+                        if epoch_match:
+                            training_state["current_epoch"] = int(epoch_match.group(1))
 
-                            current_time = _time.time()
-                            if step > 1:
-                                elapsed_since_last = current_time - training_state["last_step_time"]
-                                if elapsed_since_last > 0:
-                                    training_state["steps_per_second"] = 1.0 / elapsed_since_last
+                        current_time = _time.time()
+                        if step > 1:
+                            elapsed_since_last = current_time - training_state["last_step_time"]
+                            if elapsed_since_last > 0:
+                                training_state["steps_per_second"] = 1.0 / elapsed_since_last
 
-                                    total_epochs = training_state["config"]["epochs"]
-                                    if training_state["current_epoch"] > 0:
-                                        steps_per_epoch = step / training_state["current_epoch"]
-                                        total_steps = int(steps_per_epoch * total_epochs)
-                                        remaining_steps = total_steps - step
-                                        training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
+                                total_epochs = training_state["config"]["epochs"]
+                                if training_state["current_epoch"] > 0:
+                                    steps_per_epoch = step / training_state["current_epoch"]
+                                    total_steps = int(steps_per_epoch * total_epochs)
+                                    remaining_steps = total_steps - step
+                                    training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
 
-                            training_state["last_step_time"] = current_time
+                        training_state["last_step_time"] = current_time
 
+                        if loss is not None and loss == loss:
                             log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
-                            if training_state["training_log"]:
-                                training_state["training_log"] += "\n" + log_entry
-                            else:
-                                training_state["training_log"] = log_entry
-                            log_lines = training_state["training_log"].split("\n")
-                            if len(log_lines) > 100:
-                                training_state["training_log"] = "\n".join(log_lines[-100:])
+                        else:
+                            log_entry = f"Step {step}: {status}"
+                        if training_state["training_log"]:
+                            training_state["training_log"] += "\n" + log_entry
+                        else:
+                            training_state["training_log"] = log_entry
+                        log_lines = training_state["training_log"].split("\n")
+                        if len(log_lines) > 100:
+                            training_state["training_log"] = "\n".join(log_lines[-100:])
 
                         if training_state.get("should_stop", False):
                             break
@@ -4510,8 +4540,8 @@ def create_app() -> FastAPI:
                     except Exception:
                         pass
 
-            executor: ThreadPoolExecutor = app.state.executor
-            executor.submit(_run_lokr_training_sync)
+            import threading
+            threading.Thread(target=_run_lokr_training_sync, daemon=True).start()
 
             return _wrap_response({
                 "message": "LoKR training started",
@@ -4533,10 +4563,8 @@ def create_app() -> FastAPI:
         """Stop the current training process."""
         training_state = app.state.training_state
 
-        if not training_state.get("is_training", False):
-            raise HTTPException(status_code=400, detail="No training in progress")
-
-        training_state["should_stop"] = True
+        if training_state.get("is_training", False):
+            training_state["should_stop"] = True
         try:
             _stop_tensorboard(app)
         except Exception:
@@ -4560,7 +4588,9 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
-        return _wrap_response({"message": "Stopping training..."})
+        if training_state.get("is_training", False):
+            return _wrap_response({"message": "Stopping training..."})
+        return _wrap_response({"message": "No training in progress"})
 
     @app.post("/v1/training/load_tensor_info")
     async def load_tensor_info(request: dict, _: None = Depends(verify_api_key)):
