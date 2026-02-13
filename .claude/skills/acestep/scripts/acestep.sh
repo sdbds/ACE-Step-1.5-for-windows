@@ -72,6 +72,7 @@ ensure_output_dir() {
 DEFAULT_CONFIG='{
   "api_url": "http://127.0.0.1:8001",
   "api_key": "",
+  "api_mode": "native",
   "generation": {
     "thinking": true,
     "use_format": true,
@@ -85,7 +86,15 @@ DEFAULT_CONFIG='{
 # Ensure config file exists
 ensure_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo "$DEFAULT_CONFIG" > "$CONFIG_FILE"
+        local example="${SCRIPT_DIR}/config.example.json"
+        if [ -f "$example" ]; then
+            cp "$example" "$CONFIG_FILE"
+            echo -e "${YELLOW}Config file created from config.example.json. Please configure your settings:${NC}"
+            echo -e "  ${CYAN}./scripts/acestep.sh config --set api_url <url>${NC}"
+            echo -e "  ${CYAN}./scripts/acestep.sh config --set api_key <key>${NC}"
+        else
+            echo "$DEFAULT_CONFIG" > "$CONFIG_FILE"
+        fi
     fi
 }
 
@@ -244,11 +253,20 @@ cmd_config() {
             --set) action="set"; key="$2"; value="$3"; shift 3 ;;
             --reset) action="reset"; shift ;;
             --list) action="list"; shift ;;
+            --check-key) action="check-key"; shift ;;
             *) shift ;;
         esac
     done
 
     case "$action" in
+        "check-key")
+            local api_key=$(get_config "api_key")
+            if [ -n "$api_key" ]; then
+                echo "api_key: configured"
+            else
+                echo "api_key: empty"
+            fi
+            ;;
         "get")
             [ -z "$key" ] && { echo -e "${RED}Error: --get requires KEY${NC}"; exit 1; }
             local result=$(get_config "$key")
@@ -261,11 +279,11 @@ cmd_config() {
         "reset")
             echo "$DEFAULT_CONFIG" > "$CONFIG_FILE"
             echo -e "${GREEN}Configuration reset to defaults.${NC}"
-            cat "$CONFIG_FILE"
+            jq 'walk(if type == "object" and has("api_key") and (.api_key | length) > 0 then .api_key = "***" else . end)' "$CONFIG_FILE"
             ;;
         "list")
             echo "Current configuration:"
-            cat "$CONFIG_FILE"
+            jq 'walk(if type == "object" and has("api_key") and (.api_key | length) > 0 then .api_key = "***" else . end)' "$CONFIG_FILE"
             ;;
         *)
             echo "Config file: $CONFIG_FILE"
@@ -488,6 +506,197 @@ download_audios() {
     done <<< "$audio_paths"
 }
 
+# =============================================================================
+# Completion Mode (OpenRouter /v1/chat/completions)
+# =============================================================================
+
+# Load api_mode from config (default: native)
+load_api_mode() {
+    local mode=$(get_config "api_mode")
+    echo "${mode:-native}"
+}
+
+# Get model ID from /v1/models endpoint for completion mode
+get_completion_model() {
+    local api_url="$1"
+    local user_model="$2"
+    local api_key=$(load_api_key)
+
+    # If user specified a model, prefix with acemusic/ if needed
+    if [ -n "$user_model" ]; then
+        if [[ "$user_model" == */* ]]; then
+            echo "$user_model"
+        else
+            echo "acemusic/${user_model}"
+        fi
+        return
+    fi
+
+    # Query /v1/models for the first available model
+    local response
+    if [ -n "$api_key" ]; then
+        response=$(curl -s -H "Authorization: Bearer ${api_key}" "${api_url}/v1/models" 2>/dev/null)
+    else
+        response=$(curl -s "${api_url}/v1/models" 2>/dev/null)
+    fi
+
+    local model_id
+    model_id=$(echo "$response" | jq -r '.data[0].id // empty' 2>/dev/null)
+    echo "${model_id:-acemusic/acestep-v15-turbo}"
+}
+
+# Decode base64 audio data URL and save to file
+# Handles cross-platform compatibility (Linux/macOS/Windows MSYS)
+decode_base64_audio() {
+    local data_url="$1"
+    local output_file="$2"
+
+    # Strip data URL prefix: data:audio/mpeg;base64,...
+    local b64_data="${data_url#data:*;base64,}"
+
+    local tmp_b64=$(mktemp)
+    printf '%s' "$b64_data" > "$tmp_b64"
+
+    if command -v base64 &> /dev/null; then
+        # Linux / macOS / MSYS2
+        base64 -d < "$tmp_b64" > "$output_file" 2>/dev/null || \
+        base64 -D < "$tmp_b64" > "$output_file" 2>/dev/null || \
+        python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" < "$tmp_b64" > "$output_file" 2>/dev/null || \
+        python -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" < "$tmp_b64" > "$output_file" 2>/dev/null
+    else
+        # Fallback to python
+        python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" < "$tmp_b64" > "$output_file" 2>/dev/null || \
+        python -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))" < "$tmp_b64" > "$output_file" 2>/dev/null
+    fi
+
+    local decode_ok=$?
+    rm -f "$tmp_b64"
+    return $decode_ok
+}
+
+# Parse completion response: extract metadata, save audio files
+# Usage: parse_completion_response <response_file> <job_id>
+parse_completion_response() {
+    local resp_file="$1"
+    local job_id="$2"
+
+    ensure_output_dir
+
+    local audio_format=$(get_config "generation.audio_format")
+    [ -z "$audio_format" ] && audio_format="mp3"
+
+    # Check for error
+    local finish_reason
+    finish_reason=$(jq -r '.choices[0].finish_reason // "stop"' "$resp_file" 2>/dev/null)
+    if [ "$finish_reason" = "error" ]; then
+        local err_content
+        err_content=$(jq -r '.choices[0].message.content // "Unknown error"' "$resp_file" 2>/dev/null)
+        echo -e "${RED}Generation failed: $err_content${NC}"
+        return 1
+    fi
+
+    # Extract and display text content (metadata + lyrics)
+    local content
+    content=$(jq -r '.choices[0].message.content // empty' "$resp_file" 2>/dev/null)
+    if [ -n "$content" ]; then
+        echo "$content"
+        echo ""
+    fi
+
+    # Extract and save audio files
+    local audio_count
+    audio_count=$(jq -r '.choices[0].message.audio | length // 0' "$resp_file" 2>/dev/null)
+
+    if [ "$audio_count" -gt 0 ] 2>/dev/null; then
+        local i=0
+        while [ "$i" -lt "$audio_count" ]; do
+            local audio_url
+            audio_url=$(jq -r ".choices[0].message.audio[$i].audio_url.url // empty" "$resp_file" 2>/dev/null)
+
+            if [ -n "$audio_url" ]; then
+                local output_file="${OUTPUT_DIR}/${job_id}_$((i+1)).${audio_format}"
+                echo -e "  ${CYAN}Decoding audio $((i+1))...${NC}"
+
+                if decode_base64_audio "$audio_url" "$output_file"; then
+                    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+                        echo -e "  ${GREEN}Saved: $output_file${NC}"
+                    else
+                        echo -e "  ${RED}Failed to decode audio $((i+1))${NC}"
+                        rm -f "$output_file" 2>/dev/null
+                    fi
+                else
+                    echo -e "  ${RED}Failed to decode audio $((i+1))${NC}"
+                    rm -f "$output_file" 2>/dev/null
+                fi
+            fi
+            i=$((i+1))
+        done
+    else
+        echo -e "  ${YELLOW}No audio files in response${NC}"
+    fi
+
+    # Save full response JSON (strip base64 audio to keep file small)
+    local clean_resp
+    clean_resp=$(jq 'del(.choices[].message.audio[].audio_url.url)' "$resp_file" 2>/dev/null)
+    if [ -n "$clean_resp" ]; then
+        save_result "$job_id" "$clean_resp"
+    else
+        save_result "$job_id" "$(cat "$resp_file")"
+    fi
+}
+
+# Send request to /v1/chat/completions and handle response
+# Usage: send_completion_request <api_url> <payload_file> <job_id_var>
+send_completion_request() {
+    local api_url="$1"
+    local payload_file="$2"
+    local api_key=$(load_api_key)
+
+    local resp_file=$(mktemp)
+
+    local http_code
+    if [ -n "$api_key" ]; then
+        http_code=$(curl -s -w "%{http_code}" --connect-timeout 10 --max-time 660 \
+            -o "$resp_file" \
+            -X POST "${api_url}/v1/chat/completions" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -H "Authorization: Bearer ${api_key}" \
+            --data-binary "@${payload_file}")
+    else
+        http_code=$(curl -s -w "%{http_code}" --connect-timeout 10 --max-time 660 \
+            -o "$resp_file" \
+            -X POST "${api_url}/v1/chat/completions" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            --data-binary "@${payload_file}")
+    fi
+
+    rm -f "$payload_file"
+
+    if [ "$http_code" != "200" ]; then
+        local err_detail
+        err_detail=$(jq -r '.detail // .error.message // empty' "$resp_file" 2>/dev/null)
+        echo -e "${RED}Error: HTTP $http_code${NC}"
+        [ -n "$err_detail" ] && echo -e "${RED}$err_detail${NC}"
+        rm -f "$resp_file"
+        return 1
+    fi
+
+    # Generate a job_id from the completion id
+    local job_id
+    job_id=$(jq -r '.id // empty' "$resp_file" 2>/dev/null)
+    [ -z "$job_id" ] && job_id="completion-$(date +%s)"
+
+    echo ""
+    echo -e "${GREEN}Generation completed!${NC}"
+    echo ""
+
+    parse_completion_response "$resp_file" "$job_id"
+    rm -f "$resp_file"
+
+    echo ""
+    echo -e "${GREEN}Done! Files saved to: $OUTPUT_DIR${NC}"
+}
+
 # Wait for job and download results
 wait_for_job() {
     local api_url="$1"
@@ -646,6 +855,8 @@ cmd_generate() {
     [ -n "$bpm" ] && payload=$(echo "$payload" | jq --argjson v "$bpm" '. + {bpm: $v}')
     [ -n "$batch" ] && payload=$(echo "$payload" | jq --argjson v "$batch" '. + {batch_size: $v}')
 
+    local api_mode=$(load_api_mode)
+
     echo "Generating music..."
     if [ -n "$description" ]; then
         echo "  Mode: Simple (description)"
@@ -655,38 +866,91 @@ cmd_generate() {
         echo "  Caption: ${caption:0:50}..."
     fi
     echo "  Thinking: $thinking, Format: $use_format"
+    echo "  API: $api_mode"
     echo "  Output: $OUTPUT_DIR"
     echo ""
 
-    # Write payload to temp file to ensure proper UTF-8 encoding
-    local temp_payload=$(mktemp)
-    printf '%s' "$payload" > "$temp_payload"
+    if [ "$api_mode" = "completion" ]; then
+        # --- Completion mode: /v1/chat/completions ---
+        local model_id=$(get_completion_model "$api_url" "$model")
 
-    local api_key=$(load_api_key)
-    local response
-    if [ -n "$api_key" ]; then
-        response=$(curl -s -X POST "${api_url}/release_task" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            -H "Authorization: Bearer ${api_key}" \
-            --data-binary "@${temp_payload}")
+        # Build message content
+        local message_content=""
+        local sample_mode=false
+        if [ -n "$description" ]; then
+            message_content="$description"
+            sample_mode=true
+        else
+            message_content="<prompt>${caption}</prompt>"
+            [ -n "$lyrics" ] && message_content="${message_content}<lyrics>${lyrics}</lyrics>"
+        fi
+
+        # Build completion payload
+        local payload_c=$(jq -n \
+            --arg model "$model_id" \
+            --arg content "$message_content" \
+            --argjson thinking "$thinking" \
+            --argjson use_format "$use_format" \
+            --argjson sample_mode "$sample_mode" \
+            --argjson use_cot_caption "$cot_caption" \
+            --argjson use_cot_language "$cot_language" \
+            --arg vocal_language "$language" \
+            --arg format "${def_audio_format:-mp3}" \
+            '{
+                model: $model,
+                messages: [{"role": "user", "content": $content}],
+                stream: false,
+                thinking: $thinking,
+                use_format: $use_format,
+                sample_mode: $sample_mode,
+                use_cot_caption: $use_cot_caption,
+                use_cot_language: $use_cot_language,
+                audio_config: {
+                    format: $format,
+                    vocal_language: $vocal_language
+                }
+            }')
+
+        # Add optional parameters to completion payload
+        [ -n "$guidance" ] && payload_c=$(echo "$payload_c" | jq --argjson v "$guidance" '. + {guidance_scale: $v}')
+        [ -n "$seed" ] && payload_c=$(echo "$payload_c" | jq --argjson v "$seed" '. + {seed: $v}')
+        [ -n "$batch" ] && payload_c=$(echo "$payload_c" | jq --argjson v "$batch" '. + {batch_size: $v}')
+        [ -n "$duration" ] && payload_c=$(echo "$payload_c" | jq --argjson v "$duration" '.audio_config.duration = $v')
+        [ -n "$bpm" ] && payload_c=$(echo "$payload_c" | jq --argjson v "$bpm" '.audio_config.bpm = $v')
+
+        local temp_payload=$(mktemp)
+        printf '%s' "$payload_c" > "$temp_payload"
+
+        send_completion_request "$api_url" "$temp_payload"
     else
-        response=$(curl -s -X POST "${api_url}/release_task" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            --data-binary "@${temp_payload}")
-    fi
+        # --- Native mode: /release_task + polling ---
+        local temp_payload=$(mktemp)
+        printf '%s' "$payload" > "$temp_payload"
 
-    rm -f "$temp_payload"
+        local api_key=$(load_api_key)
+        local response
+        if [ -n "$api_key" ]; then
+            response=$(curl -s -X POST "${api_url}/release_task" \
+                -H "Content-Type: application/json; charset=utf-8" \
+                -H "Authorization: Bearer ${api_key}" \
+                --data-binary "@${temp_payload}")
+        else
+            response=$(curl -s -X POST "${api_url}/release_task" \
+                -H "Content-Type: application/json; charset=utf-8" \
+                --data-binary "@${temp_payload}")
+        fi
 
-    # Response is wrapped: {"data": {"task_id": ...}, "code": 200, ...}
-    local job_id=$(echo "$response" | jq -r '.data.task_id // .task_id // empty')
+        rm -f "$temp_payload"
 
-    [ -z "$job_id" ] && { echo -e "${RED}Error: Failed to create job${NC}"; echo "$response"; exit 1; }
+        local job_id=$(echo "$response" | jq -r '.data.task_id // .task_id // empty')
+        [ -z "$job_id" ] && { echo -e "${RED}Error: Failed to create job${NC}"; echo "$response"; exit 1; }
 
-    if [ "$no_wait" = true ]; then
-        echo "Job ID: $job_id"
-        echo "Use '$0 status $job_id' to check progress and download"
-    else
-        wait_for_job "$api_url" "$job_id"
+        if [ "$no_wait" = true ]; then
+            echo "Job ID: $job_id"
+            echo "Use '$0 status $job_id' to check progress and download"
+        else
+            wait_for_job "$api_url" "$job_id"
+        fi
     fi
 }
 
@@ -715,42 +979,67 @@ cmd_random() {
     # Normalize boolean for jq --argjson
     thinking=$(normalize_bool "$thinking" "true")
 
+    local api_mode=$(load_api_mode)
+
     echo "Generating random music..."
     echo "  Thinking: $thinking"
+    echo "  API: $api_mode"
     echo "  Output: $OUTPUT_DIR"
     echo ""
 
-    local payload=$(jq -n --argjson thinking "$thinking" '{sample_mode: true, thinking: $thinking}')
+    if [ "$api_mode" = "completion" ]; then
+        # --- Completion mode ---
+        local model_id=$(get_completion_model "$api_url" "")
+        local def_audio_format=$(get_config "generation.audio_format")
 
-    # Write payload to temp file
-    local temp_payload=$(mktemp)
-    printf '%s' "$payload" > "$temp_payload"
+        local payload_c=$(jq -n \
+            --arg model "$model_id" \
+            --argjson thinking "$thinking" \
+            --arg format "${def_audio_format:-mp3}" \
+            '{
+                model: $model,
+                messages: [{"role": "user", "content": "Generate a random song"}],
+                stream: false,
+                sample_mode: true,
+                thinking: $thinking,
+                audio_config: { format: $format }
+            }')
 
-    local api_key=$(load_api_key)
-    local response
-    if [ -n "$api_key" ]; then
-        response=$(curl -s -X POST "${api_url}/release_task" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            -H "Authorization: Bearer ${api_key}" \
-            --data-binary "@${temp_payload}")
+        local temp_payload=$(mktemp)
+        printf '%s' "$payload_c" > "$temp_payload"
+
+        send_completion_request "$api_url" "$temp_payload"
     else
-        response=$(curl -s -X POST "${api_url}/release_task" \
-            -H "Content-Type: application/json; charset=utf-8" \
-            --data-binary "@${temp_payload}")
-    fi
+        # --- Native mode ---
+        local payload=$(jq -n --argjson thinking "$thinking" '{sample_mode: true, thinking: $thinking}')
 
-    rm -f "$temp_payload"
+        local temp_payload=$(mktemp)
+        printf '%s' "$payload" > "$temp_payload"
 
-    # Response is wrapped: {"data": {"task_id": ...}, "code": 200, ...}
-    local job_id=$(echo "$response" | jq -r '.data.task_id // .task_id // empty')
+        local api_key=$(load_api_key)
+        local response
+        if [ -n "$api_key" ]; then
+            response=$(curl -s -X POST "${api_url}/release_task" \
+                -H "Content-Type: application/json; charset=utf-8" \
+                -H "Authorization: Bearer ${api_key}" \
+                --data-binary "@${temp_payload}")
+        else
+            response=$(curl -s -X POST "${api_url}/release_task" \
+                -H "Content-Type: application/json; charset=utf-8" \
+                --data-binary "@${temp_payload}")
+        fi
 
-    [ -z "$job_id" ] && { echo -e "${RED}Error: Failed to create job${NC}"; echo "$response"; exit 1; }
+        rm -f "$temp_payload"
 
-    if [ "$no_wait" = true ]; then
-        echo "Job ID: $job_id"
-        echo "Use '$0 status $job_id' to check progress and download"
-    else
-        wait_for_job "$api_url" "$job_id"
+        local job_id=$(echo "$response" | jq -r '.data.task_id // .task_id // empty')
+        [ -z "$job_id" ] && { echo -e "${RED}Error: Failed to create job${NC}"; echo "$response"; exit 1; }
+
+        if [ "$no_wait" = true ]; then
+            echo "Job ID: $job_id"
+            echo "Use '$0 status $job_id' to check progress and download"
+        else
+            wait_for_job "$api_url" "$job_id"
+        fi
     fi
 }
 

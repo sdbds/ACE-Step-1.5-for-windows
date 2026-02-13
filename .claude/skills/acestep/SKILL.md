@@ -6,153 +6,73 @@ allowed-tools: Read, Write, Bash, Skill
 
 # ACE-Step Music Generation Skill
 
-Use ACE-Step V1.5 API for music generation. Script: `scripts/acestep.sh` (requires curl + jq).
+Use ACE-Step V1.5 API for music generation. **Always use `scripts/acestep.sh` script** — do NOT call API endpoints directly.
 
-## Prerequisites - ACE-Step API Service
-
-**IMPORTANT**: This skill requires the ACE-Step API server to be running.
-
-### Required Dependencies
-
-The `scripts/acestep.sh` script requires the following tools:
-
-**1. curl** - For making HTTP requests to the API
-**2. jq** - For parsing JSON responses
-
-#### Check Dependencies
-
-Before using this skill, verify that the required tools are installed:
+## Quick Start
 
 ```bash
-# Check curl
-curl --version
+# 1. cd to this skill's directory
+cd {project_root}/{.claude or .codex}/skills/acestep/
 
-# Check jq
-jq --version
+# 2. Check API service health
+./scripts/acestep.sh health
+
+# 3. Generate with lyrics (recommended)
+./scripts/acestep.sh generate -c "pop, female vocal, piano" -l "[Verse] Your lyrics here..." --duration 120 --language zh
+
+# 4. Output saved to: {project_root}/acestep_output/
 ```
 
-#### Installing jq
+## Workflow
 
-If jq is not installed, the script will attempt to install it automatically. If automatic installation fails, install manually:
-
-**Windows:**
-```bash
-# Using Chocolatey
-choco install jq
-
-# Or download from: https://jqlang.github.io/jq/download/
-# Extract jq.exe and add to PATH
-```
-
-**macOS:**
-```bash
-# Using Homebrew
-brew install jq
-
-# Using MacPorts
-port install jq
-```
-
-**Linux:**
-```bash
-# Debian/Ubuntu
-sudo apt-get install jq
-
-# Fedora/RHEL/CentOS
-sudo yum install jq
-# or
-sudo dnf install jq
-
-# Arch Linux
-sudo pacman -S jq
-```
-
-**Verification:**
-```bash
-jq --version
-# Should output: jq-1.x
-```
-
-If user reports jq installation issues, guide them through manual installation for their platform.
-
-### Before First Use
-
-**Ask the user about their setup:**
-
-1. **"Do you have ACE-Step API service configured and running?"**
-
-   If **YES**:
-   - Verify the API endpoint: `curl -s http://127.0.0.1:8001/health`
-   - If using remote service, ask for the API URL and update `scripts/config.json`
-   - Proceed with music generation
-
-   If **NO** or **NOT SURE**:
-   - Ask: "Do you have ACE-Step installed?"
-
-     **If installed but not running**:
-     - Use the acestep-docs skill to help them start the service
-     - Guide them through startup process
-
-     **If not installed**:
-     - Offer to help download and install ACE-Step
-     - Ask: "Would you like to use the Windows portable package or install from source?"
-     - Use acestep-docs skill to guide through installation
-
-### Service Configuration
-
-**Local Service (Default):**
-```json
-{
-  "api_url": "http://127.0.0.1:8001",
-  "api_key": ""
-}
-```
-
-**Remote Service:**
-```json
-{
-  "api_url": "http://your-server-ip:8001",
-  "api_key": "your-api-key-if-needed"
-}
-```
-
-To configure remote service, update `scripts/config.json` or use:
-```bash
-cd {skill_directory}/scripts/
-./acestep.sh config --set api_url "http://remote-server:8001"
-./acestep.sh config --set api_key "your-key"
-```
-
-### Using acestep-docs Skill for Setup Help
-
-**IMPORTANT**: For installation and startup, always use the acestep-docs skill to get complete and accurate guidance.
-
-When user needs help with installation or startup, invoke the acestep-docs skill:
-
-```
-Use the Skill tool to invoke: acestep-docs
-```
-
-**DO NOT provide simplified startup commands** - each user's environment may be different. Always guide them to use acestep-docs for proper setup.
-
-### Health Check
-
-**To verify if service is running:**
-```bash
-curl http://127.0.0.1:8001/health
-# Should return: {"status":"ok",...}
-```
-
-If health check fails, use acestep-docs skill to help user start the service properly.
-
----
-
-**WORKFLOW**: For user requests requiring vocals, you should:
-1. Consult [Music Creation Guide](./music-creation-guide.md) for lyrics writing, caption creation, duration/BPM/key selection
-2. Write complete, well-structured lyrics yourself based on the guide
+For user requests requiring vocals:
+1. Use the **acestep-songwriting** skill for lyrics writing, caption creation, duration/BPM/key selection
+2. Write complete, well-structured lyrics yourself based on the songwriting guide
 3. Generate using Caption mode with `-c` and `-l` parameters
 
 Only use Simple/Random mode (`-d` or `random`) for quick inspiration or instrumental exploration.
+
+If the user needs a simple music video, use the **acestep-simplemv** skill to render one with waveform visualization and synced lyrics.
+
+**MV Production Requirements**: Making a simple MV requires three additional skills to be installed:
+- **acestep-songwriting** — for writing lyrics and planning song structure
+- **acestep-lyrics-transcription** — for transcribing audio to timestamped lyrics (LRC)
+- **acestep-simplemv** — for rendering the final music video
+
+## Script Commands
+
+**CRITICAL - Complete Lyrics Input**: When providing lyrics via the `-l` parameter, you MUST pass ALL lyrics content WITHOUT any omission:
+- If user provides lyrics, pass the ENTIRE text they give you
+- If you generate lyrics yourself, pass the COMPLETE lyrics you created
+- NEVER truncate, shorten, or pass only partial lyrics
+- Missing lyrics will result in incomplete or incoherent songs
+
+**Music Parameters**: Use the **acestep-songwriting** skill for guidance on duration, BPM, key scale, and time signature.
+
+```bash
+# need to cd to this skill's directory first
+cd {project_root}/{.claude or .codex}/skills/acestep/
+
+# Caption mode - RECOMMENDED: Write lyrics first, then generate
+./scripts/acestep.sh generate -c "Electronic pop, energetic synths" -l "[Verse] Your complete lyrics
+[Chorus] Full chorus here..." --duration 120 --bpm 128
+
+# Instrumental only
+./scripts/acestep.sh generate "Jazz with saxophone"
+
+# Quick exploration (Simple/Random mode)
+./scripts/acestep.sh generate -d "A cheerful song about spring"
+./scripts/acestep.sh random
+
+# Options
+./scripts/acestep.sh generate "Rock" --duration 60 --batch 2
+./scripts/acestep.sh generate "EDM" --no-thinking    # Faster
+
+# Other commands
+./scripts/acestep.sh status <job_id>
+./scripts/acestep.sh health
+./scripts/acestep.sh models
+```
 
 ## Output Files
 
@@ -190,41 +110,6 @@ project_root/
 
 To get the actual synthesized lyrics, parse the JSON and read the top-level `lyrics` field, not `metas.lyrics`.
 
-## Script Commands
-
-**CRITICAL - Complete Lyrics Input**: When providing lyrics via the `-l` parameter, you MUST pass ALL lyrics content WITHOUT any omission:
-- If user provides lyrics, pass the ENTIRE text they give you
-- If you generate lyrics yourself, pass the COMPLETE lyrics you created
-- NEVER truncate, shorten, or pass only partial lyrics
-- Missing lyrics will result in incomplete or incoherent songs
-
-**Music Parameters**: Refer to [Music Creation Guide](./music-creation-guide.md) for how to calculate duration, choose BPM, key scale, and time signature.
-
-```bash
-# need to cd skills path
-cd {project_root}/{.claude or .codex}/skills/acestep/
-
-# Caption mode - RECOMMENDED: Write lyrics first, then generate
-./scripts/acestep.sh generate -c "Electronic pop, energetic synths" -l "[Verse] Your complete lyrics
-[Chorus] Full chorus here..." --duration 120 --bpm 128
-
-# Instrumental only
-./scripts/acestep.sh generate "Jazz with saxophone"
-
-# Quick exploration (Simple/Random mode)
-./scripts/acestep.sh generate -d "A cheerful song about spring"
-./scripts/acestep.sh random
-
-# Options
-./scripts/acestep.sh generate "Rock" --duration 60 --batch 2
-./scripts/acestep.sh generate "EDM" --no-thinking    # Faster
-
-# Other commands
-./scripts/acestep.sh status <job_id>
-./scripts/acestep.sh health
-./scripts/acestep.sh models
-```
-
 ## Configuration
 
 **Important**: Configuration follows this priority (high to low):
@@ -239,6 +124,7 @@ cd {project_root}/{.claude or .codex}/skills/acestep/
 {
   "api_url": "http://127.0.0.1:8001",
   "api_key": "",
+  "api_mode": "completion",
   "generation": {
     "thinking": true,
     "use_format": false,
@@ -255,102 +141,113 @@ cd {project_root}/{.claude or .codex}/skills/acestep/
 |--------|---------|-------------|
 | `api_url` | `http://127.0.0.1:8001` | API server address |
 | `api_key` | `""` | API authentication key (optional) |
+| `api_mode` | `completion` | API mode: `completion` (OpenRouter, default) or `native` (polling) |
 | `generation.thinking` | `true` | Enable 5Hz LM (higher quality, slower) |
 | `generation.audio_format` | `mp3` | Output format (mp3/wav/flac) |
 | `generation.vocal_language` | `en` | Vocal language |
 
-## API Reference
+## Prerequisites - ACE-Step API Service
 
-All responses wrapped: `{"data": <payload>, "code": 200, "error": null, "timestamp": ...}`
+**IMPORTANT**: This skill requires the ACE-Step API server to be running.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/release_task` | POST | Create generation task |
-| `/query_result` | POST | Query task status, body: `{"task_id_list": ["id"]}` |
-| `/v1/models` | GET | List available models |
-| `/v1/audio?path={path}` | GET | Download audio file |
+### Required Dependencies
 
-### Query Result Response
+The `scripts/acestep.sh` script requires: **curl** and **jq**.
 
-```json
-{
-  "data": [{
-    "task_id": "xxx",
-    "status": 1,
-    "result": "[{\"file\":\"/v1/audio?path=...\",\"metas\":{\"bpm\":120,\"duration\":60,\"keyscale\":\"C Major\"}}]"
-  }]
-}
+```bash
+# Check dependencies
+curl --version
+jq --version
 ```
 
-Status codes: `0` = processing, `1` = success, `2` = failed
+If jq is not installed, the script will attempt to install it automatically. If automatic installation fails:
+- **Windows**: `choco install jq` or download from https://jqlang.github.io/jq/download/
+- **macOS**: `brew install jq`
+- **Linux**: `sudo apt-get install jq` (Debian/Ubuntu) or `sudo dnf install jq` (Fedora)
 
-## Request Parameters (`/release_task`)
+### Before First Use
 
-Parameters can be placed in `param_obj` object.
+**You MUST check the API key and URL status before proceeding.** Run:
 
-### Generation Modes
-
-| Mode | Usage | When to Use |
-|------|-------|-------------|
-| **Caption** (Recommended) | `generate -c "style" -l "lyrics"` | For vocal songs - write lyrics yourself first |
-| **Simple** | `generate -d "description"` | Quick exploration, LM generates everything |
-| **Random** | `random` | Random generation for inspiration |
-
-### Core Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `prompt` | string | "" | Music style description (Caption mode) |
-| `lyrics` | string | "" | **Full lyrics content** - Pass ALL lyrics without omission. Use `[inst]` for instrumental. Partial/truncated lyrics = incomplete songs |
-| `sample_mode` | bool | false | Enable Simple/Random mode |
-| `sample_query` | string | "" | Description for Simple mode |
-| `thinking` | bool | false | Enable 5Hz LM for audio code generation |
-| `use_format` | bool | false | Use LM to enhance caption/lyrics |
-| `model` | string | - | DiT model name |
-| `batch_size` | int | 1 | Number of audio files to generate |
-
-### Music Attributes
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `audio_duration` | float | - | Duration in seconds |
-| `bpm` | int | - | Tempo (beats per minute) |
-| `key_scale` | string | "" | Key (e.g. "C Major") |
-| `time_signature` | string | "" | Time signature (e.g. "4/4") |
-| `vocal_language` | string | "en" | Language code (en, zh, ja, etc.) |
-| `audio_format` | string | "mp3" | Output format (mp3/wav/flac) |
-
-### Generation Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `inference_steps` | int | 8 | Diffusion steps |
-| `guidance_scale` | float | 7.0 | CFG scale |
-| `seed` | int | -1 | Random seed (-1 for random) |
-| `infer_method` | string | "ode" | Diffusion method (ode/sde) |
-
-### Audio Task Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `task_type` | string | "text2music" | text2music / continuation / repainting |
-| `src_audio_path` | string | - | Source audio for continuation |
-| `repainting_start` | float | 0.0 | Repainting start position (seconds) |
-| `repainting_end` | float | - | Repainting end position (seconds) |
-
-### Example Request (Simple Mode)
-
-```json
-{
-  "sample_mode": true,
-  "sample_query": "A cheerful pop song about spring",
-  "thinking": true,
-  "param_obj": {
-    "duration": 60,
-    "bpm": 120,
-    "language": "en"
-  },
-  "batch_size": 2
-}
+```bash
+cd "{project_root}/{.claude or .codex}/skills/acestep/" && bash ./scripts/acestep.sh config --check-key
+cd "{project_root}/{.claude or .codex}/skills/acestep/" && bash ./scripts/acestep.sh config --get api_url
 ```
+
+#### Case 1: Using Official Cloud API (`https://api.acemusic.ai`) without API key
+
+If `api_url` is `https://api.acemusic.ai` and `api_key` is `empty`, you MUST stop and guide the user to configure their key:
+
+1. Tell the user: "You're using the ACE-Step official cloud API, but no API key is configured. An API key is required to use this service."
+2. Explain how to get a key: API keys are currently available through the official ACE-Step Discord community (https://discord.gg/bGVxwUyD). Additional distribution methods will be added in the future.
+3. Use `AskUserQuestion` to ask the user to provide their API key.
+4. Once provided, configure it:
+   ```bash
+   cd "{project_root}/{.claude or .codex}/skills/acestep/" && bash ./scripts/acestep.sh config --set api_key <KEY>
+   ```
+5. Additionally, inform the user: "If you also want to render music videos (MV), it's recommended to configure a lyrics transcription API key as well (OpenAI Whisper or ElevenLabs Scribe), so that lyrics can be automatically transcribed with accurate timestamps. You can configure it later via the `acestep-lyrics-transcription` skill."
+
+#### Case 2: API key is configured
+
+Verify the API endpoint: `./scripts/acestep.sh health` and proceed with music generation.
+
+#### Case 3: Using local/custom API without key
+
+Local services (`http://127.0.0.1:*`) typically don't require a key. Verify with `./scripts/acestep.sh health` and proceed.
+
+If health check fails:
+- Ask: "Do you have ACE-Step installed?"
+- **If installed but not running**: Use the acestep-docs skill to help them start the service
+- **If not installed**: Use acestep-docs skill to guide through installation
+
+### Service Configuration
+
+**Official Cloud API:** ACE-Step provides an official API endpoint at `https://api.acemusic.ai`. To use it:
+```bash
+./scripts/acestep.sh config --set api_url "https://api.acemusic.ai"
+./scripts/acestep.sh config --set api_key "your-key"
+./scripts/acestep.sh config --set api_mode completion
+```
+API keys are currently available through the official ACE-Step Discord community. Additional distribution methods will be added in the future.
+
+**Local Service (Default):** No configuration needed — connects to `http://127.0.0.1:8001`.
+
+**Custom Remote Service:** Update `scripts/config.json` or use:
+```bash
+./scripts/acestep.sh config --set api_url "http://remote-server:8001"
+./scripts/acestep.sh config --set api_key "your-key"
+```
+
+**API Key Handling**: When checking whether an API key is configured, use `config --check-key` which only reports `configured` or `empty` without printing the actual key. **NEVER use `config --get api_key`** or read `config.json` directly — these would expose the user's API key. The `config --list` command is safe — it automatically masks API keys as `***` in output.
+
+### API Mode
+
+The skill supports two API modes. Switch via `api_mode` in `scripts/config.json`:
+
+| Mode | Endpoint | Description |
+|------|----------|-------------|
+| `completion` (default) | `/v1/chat/completions` | OpenRouter-compatible, sync request, audio returned as base64 |
+| `native` | `/release_task` + `/query_result` | Async polling mode, supports all parameters |
+
+**Switch mode:**
+```bash
+./scripts/acestep.sh config --set api_mode completion
+./scripts/acestep.sh config --set api_mode native
+```
+
+**Completion mode notes:**
+- No polling needed — single request returns result directly
+- Audio is base64-encoded inline in the response (auto-decoded and saved)
+- `inference_steps`, `infer_method`, `shift` are not configurable (server defaults)
+- `--no-wait` and `status` commands are not applicable in completion mode
+- Requires `model` field — auto-detected from `/v1/models` if not specified
+
+### Using acestep-docs Skill for Setup Help
+
+**IMPORTANT**: For installation and startup, always use the acestep-docs skill to get complete and accurate guidance.
+
+**DO NOT provide simplified startup commands** - each user's environment may be different. Always guide them to use acestep-docs for proper setup.
+
+---
+
+For API debugging, see [API Reference](./api-reference.md).
