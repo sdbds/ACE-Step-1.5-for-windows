@@ -41,6 +41,7 @@ dependencies = [
     "mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     # Training dependencies
     "peft>=0.18.0",
+    "lycoris-lora",
     "lightning>=2.0.0",
     "tensorboard>=2.0.0",
     # Local third-party packages

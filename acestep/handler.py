@@ -44,7 +44,12 @@ from acestep.constants import (
     SFT_GEN_PROMPT,
     DEFAULT_DIT_INSTRUCTION,
 )
-from acestep.core.generation.handler import InitServiceMixin, LoraManagerMixin, ProgressMixin
+from acestep.core.generation.handler import (
+    DiffusionMixin,
+    InitServiceMixin,
+    LoraManagerMixin,
+    ProgressMixin,
+)
 from acestep.dit_alignment_score import MusicStampsAligner, MusicLyricScorer
 from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_effective_free_vram_gb
 
@@ -52,7 +57,7 @@ from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_eff
 warnings.filterwarnings("ignore")
 
 
-class AceStepHandler(InitServiceMixin, LoraManagerMixin, ProgressMixin):
+class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, ProgressMixin):
     """ACE-Step Business Logic Handler"""
 
     def __init__(self):
@@ -108,10 +113,9 @@ class AceStepHandler(InitServiceMixin, LoraManagerMixin, ProgressMixin):
         self.lora_loaded = False
         self.use_lora = False
         self.lora_scale = 1.0  # LoRA influence scale (0-1)
-        self._base_decoder = None  # Backup of original decoder
+        self._base_decoder = None  # Backup of original decoder state_dict (CPU) for memory efficiency
         self._adapter_type = None  # None | "peft_lora" | "lycoris_lokr"
         self._lycoris_net = None
-
         self._lora_adapter_registry = {}  # adapter_name -> explicit scaling targets
         self._lora_active_adapter = None
 
@@ -833,74 +837,6 @@ class AceStepHandler(InitServiceMixin, LoraManagerMixin, ProgressMixin):
                 pbar.update(1)
 
         return mx.concatenate(encoded_parts, axis=1)
-
-    def _mlx_run_diffusion(
-        self,
-        encoder_hidden_states,
-        encoder_attention_mask,
-        context_latents,
-        src_latents,
-        seed,
-        infer_method: str = "ode",
-        shift: float = 3.0,
-        timesteps=None,
-        audio_cover_strength: float = 1.0,
-        encoder_hidden_states_non_cover=None,
-        encoder_attention_mask_non_cover=None,
-        context_latents_non_cover=None,
-    ) -> Dict[str, Any]:
-        """Run the diffusion loop using the MLX decoder.
-
-        Accepts PyTorch tensors, converts to numpy for MLX, runs the loop,
-        and converts results back to PyTorch tensors.
-        """
-        import numpy as np
-        from acestep.mlx_dit.generate import mlx_generate_diffusion
-
-        # Convert inputs to numpy (float32)
-        enc_np = encoder_hidden_states.detach().cpu().float().numpy()
-        ctx_np = context_latents.detach().cpu().float().numpy()
-        src_shape = (src_latents.shape[0], src_latents.shape[1], src_latents.shape[2])
-
-        enc_nc_np = (
-            encoder_hidden_states_non_cover.detach().cpu().float().numpy()
-            if encoder_hidden_states_non_cover is not None else None
-        )
-        ctx_nc_np = (
-            context_latents_non_cover.detach().cpu().float().numpy()
-            if context_latents_non_cover is not None else None
-        )
-
-        # Convert timesteps tensor if present
-        ts_list = None
-        if timesteps is not None:
-            if hasattr(timesteps, "tolist"):
-                ts_list = timesteps.tolist()
-            else:
-                ts_list = list(timesteps)
-
-        result = mlx_generate_diffusion(
-            mlx_decoder=self.mlx_decoder,
-            encoder_hidden_states_np=enc_np,
-            context_latents_np=ctx_np,
-            src_latents_shape=src_shape,
-            seed=seed,
-            infer_method=infer_method,
-            shift=shift,
-            timesteps=ts_list,
-            audio_cover_strength=audio_cover_strength,
-            encoder_hidden_states_non_cover_np=enc_nc_np,
-            context_latents_non_cover_np=ctx_nc_np,
-        )
-
-        # Convert result latents back to PyTorch tensor on the correct device
-        target_np = result["target_latents"]
-        target_tensor = torch.from_numpy(target_np).to(device=self.device, dtype=self.dtype)
-
-        return {
-            "target_latents": target_tensor,
-            "time_costs": result["time_costs"],
-        }
 
     def initialize_service(
         self,
@@ -3239,6 +3175,8 @@ class AceStepHandler(InitServiceMixin, LoraManagerMixin, ProgressMixin):
                 logger.info("🔍 [DEBUG] DiT TEXT ENCODER INPUT (Inference)")
                 logger.info(f"{'='*70}")
                 logger.info(f"text_prompt:\n{text_prompt}")
+                logger.info(f"{'='*70}")
+                logger.info(f"lyrics_text:\n{self._format_lyrics(lyrics[i], actual_language)}")
                 logger.info(f"{'='*70}\n")
 
             # Tokenize text

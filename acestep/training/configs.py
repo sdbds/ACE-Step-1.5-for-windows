@@ -40,6 +40,8 @@ class LoRAConfig:
 
 @dataclass
 class LoKRConfig:
+    """Configuration for LoKr (Low-Rank Kronecker) training."""
+
     linear_dim: int = 64
     linear_alpha: int = 128
     factor: int = -1
@@ -55,7 +57,8 @@ class LoKRConfig:
     rs_lora: bool = False
     unbalanced_factorization: bool = False
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
+        """Convert to dictionary for LyCORIS config."""
         return {
             "linear_dim": self.linear_dim,
             "linear_alpha": self.linear_alpha,

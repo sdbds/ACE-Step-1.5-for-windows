@@ -30,10 +30,18 @@ class PreprocessMixin:
         output_dir: str,
         max_duration: float = 240.0,
         skip_existing: bool = False,
+        preprocess_mode: str = "lora",
         progress_callback=None,
     ) -> Tuple[List[str], str]:
         """Preprocess all labeled samples to tensor files for efficient training."""
-        debug_log_for("dataset", f"preprocess_to_tensors: output_dir='{output_dir}', max_duration={max_duration}")
+        mode = str(preprocess_mode or "lora").strip().lower()
+        if mode not in {"lora", "lokr"}:
+            mode = "lora"
+
+        debug_log_for(
+            "dataset",
+            f"preprocess_to_tensors: output_dir='{output_dir}', max_duration={max_duration}, mode={mode}",
+        )
         if not self.samples:
             return [], "❌ No samples to preprocess"
 
@@ -187,6 +195,17 @@ class PreprocessMixin:
                     if lyric_hidden_states.dtype != model_dtype:
                         lyric_hidden_states = lyric_hidden_states.to(model_dtype)
 
+                    refer_audio_hidden = None
+                    refer_audio_order_mask_val = None
+                    if mode == "lokr":
+                        # LoKr mode uses per-sample audio latents as reference-audio conditioning.
+                        refer_audio_hidden = target_latents.to(device=model_device, dtype=model_dtype)
+                        refer_audio_order_mask_val = torch.zeros(
+                            refer_audio_hidden.shape[0],
+                            device=model_device,
+                            dtype=torch.long,
+                        )
+
                     encoder_hidden_states, encoder_attention_mask = run_encoder(
                         model,
                         text_hidden_states=text_hidden_states,
@@ -195,13 +214,22 @@ class PreprocessMixin:
                         lyric_attention_mask=lyric_attention_mask,
                         device=model_device,
                         dtype=model_dtype,
+                        refer_audio_hidden_states_packed=refer_audio_hidden,
+                        refer_audio_order_mask=refer_audio_order_mask_val,
                     )
                 debug_end_verbose_for("dataset", f"run_encoder[{i}]", t0)
 
                 del text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
 
                 t0 = debug_start_verbose_for("dataset", f"build_context_latents[{i}]")
-                context_latents = build_context_latents(silence_latent, latent_length, device, dtype)
+                context_src = target_latents if mode == "lokr" else None
+                context_latents = build_context_latents(
+                    silence_latent,
+                    latent_length,
+                    device,
+                    dtype,
+                    src_latents=context_src,
+                )
                 debug_end_verbose_for("dataset", f"build_context_latents[{i}]", t0)
 
                 output_data = {
@@ -221,6 +249,7 @@ class PreprocessMixin:
                         "timesignature": sample.timesignature,
                         "language": sample.language,
                         "is_instrumental": sample.is_instrumental,
+                        "preprocess_mode": mode,
                     },
                 }
                 t0 = debug_start_verbose_for("dataset", f"torch.save[{i}]")

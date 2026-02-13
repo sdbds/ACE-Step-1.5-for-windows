@@ -22,7 +22,7 @@ from transformers.generation.logits_process import (
     RepetitionPenaltyLogitsProcessor,
 )
 from acestep.constrained_logits_processor import MetadataConstrainedLogitsProcessor
-from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION
+from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION, DURATION_MIN, DURATION_MAX
 from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
 
 # Minimum free VRAM (GB) required to attempt vLLM initialization.
@@ -195,6 +195,66 @@ class LLMHandler:
         except Exception as e:
             logger.warning(f"Failed to calculate GPU memory utilization: {e}")
             return 0.9, False
+
+    def _compute_max_new_tokens(
+        self,
+        target_duration: Optional[float],
+        generation_phase: str,
+        fallback_max: Optional[int] = None,
+    ) -> int:
+        """
+        Compute max_new_tokens based on target duration and generation phase.
+
+        In the two-phase architecture:
+        - CoT phase: generates metadata (~50-200 tokens) + needs buffer for safety.
+        - Codes phase: CoT is already in the prompt; only audio codes are generated.
+          The constrained decoder forces EOS at exactly target_codes, so only a
+          small buffer (10 tokens) is needed to avoid a misleading progress bar.
+
+        Duration is clamped to ``[DURATION_MIN, max_dur]`` where *max_dur* is the
+        GPU-config-dependent maximum (from ``get_global_gpu_config()``) capped at
+        ``DURATION_MAX``.  This keeps the progress-bar total aligned with what the
+        constrained decoder actually enforces.
+
+        Args:
+            target_duration: Target duration in seconds (5 codes = 1 second).
+            generation_phase: "cot" or "codes".
+            fallback_max: Fallback value when target_duration is not set.
+
+        Returns:
+            Computed max_new_tokens value, capped at model's max length.
+        """
+        if target_duration is not None and target_duration > 0:
+            # Determine the effective upper bound from GPU config (if available)
+            # so that max_new_tokens does not exceed what the constrained decoder
+            # will actually enforce on lower-tier GPUs.
+            gpu_max_dur = DURATION_MAX
+            try:
+                gpu_cfg = get_global_gpu_config()
+                gpu_max_dur = min(gpu_cfg.max_duration_with_lm, DURATION_MAX)
+            except Exception:
+                pass  # Fallback to DURATION_MAX if GPU config unavailable
+
+            effective_duration = max(DURATION_MIN, min(gpu_max_dur, target_duration))
+            target_codes = int(effective_duration * 5)
+            if generation_phase == "codes":
+                # Codes phase: CoT already in prompt, only audio codes generated.
+                # Constrained decoder forces EOS at target_codes, so small buffer suffices.
+                max_new_tokens = target_codes + 10
+            else:
+                # CoT phase or mixed: add larger buffer for metadata overhead.
+                max_new_tokens = target_codes + 500
+        else:
+            if fallback_max is not None:
+                max_new_tokens = fallback_max
+            else:
+                max_new_tokens = getattr(self, "max_model_len", 4096) - 64
+
+        # Cap at model's max length
+        if hasattr(self, "max_model_len"):
+            max_new_tokens = min(max_new_tokens, self.max_model_len - 64)
+
+        return max_new_tokens
 
     def _has_meaningful_negative_prompt(self, negative_prompt: str) -> bool:
         """Check if negative prompt is meaningful (not default/empty)"""
@@ -718,17 +778,12 @@ class LLMHandler:
             codes_temperature=codes_temperature,
         )
 
-        # Calculate max_tokens based on target_duration if specified
-        # 5 audio codes = 1 second, plus ~500 tokens for CoT metadata and safety margin
-        if target_duration is not None and target_duration > 0:
-            # Ensure duration is within valid range (10-600 seconds)
-            effective_duration = max(10, min(600, target_duration))
-            max_tokens = int(effective_duration * 5) + 500
-            # Cap at model's max length
-            max_tokens = min(max_tokens, self.max_model_len - 64)
-        else:
-            # No duration constraint - use default (model will stop at EOS naturally)
-            max_tokens = self.max_model_len - 64
+        # Calculate max_tokens based on target_duration and generation phase
+        max_tokens = self._compute_max_new_tokens(
+            target_duration=target_duration,
+            generation_phase=generation_phase,
+            fallback_max=self.max_model_len - 64,
+        )
 
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
@@ -823,18 +878,12 @@ class LLMHandler:
         with self._load_model_context():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            # Calculate max_new_tokens based on target_duration if specified
-            # 5 audio codes = 1 second, plus ~500 tokens for CoT metadata and safety margin
-            if target_duration is not None and target_duration > 0:
-                # Ensure duration is within valid range (10-600 seconds)
-                effective_duration = max(10, min(600, target_duration))
-                max_new_tokens = int(effective_duration * 5) + 500
-            else:
-                max_new_tokens = getattr(self.llm.config, "max_new_tokens", 4096)
-
-            # Cap at model's max length
-            if hasattr(self, "max_model_len"):
-                max_new_tokens = min(max_new_tokens, self.max_model_len - 64)
+            # Calculate max_new_tokens based on target_duration and generation phase
+            max_new_tokens = self._compute_max_new_tokens(
+                target_duration=target_duration,
+                generation_phase=generation_phase,
+                fallback_max=getattr(self.llm.config, "max_new_tokens", 4096),
+            )
 
             # Build logits processor list (only for CFG and repetition penalty)
             logits_processor = self._build_logits_processor(repetition_penalty)
@@ -974,42 +1023,46 @@ class LLMHandler:
         # Determine if batch mode
         formatted_prompt_list, is_batch = self._normalize_batch_input(formatted_prompts)
 
-        # For batch mode, process each item sequentially with different seeds
+        # For batch mode, process each item sequentially with different seeds.
+        # Wrap the entire loop in a single _load_model_context() so the model
+        # loads to GPU once and offloads once, instead of per-item.
         if is_batch:
             output_texts = []
-            for i, formatted_prompt in enumerate(formatted_prompt_list):
-                # Set seed for this item if provided
-                if seeds and i < len(seeds):
-                    torch.manual_seed(seeds[i])
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(seeds[i])
-                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                        torch.mps.manual_seed(seeds[i])
 
-                # Generate using single-item method with batch-mode defaults
-                output_text = self._run_pt_single(
-                    formatted_prompt=formatted_prompt,
-                    temperature=temperature,
-                    cfg_scale=cfg_scale,
-                    negative_prompt=negative_prompt,
-                    top_k=top_k,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
-                    use_constrained_decoding=use_constrained_decoding,
-                    constrained_decoding_debug=constrained_decoding_debug,
-                    target_duration=target_duration,
-                    user_metadata=None,
-                    stop_at_reasoning=False,
-                    skip_genres=True,
-                    skip_caption=True,
-                    skip_language=True,
-                    generation_phase=generation_phase,
-                    caption=caption,
-                    lyrics=lyrics,
-                    cot_text=cot_text,
-                )
+            with self._load_model_context():
+                for i, formatted_prompt in enumerate(formatted_prompt_list):
+                    # Set seed for this item if provided
+                    if seeds and i < len(seeds):
+                        torch.manual_seed(seeds[i])
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(seeds[i])
+                        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                            torch.mps.manual_seed(seeds[i])
 
-                output_texts.append(output_text)
+                    # Generate using single-item method with batch-mode defaults
+                    output_text = self._run_pt_single(
+                        formatted_prompt=formatted_prompt,
+                        temperature=temperature,
+                        cfg_scale=cfg_scale,
+                        negative_prompt=negative_prompt,
+                        top_k=top_k,
+                        top_p=top_p,
+                        repetition_penalty=repetition_penalty,
+                        use_constrained_decoding=use_constrained_decoding,
+                        constrained_decoding_debug=constrained_decoding_debug,
+                        target_duration=target_duration,
+                        user_metadata=None,
+                        stop_at_reasoning=False,
+                        skip_genres=True,
+                        skip_caption=True,
+                        skip_language=True,
+                        generation_phase=generation_phase,
+                        caption=caption,
+                        lyrics=lyrics,
+                        cot_text=cot_text,
+                    )
+
+                    output_texts.append(output_text)
 
             return output_texts
 
@@ -2779,13 +2832,11 @@ class LLMHandler:
         prompt = mx.array(input_ids_np[0])  # 1D [seq_len]
 
         # ---- Calculate max_new_tokens ----
-        if target_duration is not None and target_duration > 0:
-            effective_duration = max(10, min(600, target_duration))
-            max_new_tokens = int(effective_duration * 5) + 500
-        else:
-            max_new_tokens = getattr(self, "max_model_len", 4096) - 64
-        if hasattr(self, "max_model_len"):
-            max_new_tokens = min(max_new_tokens, self.max_model_len - 64)
+        # Batch native is always codes phase
+        max_new_tokens = self._compute_max_new_tokens(
+            target_duration=target_duration,
+            generation_phase="codes",
+        )
 
         # ---- EOS tokens ----
         eos_token_id = self.llm_tokenizer.eos_token_id
@@ -3153,13 +3204,10 @@ class LLMHandler:
         )
 
         # ---- Calculate max_new_tokens ----
-        if target_duration is not None and target_duration > 0:
-            effective_duration = max(10, min(600, target_duration))
-            max_new_tokens = int(effective_duration * 5) + 500
-        else:
-            max_new_tokens = getattr(self, "max_model_len", 4096) - 64
-        if hasattr(self, "max_model_len"):
-            max_new_tokens = min(max_new_tokens, self.max_model_len - 64)
+        max_new_tokens = self._compute_max_new_tokens(
+            target_duration=target_duration,
+            generation_phase=generation_phase,
+        )
 
         # ---- EOS tokens ----
         eos_token_id = self.llm_tokenizer.eos_token_id
@@ -3501,13 +3549,10 @@ class LLMHandler:
         )
 
         # Calculate max_new_tokens
-        if target_duration is not None and target_duration > 0:
-            effective_duration = max(10, min(600, target_duration))
-            max_new_tokens = int(effective_duration * 5) + 500
-        else:
-            max_new_tokens = getattr(self, "max_model_len", 4096) - 64
-        if hasattr(self, "max_model_len"):
-            max_new_tokens = min(max_new_tokens, self.max_model_len - 64)
+        max_new_tokens = self._compute_max_new_tokens(
+            target_duration=target_duration,
+            generation_phase=generation_phase,
+        )
 
         # EOS token
         eos_token_id = self.llm_tokenizer.eos_token_id
@@ -3814,6 +3859,18 @@ class LLMHandler:
             yield
             return
 
+        # Reentrancy guard: if an outer context already loaded the model
+        # to the target device, skip the inner load/offload to avoid
+        # redundant CPU↔GPU transfers during batch processing.
+        try:
+            current_device = next(model.parameters()).device.type
+        except StopIteration:
+            current_device = None
+        target_device = str(self.device).split(":")[0]
+        if current_device == target_device:
+            yield
+            return
+
         # Load to GPU
         logger.info(f"Loading LLM to {self.device}")
         start_time = time.time()
@@ -3876,7 +3933,7 @@ class LLMHandler:
                 )
                 load_time = time.time() - start_time
                 logger.info(f"HuggingFace model loaded in {load_time:.2f}s")
-                
+
                 # When offload_to_cpu is enabled, keep the model on CPU to save
                 # VRAM.  The caller (_load_scoring_model_context in
                 # test_time_scaling.py) will move it to the accelerator only for
@@ -3889,7 +3946,7 @@ class LLMHandler:
                     self._hf_model_for_scoring = self._hf_model_for_scoring.to(device)
                     self._hf_model_for_scoring.eval()
                     logger.info(f"HuggingFace model for scoring ready on {device}")
-            
+
             return self._hf_model_for_scoring
 
         elif self.llm_backend == "mlx":
@@ -3911,7 +3968,7 @@ class LLMHandler:
                 )
                 load_time = time.time() - start_time
                 logger.info(f"HuggingFace model loaded in {load_time:.2f}s")
-                
+
                 # When offload_to_cpu is enabled, keep on CPU; the scoring
                 # context manager will move it to the accelerator as needed.
                 if self.offload_to_cpu:
@@ -3922,7 +3979,7 @@ class LLMHandler:
                     self._hf_model_for_scoring = self._hf_model_for_scoring.to(device)
                     self._hf_model_for_scoring.eval()
                     logger.info(f"HuggingFace model for scoring ready on {device}")
-            
+
             return self._hf_model_for_scoring
 
         else:

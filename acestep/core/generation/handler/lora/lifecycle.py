@@ -37,19 +37,45 @@ def load_lora(self, lora_path: str) -> str:
         return "❌ PEFT library not installed. Please install with: pip install peft"
 
     try:
-        import copy
-
+        # Memory-efficient state_dict backup instead of deepcopy
         if self._base_decoder is None:
-            self._base_decoder = copy.deepcopy(self.model.decoder)
-            logger.info("Base decoder backed up")
+            # Log memory before backup
+            if hasattr(self, '_memory_allocated'):
+                mem_before = self._memory_allocated() / (1024**3)
+                logger.info(f"VRAM before LoRA load: {mem_before:.2f}GB")
+            
+            # Save only the base model weights as state_dict (CPU to save VRAM)
+            try:
+                state_dict = self.model.decoder.state_dict()
+                if not state_dict:
+                    raise ValueError("state_dict is empty - cannot backup decoder")
+                self._base_decoder = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+            except Exception as e:
+                logger.error(f"Failed to create state_dict backup: {e}")
+                raise
+            
+            # Calculate backup size in MB
+            backup_size_mb = sum(v.numel() * v.element_size() for v in self._base_decoder.values()) / (1024**2)
+            logger.info(f"Base decoder state_dict backed up to CPU ({backup_size_mb:.1f}MB)")
         else:
-            self.model.decoder = copy.deepcopy(self._base_decoder)
-            logger.info("Restored base decoder before loading new LoRA")
+            # Restore base decoder from state_dict backup
+            logger.info("Restoring base decoder from state_dict backup")
+            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            if load_result.missing_keys:
+                logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
+            if load_result.unexpected_keys:
+                logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
+            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
 
         logger.info(f"Loading LoRA adapter from {lora_path}")
         self.model.decoder = PeftModel.from_pretrained(self.model.decoder, lora_path, is_trainable=False)
         self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
         self.model.decoder.eval()
+
+        # Log memory after LoRA load
+        if hasattr(self, '_memory_allocated'):
+            mem_after = self._memory_allocated() / (1024**3)
+            logger.info(f"VRAM after LoRA load: {mem_after:.2f}GB")
 
         self.lora_loaded = True
         self.use_lora = True
@@ -81,9 +107,35 @@ def unload_lora(self) -> str:
         return "❌ Base decoder backup not found. Cannot restore."
 
     try:
-        import copy
-
-        self.model.decoder = copy.deepcopy(self._base_decoder)
+        # Log memory before unload (track before any operations)
+        mem_before = None
+        if hasattr(self, '_memory_allocated'):
+            mem_before = self._memory_allocated() / (1024**3)
+            logger.info(f"VRAM before LoRA unload: {mem_before:.2f}GB")
+        
+        # Get the base model from the PEFT wrapper if it exists
+        # This is more memory-efficient than recreating from state_dict
+        from peft import PeftModel
+        
+        if isinstance(self.model.decoder, PeftModel):
+            logger.info("Extracting base model from PEFT wrapper")
+            # PEFT's get_base_model() returns the underlying base model without copying
+            self.model.decoder = self.model.decoder.get_base_model()
+            # Restore state_dict from backup to ensure clean state
+            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            if load_result.missing_keys:
+                logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
+            if load_result.unexpected_keys:
+                logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
+        else:
+            # Fallback: restore from state_dict backup
+            logger.info("Restoring base decoder from state_dict backup")
+            load_result = self.model.decoder.load_state_dict(self._base_decoder, strict=False)
+            if load_result.missing_keys:
+                logger.warning(f"Missing keys when restoring decoder: {load_result.missing_keys[:5]}")
+            if load_result.unexpected_keys:
+                logger.warning(f"Unexpected keys when restoring decoder: {load_result.unexpected_keys[:5]}")
+        
         self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
         self.model.decoder.eval()
 
@@ -98,6 +150,12 @@ def unload_lora(self) -> str:
         self._lora_adapter_registry = {}
         self._lora_active_adapter = None
         self._lora_scale_state = {}
+
+        # Log memory after unload
+        if mem_before is not None and hasattr(self, '_memory_allocated'):
+            mem_after = self._memory_allocated() / (1024**3)
+            freed = mem_before - mem_after
+            logger.info(f"VRAM after LoRA unload: {mem_after:.2f}GB (freed: {freed:.2f}GB)")
 
         logger.info("LoRA unloaded, base decoder restored")
         return "✅ LoRA unloaded, using base model"

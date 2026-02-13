@@ -379,6 +379,8 @@ python -m acestep.acestep_v15_pipeline --port 7680
 
 On Windows, use `.venv\Scripts\activate` and the same steps.
 
+> **Note:** `torchcodec` is not available for AMD ROCm GPUs due to CUDA-specific dependencies. ACE-Step automatically uses `soundfile` as a fallback for audio I/O, which provides full functionality on ROCm platforms.
+
 ### GPU Detection Troubleshooting
 
 If you see "No GPU detected, running on CPU" with an AMD GPU:
@@ -412,7 +414,9 @@ See [ACE-Step1.5-Rocm-Manual-Linux.md](ACE-Step1.5-Rocm-Manual-Linux.md) for a d
 | nanovllm acceleration | NOT supported on Intel GPUs |
 | Test Environment | PyTorch 2.8.0 from [Intel Extension for PyTorch](https://pytorch-extension.intel.com/?request=platform) |
 
-> Note: LLM inference speed may decrease when generating audio longer than 2 minutes. Intel discrete GPUs are expected to work but not yet tested.
+> **Note:** LLM inference speed may decrease when generating audio longer than 2 minutes. Intel discrete GPUs are expected to work but not yet tested.
+> 
+> **Audio I/O:** `torchcodec` is not available for Intel XPU GPUs. ACE-Step automatically uses `soundfile` as a fallback for audio I/O, which provides full functionality on Intel platforms.
 
 ---
 

@@ -420,6 +420,63 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
     )
 
 
+def _extract_metadata_for_editing(lm_metadata):
+    """Extract lyrics and caption from lm_metadata for repaint/remix operations.
+    
+    Args:
+        lm_metadata: Metadata dictionary from LM generation (or None)
+    
+    Returns:
+        Tuple of (lyrics, caption) as strings (empty strings if not found)
+    """
+    lyrics = ""
+    caption = ""
+    if lm_metadata and isinstance(lm_metadata, dict):
+        lyrics = lm_metadata.get("lyrics", "")
+        caption = lm_metadata.get("caption", "")
+    return lyrics, caption
+
+
+def send_audio_to_remix(audio_file, lm_metadata):
+    """Send generated audio to src_audio and switch mode to Remix.
+    Also populate lyrics and caption fields from the generated audio.
+    
+    Returns:
+        Tuple of (src_audio, generation_mode, lyrics, caption)
+    """
+    if audio_file is None:
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
+    return (
+        audio_file,                       # src_audio
+        gr.update(value="Remix"),         # generation_mode -> Remix
+        lyrics,                           # lyrics
+        caption,                          # caption
+    )
+
+
+def send_audio_to_repaint(audio_file, lm_metadata):
+    """Send generated audio to src_audio and switch mode to Repaint.
+    Also populate lyrics field with lyrics from the generated audio.
+    
+    Returns:
+        Tuple of (src_audio, generation_mode, lyrics, caption)
+    """
+    if audio_file is None:
+        return (gr.skip(),) * 4
+    
+    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    
+    return (
+        audio_file,                       # src_audio
+        gr.update(value="Repaint"),       # generation_mode -> Repaint
+        lyrics,                           # lyrics
+        caption,                          # caption
+    )
+
+
 def generate_with_progress(
     dit_handler, llm_handler,
     captions, lyrics, bpm, key_scale, time_signature, vocal_language,
@@ -2289,4 +2346,61 @@ def restore_batch_parameters(current_batch_index, batch_queue):
         enable_normalization, normalization_db,
         latent_shift, latent_rescale
     )
+
+
+def convert_result_audio_to_codes(dit_handler, generated_audio):
+    """Convert a generated audio sample to LM audio codes.
+    
+    Args:
+        dit_handler: DiT handler instance with convert_src_audio_to_codes method
+        generated_audio: File path to the generated audio
+        
+    Returns:
+        Tuple of (codes_display_update, details_accordion_update)
+    """
+    if not generated_audio:
+        gr.Warning("No audio to convert.")
+        return gr.skip(), gr.skip()
+    
+    if not dit_handler or dit_handler.model is None:
+        gr.Warning(t("messages.service_not_initialized"))
+        return gr.skip(), gr.skip()
+    
+    try:
+        codes_string = dit_handler.convert_src_audio_to_codes(generated_audio)
+        if not codes_string or codes_string.startswith("❌"):
+            gr.Warning(f"Failed to convert audio to codes: {codes_string}")
+            return gr.skip(), gr.skip()
+        
+        gr.Info("Audio converted to codes successfully.")
+        return gr.update(value=codes_string), gr.update(open=True)
+    except Exception as e:
+        gr.Warning(f"Error converting audio to codes: {e}")
+        return gr.skip(), gr.skip()
+
+
+def save_lrc_to_file(lrc_text):
+    """Save LRC text to a downloadable .lrc file.
+    
+    Args:
+        lrc_text: The LRC text content to save
+        
+    Returns:
+        gr.update for the File component with the .lrc file path
+    """
+    if not lrc_text or not lrc_text.strip():
+        gr.Warning("No LRC content to save.")
+        return gr.skip()
+    
+    try:
+        # Create a temporary file with .lrc extension
+        tmp_dir = tempfile.mkdtemp()
+        lrc_path = os.path.join(tmp_dir, "lyrics.lrc")
+        with open(lrc_path, "w", encoding="utf-8") as f:
+            f.write(lrc_text)
+        gr.Info("LRC file ready for download.")
+        return gr.update(value=lrc_path, visible=True)
+    except Exception as e:
+        gr.Warning(f"Error saving LRC file: {e}")
+        return gr.skip()
 

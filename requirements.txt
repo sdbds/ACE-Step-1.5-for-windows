@@ -32,8 +32,9 @@ toml
 huggingface_hub[hf_xet]
 modelscope
 
-# Training dependencies (required for LoRA training)
+# Training dependencies (required for LoRA/LoKr training)
 peft>=0.18.0
+lycoris-lora
 lightning>=2.0.0
 tensorboard>=2.0.0
 

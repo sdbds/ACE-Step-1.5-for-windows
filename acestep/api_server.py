@@ -393,6 +393,8 @@ PARAM_ALIASES = {
     "use_cot_language": ["use_cot_language", "cot_language", "cot-language"],
     "is_format_caption": ["is_format_caption", "isFormatCaption"],
     "allow_lm_batch": ["allow_lm_batch", "allowLmBatch", "parallel_thinking"],
+    "track_name": ["track_name", "trackName"],
+    "track_classes": ["track_classes", "trackClasses", "instruments"],
 }
 
 
@@ -602,6 +604,8 @@ class GenerateMusicRequest(BaseModel):
     use_cot_language: bool = True
     is_format_caption: bool = False
     allow_lm_batch: bool = True
+    track_name: Optional[str] = None
+    track_classes: Optional[List[str]] = None
 
     lm_temperature: float = 0.85
     lm_cfg_scale: float = 2.5
@@ -2126,7 +2130,25 @@ def create_app() -> FastAPI:
                 # This matches gradio behavior which uses TASK_INSTRUCTIONS for each task type
                 instruction_to_use = req.instruction
                 if instruction_to_use == DEFAULT_DIT_INSTRUCTION and req.task_type in TASK_INSTRUCTIONS:
-                    instruction_to_use = TASK_INSTRUCTIONS[req.task_type]
+                    raw_instruction = TASK_INSTRUCTIONS[req.task_type]
+                    
+                    if req.task_type == "complete":
+                         #  Use track_classes joined by pipes
+                         if req.track_classes:
+                             # Join list items: ["Drums", "Bass"] -> "DRUMS | BASS"
+                             classes_str = " | ".join([str(t).upper() for t in req.track_classes])
+                             # Use the raw instruction template from constants
+                             # Format: "Complete the track with {TRACK_CLASSES}:"
+                             instruction_to_use = raw_instruction.format(TRACK_CLASSES=classes_str)
+                         else:
+                             # Fallback if no classes provided
+                             instruction_to_use = TASK_INSTRUCTIONS.get("complete_default", raw_instruction)
+
+                    elif "{TRACK_NAME}" in raw_instruction and req.track_name:
+                        # Logic for extract/lego
+                        instruction_to_use = raw_instruction.format(TRACK_NAME=req.track_name.upper())
+                    else:
+                        instruction_to_use = raw_instruction
 
                 # Build GenerationParams using unified interface
                 # Note: thinking controls LM code generation, sample_mode only affects CoT metas
@@ -2176,11 +2198,30 @@ def create_app() -> FastAPI:
 
                 # Build GenerationConfig - default to 2 audios like gradio_ui
                 batch_size = req.batch_size if req.batch_size is not None else 2
+
+                # Resolve seed(s) from req.seed into List[int] for GenerationConfig.seeds
+                resolved_seeds = None
+                if not req.use_random_seed and req.seed is not None:
+                    if isinstance(req.seed, int):
+                        if req.seed >= 0:
+                            resolved_seeds = [req.seed]
+                    elif isinstance(req.seed, str):
+                        resolved_seeds = []
+                        for s in req.seed.split(","):
+                            s = s.strip()
+                            if s and s != "-1":
+                                try:
+                                    resolved_seeds.append(int(float(s)))
+                                except (ValueError, TypeError):
+                                    pass
+                        if not resolved_seeds:
+                            resolved_seeds = None
+
                 config = GenerationConfig(
                     batch_size=batch_size,
                     allow_lm_batch=req.allow_lm_batch,
                     use_random_seed=req.use_random_seed,
-                    seeds=None,  # Let unified logic handle seed generation
+                    seeds=resolved_seeds,
                     audio_format=req.audio_format,
                     constrained_decoding_debug=req.constrained_decoding_debug,
                 )
@@ -2824,6 +2865,221 @@ def create_app() -> FastAPI:
 
     @app.post("/release_task")
     async def create_music_generate_job(request: Request, authorization: Optional[str] = Header(None)):
+        content_type = (request.headers.get("content-type") or "").lower()
+        temp_files: list[str] = []
+
+        def _build_request(p: RequestParser, **kwargs) -> GenerateMusicRequest:
+            """Build GenerateMusicRequest from parsed parameters."""
+            # Pop audio path overrides from kwargs to avoid duplicate keyword arguments
+            # when callers (multipart/form, url-encoded, raw body) pass them explicitly.
+            ref_audio = kwargs.pop("reference_audio_path", None) or p.str("reference_audio_path") or None
+            src_audio = kwargs.pop("src_audio_path", None) or p.str("src_audio_path") or None
+
+            t_classes = p.get("track_classes")
+            if t_classes is not None and isinstance(t_classes, str):
+                t_classes = [t_classes]
+
+            return GenerateMusicRequest(
+                prompt=p.str("prompt"),
+                lyrics=p.str("lyrics"),
+                thinking=p.bool("thinking"),
+                analysis_only=p.bool("analysis_only"),
+                full_analysis_only=p.bool("full_analysis_only"),
+                sample_mode=p.bool("sample_mode"),
+                sample_query=p.str("sample_query"),
+                use_format=p.bool("use_format"),
+                model=p.str("model") or None,
+                bpm=p.int("bpm"),
+                key_scale=p.str("key_scale"),
+                time_signature=p.str("time_signature"),
+                audio_duration=p.float("audio_duration"),
+                vocal_language=p.str("vocal_language", "en"),
+                inference_steps=p.int("inference_steps", 8),
+                guidance_scale=p.float("guidance_scale", 7.0),
+                use_random_seed=p.bool("use_random_seed", True),
+                seed=p.int("seed", -1),
+                batch_size=p.int("batch_size"),
+                repainting_start=p.float("repainting_start", 0.0),
+                repainting_end=p.float("repainting_end"),
+                instruction=p.str("instruction", DEFAULT_DIT_INSTRUCTION),
+                audio_cover_strength=p.float("audio_cover_strength", 1.0),
+                reference_audio_path=ref_audio,
+                src_audio_path=src_audio,
+                task_type=p.str("task_type", "text2music"),
+                use_adg=p.bool("use_adg"),
+                cfg_interval_start=p.float("cfg_interval_start", 0.0),
+                cfg_interval_end=p.float("cfg_interval_end", 1.0),
+                infer_method=p.str("infer_method", "ode"),
+                shift=p.float("shift", 3.0),
+                audio_format=p.str("audio_format", "mp3"),
+                use_tiled_decode=p.bool("use_tiled_decode", True),
+                lm_model_path=p.str("lm_model_path") or None,
+                lm_backend=p.str("lm_backend", "vllm"),
+                lm_temperature=p.float("lm_temperature", LM_DEFAULT_TEMPERATURE),
+                lm_cfg_scale=p.float("lm_cfg_scale", LM_DEFAULT_CFG_SCALE),
+                lm_top_k=p.int("lm_top_k"),
+                lm_top_p=p.float("lm_top_p", LM_DEFAULT_TOP_P),
+                lm_repetition_penalty=p.float("lm_repetition_penalty", 1.0),
+                lm_negative_prompt=p.str("lm_negative_prompt", "NO USER INPUT"),
+                constrained_decoding=p.bool("constrained_decoding", True),
+                constrained_decoding_debug=p.bool("constrained_decoding_debug"),
+                use_cot_caption=p.bool("use_cot_caption", True),
+                use_cot_language=p.bool("use_cot_language", True),
+                is_format_caption=p.bool("is_format_caption"),
+                allow_lm_batch=p.bool("allow_lm_batch", True),
+                track_name=p.str("track_name"),
+                track_classes=t_classes,
+                **kwargs,
+            )
+
+        if content_type.startswith("application/json"):
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="JSON payload must be an object")
+            verify_token_from_request(body, authorization)
+            
+            # Explicitly validate manual string paths from JSON input
+            p = RequestParser(body)
+            req = _build_request(
+                p,
+                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+            )
+
+        elif content_type.endswith("+json"):
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="JSON payload must be an object")
+            verify_token_from_request(body, authorization)
+            
+            p = RequestParser(body)
+            req = _build_request(
+                p,
+                reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+            )
+
+        elif content_type.startswith("multipart/form-data"):
+            form = await request.form()
+            
+            # Parse form data correctly to support lists ---
+            form_dict = {}
+            for k in form.keys():
+                vals = [v for v in form.getlist(k) if not hasattr(v, 'read')]
+                if len(vals) == 1:
+                    form_dict[k] = vals[0]
+                elif len(vals) > 1:
+                    form_dict[k] = vals
+
+            verify_token_from_request(form_dict, authorization)
+
+            # Support both naming conventions: ref_audio/reference_audio, ctx_audio/src_audio
+            ref_up = form.get("ref_audio") or form.get("reference_audio")
+            ctx_up = form.get("ctx_audio") or form.get("src_audio")
+
+            reference_audio_path = None
+            src_audio_path = None
+
+            if isinstance(ref_up, StarletteUploadFile):
+                reference_audio_path = await _save_upload_to_temp(ref_up, prefix="ref_audio")
+                temp_files.append(reference_audio_path)
+            else:
+                reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
+
+            if isinstance(ctx_up, StarletteUploadFile):
+                src_audio_path = await _save_upload_to_temp(ctx_up, prefix="ctx_audio")
+                temp_files.append(src_audio_path)
+            else:
+                src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
+
+            req = _build_request(
+                RequestParser(dict(form_dict)),
+                reference_audio_path=reference_audio_path,
+                src_audio_path=src_audio_path,
+            )
+
+        elif content_type.startswith("application/x-www-form-urlencoded"):
+            form = await request.form()
+            form_dict = dict(form)
+            verify_token_from_request(form_dict, authorization)
+            reference_audio_path = _validate_audio_path(str(form.get("ref_audio_path") or form.get("reference_audio_path") or "").strip() or None)
+            src_audio_path = _validate_audio_path(str(form.get("ctx_audio_path") or form.get("src_audio_path") or "").strip() or None)
+            req = _build_request(
+                RequestParser(form_dict),
+                reference_audio_path=reference_audio_path,
+                src_audio_path=src_audio_path,
+            )
+
+        else:
+            raw = await request.body()
+            raw_stripped = raw.lstrip()
+            # Best-effort: accept missing/incorrect Content-Type if payload is valid JSON.
+            if raw_stripped.startswith(b"{") or raw_stripped.startswith(b"["):
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                    if isinstance(body, dict):
+                        verify_token_from_request(body, authorization)
+                        p = RequestParser(body)
+                        req = _build_request(
+                            p,
+                            reference_audio_path=_validate_audio_path(p.str("reference_audio_path") or None),
+                            src_audio_path=_validate_audio_path(p.str("src_audio_path") or None)
+                        )
+                    else:
+                        raise HTTPException(status_code=400, detail="JSON payload must be an object")
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid JSON body (hint: set 'Content-Type: application/json')",
+                    )
+            # Best-effort: parse key=value bodies even if Content-Type is missing.
+            elif raw_stripped and b"=" in raw:
+                parsed = urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+                flat = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
+                verify_token_from_request(flat, authorization)
+                reference_audio_path = _validate_audio_path(str(flat.get("ref_audio_path") or flat.get("reference_audio_path") or "").strip() or None)
+                src_audio_path = _validate_audio_path(str(flat.get("ctx_audio_path") or flat.get("src_audio_path") or "").strip() or None)
+                req = _build_request(
+                    RequestParser(flat),
+                    reference_audio_path=reference_audio_path,
+                    src_audio_path=src_audio_path,
+                )
+            else:
+                raise HTTPException(
+                    status_code=415,
+                    detail=(
+                        f"Unsupported Content-Type: {content_type or '(missing)'}; "
+                        "use application/json, application/x-www-form-urlencoded, or multipart/form-data"
+                    ),
+                )
+
+        rec = store.create()
+
+        q: asyncio.Queue = app.state.job_queue
+        if q.full():
+            for p in temp_files:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=429, detail="Server busy: queue is full")
+
+        if temp_files:
+            async with app.state.job_temp_files_lock:
+                app.state.job_temp_files[rec.job_id] = temp_files
+
+        async with app.state.pending_lock:
+            app.state.pending_ids.append(rec.job_id)
+            position = len(app.state.pending_ids)
+
+        await q.put((rec.job_id, req))
+        return _wrap_response({"task_id": rec.job_id, "status": "queued", "queue_position": position})
+
+    @app.post("/query_result")
+    async def query_result(request: Request, authorization: Optional[str] = Header(None)):
+        """Batch query job results"""
         content_type = (request.headers.get("content-type") or "").lower()
 
         if "json" in content_type:

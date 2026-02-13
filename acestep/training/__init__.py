@@ -6,13 +6,19 @@ including dataset building, audio labeling, and training utilities.
 """
 
 from acestep.training.dataset_builder import DatasetBuilder, AudioSample
-from acestep.training.configs import LoRAConfig, TrainingConfig
+from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
 from acestep.training.lora_utils import (
     inject_lora_into_dit,
     save_lora_weights,
     load_lora_weights,
     merge_lora_weights,
     check_peft_available,
+)
+from acestep.training.lokr_utils import (
+    inject_lokr_into_dit,
+    save_lokr_weights,
+    load_lokr_weights,
+    check_lycoris_available,
 )
 from acestep.training.data_module import (
     # Preprocessed (recommended)
@@ -25,7 +31,13 @@ from acestep.training.data_module import (
     collate_training_batch,
     load_dataset_from_json,
 )
-from acestep.training.trainer import LoRATrainer, PreprocessedLoRAModule, LIGHTNING_AVAILABLE
+from acestep.training.trainer import (
+    LoRATrainer,
+    LoKRTrainer,
+    PreprocessedLoRAModule,
+    PreprocessedLoKRModule,
+    LIGHTNING_AVAILABLE,
+)
 
 def check_lightning_available():
     """Check if Lightning Fabric is available."""
@@ -37,6 +49,7 @@ __all__ = [
     "AudioSample",
     # Configs
     "LoRAConfig",
+    "LoKRConfig",
     "TrainingConfig",
     # LoRA Utils
     "inject_lora_into_dit",
@@ -44,6 +57,11 @@ __all__ = [
     "load_lora_weights",
     "merge_lora_weights",
     "check_peft_available",
+    # LoKr Utils
+    "inject_lokr_into_dit",
+    "save_lokr_weights",
+    "load_lokr_weights",
+    "check_lycoris_available",
     # Data Module (Preprocessed - Recommended)
     "PreprocessedTensorDataset",
     "PreprocessedDataModule",
@@ -55,7 +73,9 @@ __all__ = [
     "load_dataset_from_json",
     # Trainer
     "LoRATrainer",
+    "LoKRTrainer",
     "PreprocessedLoRAModule",
+    "PreprocessedLoKRModule",
     "check_lightning_available",
     "LIGHTNING_AVAILABLE",
 ]

@@ -27,6 +27,14 @@ except ImportError:
     LIGHTNING_AVAILABLE = False
     logger.warning("Lightning Fabric not installed. Training will use basic training loop.")
 
+# OPTIMIZATION: Use 8-bit Adam to save some VRAM
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    logger.warning("bitsandbytes not installed. Using standard AdamW.")
+
 from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
 from acestep.training.lora_utils import (
     inject_lora_into_dit,
@@ -141,6 +149,102 @@ def _ensure_optimizer_params_fp32(optimizer: torch.optim.Optimizer) -> Tuple[int
                     p.data = p.data.float()
                 casted += 1
     return casted, total
+
+
+def _build_param_name_lookup(module: nn.Module, extra_module: Optional[nn.Module] = None) -> Dict[int, str]:
+    """Build a best-effort id(param) -> name lookup for debug logging."""
+    lookup: Dict[int, str] = {}
+    for name, p in module.named_parameters():
+        lookup[id(p)] = name
+    if extra_module is not None:
+        for name, p in extra_module.named_parameters():
+            lookup.setdefault(id(p), f"lycoris_net.{name}")
+    return lookup
+
+
+def _count_nonfinite_grads_detailed(
+    params: List[torch.nn.Parameter],
+    param_name_lookup: Dict[int, str],
+    detail_limit: int = 8,
+) -> Tuple[int, int, List[str]]:
+    """Count non-finite grads and return up to `detail_limit` offending tensor details."""
+    nonfinite = 0
+    total_with_grad = 0
+    details: List[str] = []
+
+    for p in params:
+        g = p.grad
+        if g is None:
+            continue
+        total_with_grad += 1
+        if torch.isfinite(g).all():
+            continue
+
+        nonfinite += 1
+        if len(details) >= detail_limit:
+            continue
+
+        pname = param_name_lookup.get(id(p), f"<unnamed:{id(p)}>")
+        g32 = g.detach().float()
+        nan_count = int(torch.isnan(g32).sum().item())
+        inf_count = int(torch.isinf(g32).sum().item())
+        finite_vals = g32[torch.isfinite(g32)]
+        max_abs_finite = float(finite_vals.abs().max().item()) if finite_vals.numel() else float("nan")
+
+        p32 = p.detach().float()
+        param_nonfinite = int((~torch.isfinite(p32)).sum().item())
+        details.append(
+            f"{pname} | shape={tuple(p.shape)} grad_dtype={g.dtype} "
+            f"nan={nan_count} inf={inf_count} max_abs_finite={max_abs_finite:.3e} "
+            f"param_nonfinite={param_nonfinite}"
+        )
+
+    return nonfinite, total_with_grad, details
+
+
+def _collect_lokr_trainable_params(module: nn.Module, lycoris_net: Optional[nn.Module]) -> List[torch.nn.Parameter]:
+    """
+    Collect LoKr trainable params robustly.
+
+    Primary path is model parameter traversal. If that returns empty due to
+    wrapper/registration quirks, fall back to LyCORIS module parameters.
+    """
+    params = [p for p in module.parameters() if p.requires_grad]
+    if params:
+        return list({id(p): p for p in params}.values())
+
+    fallback: List[torch.nn.Parameter] = []
+    if lycoris_net is None:
+        return fallback
+
+    for m in getattr(lycoris_net, "loras", []) or []:
+        for p in m.parameters():
+            if p.requires_grad:
+                fallback.append(p)
+    if not fallback:
+        for p in lycoris_net.parameters():
+            if p.requires_grad:
+                fallback.append(p)
+    return list({id(p): p for p in fallback}.values())
+
+
+def _unwrap_stale_fabric_decoder(model: nn.Module) -> bool:
+    """
+    Unwrap stale Lightning Fabric wrappers from decoder left by previous runs.
+
+    Returns:
+        True if decoder was unwrapped, else False.
+    """
+    if model is None or not hasattr(model, "decoder"):
+        return False
+    decoder = model.decoder
+    unwrapped = False
+    while hasattr(decoder, "_forward_module") and isinstance(getattr(decoder, "_forward_module"), nn.Module):
+        decoder = decoder._forward_module
+        unwrapped = True
+    if unwrapped:
+        model.decoder = decoder
+    return unwrapped
 
 
 def _iter_module_wrappers(module: nn.Module) -> List[nn.Module]:
@@ -481,90 +585,6 @@ class PreprocessedLoRAModule(nn.Module):
         return diffusion_loss
 
 
-class PreprocessedLoKRModule(nn.Module):
-    def __init__(
-        self,
-        model: nn.Module,
-        lokr_config: LoKRConfig,
-        training_config: TrainingConfig,
-        device: torch.device,
-        dtype: torch.dtype,
-    ):
-        super().__init__()
-
-        self.lokr_config = lokr_config
-        self.training_config = training_config
-        self.device = torch.device(device) if not isinstance(device, torch.device) else device
-        self.dtype = dtype
-        self.timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=self.device, dtype=self.dtype)
-        self.lycoris_net = None
-        self.lokr_info = {}
-
-        self.force_input_grads_for_checkpointing = False
-
-        if check_lycoris_available():
-            self.model, self.lycoris_net, self.lokr_info = inject_lokr_into_dit(model, lokr_config)
-            self.model.decoder = self.model.decoder.to(self.device).to(self.dtype)
-            logger.info(f"LoKR injected: {self.lokr_info.get('trainable_params', 0):,} trainable params")
-        else:
-            self.model = model
-            self.lokr_info = {}
-            logger.warning("LyCORIS not available, cannot train LoKR adapters")
-
-        if self.training_config.gradient_checkpointing:
-            if _maybe_enable_gradient_checkpointing(self.model.decoder):
-                logger.info("Gradient checkpointing enabled for decoder")
-            else:
-                logger.warning("Gradient checkpointing requested but could not be enabled for decoder")
-
-        self.config = model.config
-        self.training_losses = []
-
-    def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        _device_type = self.device.type
-        _autocast_dtype = torch.float16 if _device_type == "mps" else torch.bfloat16
-
-        with torch.autocast(device_type=_device_type, dtype=_autocast_dtype):
-            def _to_dev(x: torch.Tensor) -> torch.Tensor:
-                if x.device == self.device:
-                    return x
-                if x.device.type == self.device.type and (self.device.index is None or x.device.index == self.device.index):
-                    return x
-                return x.to(self.device, non_blocking=True)
-
-            target_latents = _to_dev(batch["target_latents"])
-            attention_mask = _to_dev(batch["attention_mask"])
-            encoder_hidden_states = _to_dev(batch["encoder_hidden_states"])
-            encoder_attention_mask = _to_dev(batch["encoder_attention_mask"])
-            context_latents = _to_dev(batch["context_latents"])
-
-            bsz = target_latents.shape[0]
-            x1 = torch.randn_like(target_latents)
-            x0 = target_latents
-
-            t, r = sample_discrete_timestep(bsz, self.timesteps_tensor)
-            t_ = t.unsqueeze(-1).unsqueeze(-1)
-            xt = t_ * x1 + (1.0 - t_) * x0
-            if self.force_input_grads_for_checkpointing:
-                xt = xt.requires_grad_(True)
-
-            decoder_outputs = self.model.decoder(
-                hidden_states=xt,
-                timestep=t,
-                timestep_r=t,
-                attention_mask=attention_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                context_latents=context_latents,
-            )
-
-            x1.sub_(x0)
-            diffusion_loss = F.mse_loss(decoder_outputs[0], x1)
-
-        diffusion_loss = diffusion_loss.float()
-        return diffusion_loss
-
-
 class LoRATrainer:
     """High-level trainer for ACE-Step LoRA fine-tuning.
 
@@ -786,10 +806,14 @@ class LoRATrainer:
             "lr": self.training_config.learning_rate,
             "weight_decay": self.training_config.weight_decay,
         }
-        if self.module.device.type == "cuda":
-            optimizer_kwargs["fused"] = True
-        optimizer = AdamW(trainable_params, **optimizer_kwargs)
-
+        # Optimizer selection: AdamW 8-bit vs Standard AdamW
+        if HAS_BNB and device_type == "cuda":
+            logger.info("train_with_fabric using bitsandbytes 8-bit AdamW optimizer")
+            optimizer = bnb.optim.AdamW8bit(trainable_params, **optimizer_kwargs)
+        else:
+            if self.module.device.type == "cuda":
+                optimizer_kwargs["fused"] = True
+            optimizer = AdamW(trainable_params, **optimizer_kwargs)
         # Calculate total steps
         steps_per_epoch = max(1, math.ceil(len(train_loader) / self.training_config.gradient_accumulation_steps))
         total_steps = steps_per_epoch * self.training_config.max_epochs
@@ -1098,13 +1122,21 @@ class LoRATrainer:
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
-
-        optimizer = AdamW(
-            trainable_params,
-            lr=self.training_config.learning_rate,
-            weight_decay=self.training_config.weight_decay,
-        )
-
+        
+        if HAS_BNB and self.module.device_type == "cuda":
+            optimizer = bnb.optim.AdamW8bit(
+                trainable_params,
+                lr=self.training_config.learning_rate,
+                weight_decay=self.training_config.weight_decay,
+            )
+            logger.info("train_basic using bitsandbytes 8-bit AdamW optimizer")
+        else:
+            optimizer = AdamW(
+                trainable_params,
+                lr=self.training_config.learning_rate,
+                weight_decay=self.training_config.weight_decay,
+            )
+        
         steps_per_epoch = max(1, math.ceil(len(train_loader) / self.training_config.gradient_accumulation_steps))
         total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
@@ -1191,7 +1223,95 @@ class LoRATrainer:
         self.is_training = False
 
 
+class PreprocessedLoKRModule(nn.Module):
+    """LoKr training module using preprocessed tensors."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lokr_config: LoKRConfig,
+        training_config: TrainingConfig,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        super().__init__()
+
+        self.lokr_config = lokr_config
+        self.training_config = training_config
+        self.device = torch.device(device) if isinstance(device, str) else device
+        self.device_type = _normalize_device_type(self.device)
+        self.dtype = _select_compute_dtype(self.device_type)
+        self.transfer_non_blocking = self.device_type in ("cuda", "xpu")
+        self.timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=self.device, dtype=self.dtype)
+        self.force_input_grads_for_checkpointing = False
+        self.lycoris_net = None
+
+        if check_lycoris_available():
+            self.model, self.lycoris_net, self.lokr_info = inject_lokr_into_dit(model, lokr_config)
+            logger.info(f"LoKr injected: {self.lokr_info['trainable_params']:,} trainable params")
+        else:
+            self.model = model
+            self.lokr_info = {}
+            logger.warning("LyCORIS not available, training without LoKr adapters")
+
+        self.config = model.config
+        self.training_losses = []
+
+    def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Single LoKr training step."""
+        if self.device_type in ("cuda", "xpu", "mps"):
+            autocast_ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+        else:
+            autocast_ctx = nullcontext()
+
+        with autocast_ctx:
+            target_latents = batch["target_latents"].to(
+                self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
+            )
+            attention_mask = batch["attention_mask"].to(
+                self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
+            )
+            encoder_hidden_states = batch["encoder_hidden_states"].to(
+                self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
+            )
+            encoder_attention_mask = batch["encoder_attention_mask"].to(
+                self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
+            )
+            context_latents = batch["context_latents"].to(
+                self.device, dtype=self.dtype, non_blocking=self.transfer_non_blocking
+            )
+
+            bsz = target_latents.shape[0]
+            x1 = torch.randn_like(target_latents)
+            x0 = target_latents
+
+            t, _ = sample_discrete_timestep(bsz, self.timesteps_tensor)
+            t_ = t.unsqueeze(-1).unsqueeze(-1)
+            xt = t_ * x1 + (1.0 - t_) * x0
+            if self.force_input_grads_for_checkpointing:
+                xt = xt.requires_grad_(True)
+
+            decoder_outputs = self.model.decoder(
+                hidden_states=xt,
+                timestep=t,
+                timestep_r=t,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                context_latents=context_latents,
+            )
+
+            flow = x1 - x0
+            diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
+
+        diffusion_loss = diffusion_loss.float()
+        self.training_losses.append(diffusion_loss.item())
+        return diffusion_loss
+
+
 class LoKRTrainer:
+    """High-level trainer for ACE-Step LoKr fine-tuning."""
+
     def __init__(
         self,
         dit_handler,
@@ -1201,26 +1321,49 @@ class LoKRTrainer:
         self.dit_handler = dit_handler
         self.lokr_config = lokr_config
         self.training_config = training_config
+
         self.module = None
         self.fabric = None
         self.is_training = False
+        self.run_metadata: Dict[str, Any] = {}
 
     def train_from_preprocessed(
         self,
         tensor_dir: str,
         training_state: Optional[Dict] = None,
-        resume_from: Optional[str] = None,
     ) -> Generator[Tuple[int, float, str], None, None]:
+        """Train LoKr adapters from preprocessed tensors."""
         self.is_training = True
-
         try:
+            if _unwrap_stale_fabric_decoder(self.dit_handler.model):
+                logger.info("Unwrapped stale Fabric decoder wrapper before LoKr training")
+
+            quantization_mode = getattr(self.dit_handler, "quantization", None)
+            if quantization_mode is not None:
+                yield 0, 0.0, (
+                    "❌ LoKr training requires a non-quantized DiT model. "
+                    f"Current quantization: {quantization_mode}. "
+                    "Re-initialize service with INT8 Quantization disabled, then retry training."
+                )
+                return
+
             if not os.path.exists(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
 
             if not check_lycoris_available():
-                yield 0, 0.0, "❌ LyCORIS not installed. Install lycoris-lora to train LoKR."
+                yield 0, 0.0, "❌ LyCORIS not installed. Install lycoris-lora to train LoKr."
                 return
+
+            torch.manual_seed(self.training_config.seed)
+            random.seed(self.training_config.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.training_config.seed)
+            try:
+                import numpy as np
+                np.random.seed(self.training_config.seed)
+            except Exception:
+                pass
 
             self.module = PreprocessedLoKRModule(
                 model=self.dit_handler.model,
@@ -1244,6 +1387,10 @@ class LoKRTrainer:
                 batch_size=self.training_config.batch_size,
                 num_workers=self.training_config.num_workers,
                 pin_memory=self.training_config.pin_memory,
+                prefetch_factor=self.training_config.prefetch_factor,
+                persistent_workers=self.training_config.persistent_workers,
+                pin_memory_device=self.training_config.pin_memory_device,
+                val_split=self.training_config.val_split,
             )
             data_module.setup('fit')
 
@@ -1251,7 +1398,19 @@ class LoKRTrainer:
                 yield 0, 0.0, "❌ No valid samples found in tensor directory"
                 return
 
+            self.run_metadata = {
+                "tensor_dir": tensor_dir,
+                "num_samples": int(len(data_module.train_dataset)),
+                "training_config": self.training_config.to_dict(),
+            }
+
             yield 0, 0.0, f"📂 Loaded {len(data_module.train_dataset)} preprocessed samples"
+            if ckpt_enabled:
+                yield 0, 0.0, "🧠 Gradient checkpointing enabled for decoder"
+            else:
+                yield 0, 0.0, "⚠️ Gradient checkpointing not enabled (model wrapper did not expose it)"
+            if not input_grads_enabled:
+                yield 0, 0.0, "ℹ️ Input-grad hook not available on this DiT; using explicit checkpointing fallback"
 
             if LIGHTNING_AVAILABLE:
                 yield from self._train_with_fabric(data_module, training_state)
@@ -1259,9 +1418,13 @@ class LoKRTrainer:
                 yield from self._train_basic(data_module, training_state)
 
         except Exception as e:
-            logger.exception("LoKR training failed")
+            logger.exception("LoKr training failed")
             yield 0, 0.0, f"❌ Training failed: {str(e)}"
         finally:
+            if self.module is not None and hasattr(self.module, "model"):
+                _unwrap_stale_fabric_decoder(self.module.model)
+            if getattr(self, "dit_handler", None) is not None and getattr(self.dit_handler, "model", None) is not None:
+                _unwrap_stale_fabric_decoder(self.dit_handler.model)
             self.is_training = False
 
     def _train_with_fabric(
@@ -1270,42 +1433,81 @@ class LoKRTrainer:
         training_state: Optional[Dict],
     ) -> Generator[Tuple[int, float, str], None, None]:
         os.makedirs(self.training_config.output_dir, exist_ok=True)
+        device_type = self.module.device_type
+        precision = _select_fabric_precision(device_type)
+        accelerator = device_type if device_type in ("cuda", "xpu", "mps", "cpu") else "auto"
+        manual_nonfinite_check = not precision.endswith("-mixed")
 
-        precision = "bf16-mixed"
-        tb_logger = TensorBoardLogger(
-            root_dir=self.training_config.output_dir,
-            name="logs",
-        )
+        tb_logger = None
+        try:
+            tb_logger = TensorBoardLogger(
+                root_dir=self.training_config.output_dir,
+                name="logs",
+            )
+        except ModuleNotFoundError as exc:
+            logger.warning(f"TensorBoard logger unavailable, continuing without logger: {exc}")
 
-        self.fabric = Fabric(
-            accelerator="auto",
-            devices=1,
-            precision=precision,
-            loggers=[tb_logger],
-        )
+        fabric_kwargs = {
+            "accelerator": accelerator,
+            "devices": 1,
+            "precision": precision,
+        }
+        if tb_logger is not None:
+            fabric_kwargs["loggers"] = [tb_logger]
+        self.fabric = Fabric(**fabric_kwargs)
         self.fabric.launch()
 
-        yield 0, 0.0, f"🚀 Starting training (precision: {precision})..."
+        yield 0, 0.0, f"🚀 Starting training (device: {device_type}, precision: {precision})..."
+        if not manual_nonfinite_check:
+            logger.info(
+                "LoKr mixed precision detected: disabling pre-unscale non-finite grad checks; "
+                "relying on AMP/GradScaler handling."
+            )
+
+        if device_type == "mps" or precision.endswith("-mixed"):
+            self.module.model.decoder = self.module.model.decoder.to(dtype=torch.float32)
+        else:
+            self.module.model.decoder = self.module.model.decoder.to(dtype=self.module.dtype)
+        casted_trainable, total_trainable_tensors = _ensure_trainable_params_fp32(self.module.model.decoder)
+        if total_trainable_tensors == 0 and getattr(self.module, "lycoris_net", None) is not None:
+            casted_fallback, total_fallback = _ensure_trainable_params_fp32(self.module.lycoris_net)
+            casted_trainable += casted_fallback
+            total_trainable_tensors += total_fallback
+        logger.info(
+            f"Trainable tensor dtype fixup: casted {casted_trainable}/{total_trainable_tensors} to fp32"
+        )
 
         train_loader = data_module.train_dataloader()
+        trainable_params = _collect_lokr_trainable_params(
+            self.module.model,
+            getattr(self.module, "lycoris_net", None),
+        )
+        param_name_lookup = _build_param_name_lookup(
+            self.module.model,
+            getattr(self.module, "lycoris_net", None),
+        )
 
-        # Prefer decoder params (after injection, LyCORIS net is registered on decoder)
-        trainable_params = [p for p in self.module.model.decoder.parameters() if p.requires_grad]
-        if not trainable_params and getattr(self.module, "lycoris_net", None) is not None:
-            trainable_params = [p for p in self.module.lycoris_net.parameters() if p.requires_grad]
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
+        if total_trainable_tensors == 0:
+            logger.warning(
+                "LoKr trainable params discovered via LyCORIS fallback traversal; "
+                "decoder parameter traversal returned 0 trainables."
+            )
 
         yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
 
-        optimizer = AdamW(
-            trainable_params,
-            lr=self.training_config.learning_rate,
-            weight_decay=self.training_config.weight_decay,
-        )
+        optimizer_kwargs = {
+            "lr": self.training_config.learning_rate,
+            "weight_decay": self.training_config.weight_decay,
+        }
+        if self.module.device.type == "cuda":
+            optimizer_kwargs["fused"] = True
+        optimizer = AdamW(trainable_params, **optimizer_kwargs)
 
-        total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
+        steps_per_epoch = max(1, math.ceil(len(train_loader) / self.training_config.gradient_accumulation_steps))
+        total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
 
         warmup_scheduler = LinearLR(
@@ -1326,9 +1528,11 @@ class LoKRTrainer:
             milestones=[warmup_steps],
         )
 
-        self.module.model = self.module.model.to(torch.bfloat16)
-
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
+        casted_opt_params, total_opt_params = _ensure_optimizer_params_fp32(optimizer)
+        logger.info(
+            f"Optimizer param dtype fixup: casted {casted_opt_params}/{total_opt_params} to fp32"
+        )
         try:
             train_loader = self.fabric.setup_dataloaders(train_loader, move_to_device=False)
         except TypeError:
@@ -1337,65 +1541,137 @@ class LoKRTrainer:
         accumulation_step = 0
         accumulated_loss = 0.0
         global_step = 0
-
+        optimizer.zero_grad(set_to_none=True)
         self.module.model.decoder.train()
 
         for epoch in range(self.training_config.max_epochs):
             epoch_loss = 0.0
-            num_batches = 0
+            num_updates = 0
             epoch_start_time = time.time()
 
             for _, batch in enumerate(train_loader):
                 if training_state and training_state.get("should_stop", False):
-                    _stop_loss = accumulated_loss.item() / max(accumulation_step, 1) if isinstance(accumulated_loss, torch.Tensor) else accumulated_loss / max(accumulation_step, 1)
-                    yield global_step, _stop_loss, "Training stopped by user"
+                    yield global_step, accumulated_loss / max(accumulation_step, 1), "Training stopped by user"
                     return
 
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
 
                 self.fabric.backward(loss)
-                loss_detached = loss.detach()
-                if isinstance(accumulated_loss, torch.Tensor):
-                    accumulated_loss.add_(loss_detached)
-                else:
-                    accumulated_loss = loss_detached
+                accumulated_loss += loss.item()
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
+                    if manual_nonfinite_check:
+                        nonfinite_grads, grad_tensors, nonfinite_details = _count_nonfinite_grads_detailed(
+                            trainable_params,
+                            param_name_lookup,
+                            detail_limit=10,
+                        )
+                        if nonfinite_grads > 0:
+                            if nonfinite_details:
+                                logger.warning(
+                                    f"LoKr non-finite gradients ({nonfinite_grads}/{grad_tensors}) at epoch "
+                                    f"{epoch+1}, step {global_step}. Top offending tensors:\n"
+                                    + "\n".join(f"  - {d}" for d in nonfinite_details)
+                                )
+                            optimizer.zero_grad(set_to_none=True)
+                            yield global_step, float("nan"), (
+                                f"⚠️ Non-finite gradients ({nonfinite_grads}/{grad_tensors}); "
+                                "skipping optimizer step (see logs for tensor names)"
+                            )
+                            accumulated_loss = 0.0
+                            accumulation_step = 0
+                            continue
                     self.fabric.clip_gradients(
                         self.module.model.decoder,
                         optimizer,
                         max_norm=self.training_config.max_grad_norm,
+                        error_if_nonfinite=False,
                     )
 
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-
                     global_step += 1
 
-                    avg_loss = accumulated_loss.item() / accumulation_step
+                    avg_loss = accumulated_loss / accumulation_step
                     self.module.training_losses.append(float(avg_loss))
-                    self.fabric.log("train/loss", avg_loss, step=global_step)
-                    self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
-
                     if global_step % self.training_config.log_every_n_steps == 0:
-                        yield global_step, avg_loss, f"Epoch {epoch+1}/{self.training_config.max_epochs}, Step {global_step}, Loss: {avg_loss:.4f}"
+                        self.fabric.log("train/loss", avg_loss, step=global_step)
+                        self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
+                        yield global_step, avg_loss, (
+                            f"Epoch {epoch+1}/{self.training_config.max_epochs}, "
+                            f"Step {global_step}, Loss: {avg_loss:.4f}"
+                        )
 
-                    epoch_loss += avg_loss * accumulation_step
-                    num_batches += 1
+                    epoch_loss += avg_loss
+                    num_updates += 1
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
-            epoch_time = time.time() - epoch_start_time
-            avg_epoch_loss = epoch_loss / max(num_batches, 1)
+            if accumulation_step > 0:
+                if manual_nonfinite_check:
+                    nonfinite_grads, grad_tensors, nonfinite_details = _count_nonfinite_grads_detailed(
+                        trainable_params,
+                        param_name_lookup,
+                        detail_limit=10,
+                    )
+                    if nonfinite_grads > 0:
+                        if nonfinite_details:
+                            logger.warning(
+                                f"LoKr non-finite remainder gradients ({nonfinite_grads}/{grad_tensors}) at epoch "
+                                f"{epoch+1}, step {global_step}. Top offending tensors:\n"
+                                + "\n".join(f"  - {d}" for d in nonfinite_details)
+                            )
+                        optimizer.zero_grad(set_to_none=True)
+                        yield global_step, float("nan"), (
+                            f"⚠️ Non-finite gradients ({nonfinite_grads}/{grad_tensors}); "
+                            "skipping optimizer remainder step (see logs for tensor names)"
+                        )
+                        accumulated_loss = 0.0
+                        accumulation_step = 0
+                        continue
 
+                self.fabric.clip_gradients(
+                    self.module.model.decoder,
+                    optimizer,
+                    max_norm=self.training_config.max_grad_norm,
+                    error_if_nonfinite=False,
+                )
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                avg_loss = accumulated_loss / accumulation_step
+                if global_step % self.training_config.log_every_n_steps == 0:
+                    self.fabric.log("train/loss", avg_loss, step=global_step)
+                    self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
+                    yield global_step, avg_loss, (
+                        f"Epoch {epoch+1}/{self.training_config.max_epochs}, "
+                        f"Step {global_step}, Loss: {avg_loss:.4f}"
+                    )
+
+                epoch_loss += avg_loss
+                num_updates += 1
+                accumulated_loss = 0.0
+                accumulation_step = 0
+
+            epoch_time = time.time() - epoch_start_time
+            avg_epoch_loss = epoch_loss / max(num_updates, 1)
             self.fabric.log("train/epoch_loss", avg_epoch_loss, step=epoch + 1)
-            yield global_step, avg_epoch_loss, f"Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s, Loss: {avg_epoch_loss:.4f}"
+            yield global_step, avg_epoch_loss, (
+                f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} "
+                f"in {epoch_time:.1f}s, Loss: {avg_epoch_loss:.4f}"
+            )
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
-                checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
+                checkpoint_dir = os.path.join(
+                    self.training_config.output_dir,
+                    "checkpoints",
+                    f"epoch_{epoch+1}",
+                )
                 save_lokr_training_checkpoint(
                     self.module.lycoris_net,
                     optimizer,
@@ -1404,17 +1680,23 @@ class LoKRTrainer:
                     global_step,
                     checkpoint_dir,
                     lokr_config=self.lokr_config,
+                    run_metadata=self.run_metadata,
                 )
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
 
         final_path = os.path.join(self.training_config.output_dir, "final")
+        final_metadata: Dict[str, Any] = {
+            "lokr_config": self.lokr_config.to_dict() if self.lokr_config else None,
+        }
+        if self.run_metadata:
+            final_metadata["run_metadata"] = self.run_metadata
         save_lokr_weights(
             self.module.lycoris_net,
             final_path,
-            metadata={"lokr_config": self.lokr_config.to_dict() if self.lokr_config else None},
+            metadata=final_metadata,
         )
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
-        yield global_step, final_loss, f"✅ Training complete! LoKR saved to {final_path}"
+        yield global_step, final_loss, f"✅ Training complete! LoKr saved to {final_path}"
 
     def _train_basic(
         self,
@@ -1422,13 +1704,13 @@ class LoKRTrainer:
         training_state: Optional[Dict],
     ) -> Generator[Tuple[int, float, str], None, None]:
         yield 0, 0.0, "🚀 Starting basic training loop..."
-
         os.makedirs(self.training_config.output_dir, exist_ok=True)
-        train_loader = data_module.train_dataloader()
 
-        trainable_params = [p for p in self.module.model.decoder.parameters() if p.requires_grad]
-        if not trainable_params and getattr(self.module, "lycoris_net", None) is not None:
-            trainable_params = [p for p in self.module.lycoris_net.parameters() if p.requires_grad]
+        train_loader = data_module.train_dataloader()
+        trainable_params = _collect_lokr_trainable_params(
+            self.module.model,
+            getattr(self.module, "lycoris_net", None),
+        )
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
@@ -1438,8 +1720,8 @@ class LoKRTrainer:
             lr=self.training_config.learning_rate,
             weight_decay=self.training_config.weight_decay,
         )
-
-        total_steps = len(train_loader) * self.training_config.max_epochs // self.training_config.gradient_accumulation_steps
+        steps_per_epoch = max(1, math.ceil(len(train_loader) / self.training_config.gradient_accumulation_steps))
+        total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
 
         warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
@@ -1454,28 +1736,23 @@ class LoKRTrainer:
         global_step = 0
         accumulation_step = 0
         accumulated_loss = 0.0
-
+        optimizer.zero_grad(set_to_none=True)
         self.module.model.decoder.train()
 
         for epoch in range(self.training_config.max_epochs):
             epoch_loss = 0.0
-            num_batches = 0
+            num_updates = 0
             epoch_start_time = time.time()
 
             for batch in train_loader:
                 if training_state and training_state.get("should_stop", False):
-                    _stop_loss = accumulated_loss.item() / max(accumulation_step, 1) if isinstance(accumulated_loss, torch.Tensor) else accumulated_loss / max(accumulation_step, 1)
-                    yield global_step, _stop_loss, "Training stopped"
+                    yield global_step, accumulated_loss / max(accumulation_step, 1), "⏹️ Training stopped"
                     return
 
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
-                loss_detached = loss.detach()
-                if isinstance(accumulated_loss, torch.Tensor):
-                    accumulated_loss.add_(loss_detached)
-                else:
-                    accumulated_loss = loss_detached
+                accumulated_loss += loss.item()
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
@@ -1485,19 +1762,35 @@ class LoKRTrainer:
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-                    avg_loss = accumulated_loss.item() / accumulation_step
+                    avg_loss = accumulated_loss / accumulation_step
                     self.module.training_losses.append(float(avg_loss))
                     if global_step % self.training_config.log_every_n_steps == 0:
                         yield global_step, avg_loss, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss:.4f}"
 
-                    epoch_loss += avg_loss * accumulation_step
-                    num_batches += 1
+                    epoch_loss += avg_loss
+                    num_updates += 1
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
+            if accumulation_step > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, self.training_config.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                avg_loss = accumulated_loss / accumulation_step
+                if global_step % self.training_config.log_every_n_steps == 0:
+                    yield global_step, avg_loss, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss:.4f}"
+
+                epoch_loss += avg_loss
+                num_updates += 1
+                accumulated_loss = 0.0
+                accumulation_step = 0
+
             epoch_time = time.time() - epoch_start_time
-            avg_epoch_loss = epoch_loss / max(num_batches, 1)
-            yield global_step, avg_epoch_loss, f"Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s"
+            avg_epoch_loss = epoch_loss / max(num_updates, 1)
+            yield global_step, avg_epoch_loss, f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s"
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
@@ -1509,17 +1802,24 @@ class LoKRTrainer:
                     global_step,
                     checkpoint_dir,
                     lokr_config=self.lokr_config,
+                    run_metadata=self.run_metadata,
                 )
                 yield global_step, avg_epoch_loss, "💾 Checkpoint saved"
 
         final_path = os.path.join(self.training_config.output_dir, "final")
+        final_metadata: Dict[str, Any] = {
+            "lokr_config": self.lokr_config.to_dict() if self.lokr_config else None,
+        }
+        if self.run_metadata:
+            final_metadata["run_metadata"] = self.run_metadata
         save_lokr_weights(
             self.module.lycoris_net,
             final_path,
-            metadata={"lokr_config": self.lokr_config.to_dict() if self.lokr_config else None},
+            metadata=final_metadata,
         )
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
-        yield global_step, final_loss, f"✅ Training complete! LoKR saved to {final_path}"
+        yield global_step, final_loss, f"✅ Training complete! LoKr saved to {final_path}"
 
     def stop(self):
+        """Stop training."""
         self.is_training = False

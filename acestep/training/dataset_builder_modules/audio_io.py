@@ -47,15 +47,21 @@ def load_lyrics_file(audio_path: str) -> Tuple[str, bool]:
 def get_audio_duration(audio_path: str) -> int:
     """Get the duration of an audio file in seconds."""
     # Primary: torchcodec (ships with torchaudio >=2.9, supports all ffmpeg formats)
+    # Note: torchcodec is optional on ROCM/Intel platforms due to CUDA dependencies
     try:
         from mutagen import File as MutagenFile
 
         audio = MutagenFile(audio_path)
         if audio is not None:
             return int(audio.info.length)
+        from torchcodec.decoders import AudioDecoder
+        decoder = AudioDecoder(audio_path)
+        return int(decoder.metadata.duration_seconds)
+    except ImportError:
+        logger.debug("torchcodec not available (expected on ROCM/Intel platforms), using soundfile fallback")
     except Exception as e:
         logger.debug(f"torchcodec failed for {audio_path}: {e}, trying soundfile")
-    # Fallback: soundfile (fast for wav/flac/ogg)
+    # Fallback: soundfile (fast for wav/flac/ogg, works on all platforms)
     try:
         import soundfile as sf
         info = sf.info(audio_path)
