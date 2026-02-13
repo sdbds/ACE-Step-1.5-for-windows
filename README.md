@@ -56,6 +56,10 @@ git clone --recurse-submodules https://github.com/sdbds/ACE-Step-1.5-for-windows
 
 # MUST USE --recurse-submodules
 
+### Change Default Model
+copy .env.sample and rename to .env
+then change model name for which your choose.
+
 ### Windows
 Run the following PowerShell script:
 ```powershell
