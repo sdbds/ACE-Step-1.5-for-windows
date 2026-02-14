@@ -734,13 +734,26 @@ def _start_tensorboard(app: FastAPI, logdir: str) -> Optional[str]:
     """(Re)start TensorBoard with the given logdir and return URL if successful."""
     try:
         import subprocess
+        import sys
+        import os
 
         tensorboard_port = int(os.getenv("TENSORBOARD_PORT", "6006"))
         _stop_tensorboard(app)
 
+        # Use virtual environment's tensorboard if available
+        if sys.prefix != sys.base_prefix:  # Running in virtual environment
+            tensorboard_cmd = os.path.join(sys.prefix, "Scripts", "tensorboard.exe")
+            if not os.path.exists(tensorboard_cmd):
+                tensorboard_cmd = os.path.join(sys.prefix, "bin", "tensorboard")
+            if not os.path.exists(tensorboard_cmd):
+                # Fallback to system tensorboard if venv version not found
+                tensorboard_cmd = "tensorboard"
+        else:
+            tensorboard_cmd = "tensorboard"
+
         app.state.tensorboard_process = subprocess.Popen(
             [
-                "tensorboard",
+                tensorboard_cmd,
                 "--logdir",
                 logdir,
                 "--port",
