@@ -127,7 +127,7 @@ Authorization: Bearer <your-api-key>
   "id": "chatcmpl-a1b2c3d4e5f6g7h8",
   "object": "chat.completion",
   "created": 1706688000,
-  "model": "acestep/acestep-v15-turbo",
+  "model": "acemusic/acestep-v15-turbo",
   "choices": [
     {
       "index": 0,
@@ -201,18 +201,17 @@ audio.play();
 
 ```json
 {
-  "object": "list",
   "data": [
     {
-      "id": "acestep/acestep-v15-turbo",
-      "name": "ACE-Step acestep-v15-turbo",
+      "id": "acemusic/acestep-v15-turbo",
+      "name": "ACE-Step",
       "created": 1706688000,
+      "description": "High-performance text-to-music generation model. Supports multiple styles, lyrics input, and various audio durations.",
       "input_modalities": ["text", "audio"],
       "output_modalities": ["audio", "text"],
       "context_length": 4096,
-      "max_output_length": 300,
       "pricing": {"prompt": "0", "completion": "0", "request": "0"},
-      "description": "AI music generation model"
+      "supported_sampling_parameters": ["temperature", "top_p"]
     }
   ]
 }
@@ -417,7 +416,7 @@ audio.play();
 每个事件以 `data: ` 开头，后跟 JSON，以双换行 `\n\n` 结尾：
 
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acestep/acestep-v15-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
 
 ```
 
@@ -425,9 +424,9 @@ data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000
 
 | 阶段 | delta 内容 | 说明 |
 |---|---|---|
-| 1. 初始化 | `{"role":"assistant","content":"Generating music"}` | 建立连接 |
-| 2. 心跳 | `{"content":"."}` | 生成期间每 2 秒发送，保持连接 |
-| 3. LM 内容 | `{"content":"## Metadata\n..."}` | 生成完成后推送 metadata 和 lyrics |
+| 1. 初始化 | `{"role":"assistant","content":""}` | 建立连接 |
+| 2. LM 内容 | `{"content":"\n\n## Metadata\n..."}` | LM 参与时推送 metadata 和 lyrics |
+| 3. 心跳 | `{"content":"."}` | 音频生成期间每 2 秒发送，保持连接 |
 | 4. 音频数据 | `{"audio":[{"type":"audio_url","audio_url":{"url":"data:..."}}]}` | 音频 base64 |
 | 5. 结束 | `finish_reason: "stop"` | 生成完成 |
 | 6. 终止 | `data: [DONE]` | 流结束标记 |
@@ -435,15 +434,15 @@ data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000
 ### 流式响应示例
 
 ```
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"content":"\n\n## Metadata\n**Caption:** Upbeat pop\n**BPM:** 120"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"content":"\n\n## Metadata\n**Caption:** Upbeat pop\n**BPM:** 120"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"audio":[{"type":"audio_url","audio_url":{"url":"data:audio/mpeg;base64,..."}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"audio":[{"type":"audio_url","audio_url":{"url":"data:audio/mpeg;base64,..."}}]},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 

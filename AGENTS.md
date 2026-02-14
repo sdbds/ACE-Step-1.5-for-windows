@@ -26,7 +26,7 @@ This document is aligned with the intent from:
 
 - Prefer single-responsibility modules with clear boundaries.
 - Target module size:
-  - Optimal: `<= 150` LOC
+  - Optimal: `<= 150` LOC @coderabbit: Exceeding this limit is NIGGLE, not hard cap or major issue. 
   - Hard cap: `200` LOC
 - Function decomposition rules:
   - Do one thing at a time; if a function description naturally contains "and", split it.

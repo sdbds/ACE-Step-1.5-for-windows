@@ -8,6 +8,7 @@ import sys
 
 from nanovllm.config import Config
 from acestep.debug_utils import debug_start, debug_end
+from nanovllm import distributed as dist_utils
 
 # Debug logging - enable with NANOVLLM_DEBUG=1
 _DEBUG = os.environ.get("NANOVLLM_DEBUG", "0") == "1"
@@ -64,20 +65,32 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        dist_port = find_available_port()
-        print(f"[debug]dist_port: {dist_port}")
-        # Use gloo backend on Windows, nccl on Linux/other platforms
-        backend = "gloo" if sys.platform == "win32" else "nccl"
-        dist.init_process_group(backend, f"tcp://127.0.0.1:{dist_port}", world_size=self.world_size, rank=rank)
+        
+        # Only initialize distributed if world_size > 1
+        if self.world_size > 1:
+            dist_port = find_available_port()
+            print(f"[debug]dist_port: {dist_port}")
+            # Use gloo backend on Windows, nccl on Linux/other platforms
+            backend = "gloo" if sys.platform == "win32" else "nccl"
+            dist_utils.initialize_distributed(backend, f"tcp://127.0.0.1:{dist_port}", world_size=self.world_size, rank=rank)
+        
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
+        
+        # Detect GPU compute capability to determine bfloat16 support
+        # Bfloat16 requires Ampere (compute capability >= 8.0) or newer
+        gpu_props = torch.cuda.get_device_properties(rank)
+        # Use tuple comparison to handle compute capability correctly
+        # (e.g., 7.5 < 8.0, 8.0 >= 8.0, 8.6 >= 8.0, etc.)
+        supports_bfloat16 = (gpu_props.major, gpu_props.minor) >= (8, 0)
+        
         # Use dtype instead of deprecated torch_dtype
         config_dtype = getattr(hf_config, 'dtype', getattr(hf_config, 'torch_dtype', torch.bfloat16))
 
         # Validate and convert config_dtype to a valid torch floating-point dtype
-        # Default to bfloat16 for CUDA (required for Flash Attention 2)
+        # Default to bfloat16 for CUDA (required for Flash Attention 2) if GPU supports it
         if config_dtype is None:
-            config_dtype = torch.bfloat16
+            config_dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
         elif isinstance(config_dtype, str):
             # Convert string dtype to torch dtype
             dtype_map = {
@@ -90,10 +103,15 @@ class ModelRunner:
                 'torch.bfloat16': torch.bfloat16,
                 'torch.float64': torch.float64,
             }
-            config_dtype = dtype_map.get(config_dtype.lower(), torch.bfloat16)
+            config_dtype = dtype_map.get(config_dtype.lower(), torch.bfloat16 if supports_bfloat16 else torch.float16)
         elif not isinstance(config_dtype, torch.dtype) or not config_dtype.is_floating_point:
-            # If not a valid floating-point torch dtype, default to bfloat16
-            config_dtype = torch.bfloat16
+            # If not a valid floating-point torch dtype, default based on GPU capability
+            config_dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
+        
+        # Override to float16 if config requested bfloat16 but GPU doesn't support it
+        if config_dtype == torch.bfloat16 and not supports_bfloat16:
+            print(f"[nanovllm] GPU {gpu_props.name} (compute capability {gpu_props.major}.{gpu_props.minor}) does not support bfloat16. Using float16 instead.", flush=True)
+            config_dtype = torch.float16
 
         self.dtype = config_dtype  # Save for later use
         torch.set_default_dtype(config_dtype)
@@ -119,9 +137,9 @@ class ModelRunner:
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+                dist_utils.barrier()
             else:
-                dist.barrier()
+                dist_utils.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
@@ -163,13 +181,13 @@ class ModelRunner:
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist_utils.barrier()
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        dist_utils.destroy_process_group()
 
     def loop(self):
         while True:

@@ -91,10 +91,10 @@ TASK_TYPES_BASE = ["text2music", "repaint", "cover", "extract", "lego", "complet
 # Generation Mode Constants (UI-level modes that map to task types)
 # ==============================================================================
 
-# Turbo model modes (also used for base-SFT)
+# Default modes for turbo and SFT models (restricted set)
 GENERATION_MODES_TURBO = ["Simple", "Custom", "Remix", "Repaint"]
 
-# Base model modes (non-SFT) - adds extract/lego/complete
+# Extended modes for pure base models only — adds Extract/Lego/Complete
 GENERATION_MODES_BASE = ["Simple", "Custom", "Remix", "Repaint", "Extract", "Lego", "Complete"]
 
 # Mapping from generation mode to task_type value

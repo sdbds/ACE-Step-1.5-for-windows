@@ -612,8 +612,8 @@ class LLMHandler:
                     return status_msg, True
 
             if backend == "vllm" and device != "cuda":
-                logger.warning(
-                    f"[initialize] vllm backend requires CUDA. Falling back to PyTorch backend for device={device}."
+                logger.info(
+                    f"[initialize] vllm backend requires CUDA, using PyTorch backend for device={device}."
                 )
                 backend = "pt"
 

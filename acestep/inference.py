@@ -137,6 +137,7 @@ class GenerationParams:
     repainting_start: float = 0.0
     repainting_end: float = -1
     audio_cover_strength: float = 1.0
+    cover_noise_strength: float = 0.0  # 0=pure noise (no cover), 1=closest to src audio
 
     # 5Hz Language Model Parameters
     thinking: bool = True
@@ -597,6 +598,7 @@ def generate_music(
             repainting_end=params.repainting_end,
             instruction=params.instruction,
             audio_cover_strength=params.audio_cover_strength,
+            cover_noise_strength=params.cover_noise_strength,
             task_type=params.task_type,
             use_adg=params.use_adg,
             cfg_interval_start=params.cfg_interval_start,

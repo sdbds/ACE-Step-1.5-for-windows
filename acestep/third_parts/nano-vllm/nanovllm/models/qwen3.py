@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm import distributed as dist_utils
 
 
 class Qwen3Attention(nn.Module):
@@ -26,7 +27,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = dist_utils.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

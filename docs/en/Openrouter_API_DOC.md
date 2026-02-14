@@ -127,7 +127,7 @@ Supports both plain text and multimodal (text + audio) formats:
   "id": "chatcmpl-a1b2c3d4e5f6g7h8",
   "object": "chat.completion",
   "created": 1706688000,
-  "model": "acestep/acestep-v15-turbo",
+  "model": "acemusic/acestep-v15-turbo",
   "choices": [
     {
       "index": 0,
@@ -201,18 +201,17 @@ Returns available model information.
 
 ```json
 {
-  "object": "list",
   "data": [
     {
-      "id": "acestep/acestep-v15-turbo",
-      "name": "ACE-Step acestep-v15-turbo",
+      "id": "acemusic/acestep-v15-turbo",
+      "name": "ACE-Step",
       "created": 1706688000,
+      "description": "High-performance text-to-music generation model. Supports multiple styles, lyrics input, and various audio durations.",
       "input_modalities": ["text", "audio"],
       "output_modalities": ["audio", "text"],
       "context_length": 4096,
-      "max_output_length": 300,
       "pricing": {"prompt": "0", "completion": "0", "request": "0"},
-      "description": "AI music generation model"
+      "supported_sampling_parameters": ["temperature", "top_p"]
     }
   ]
 }
@@ -417,7 +416,7 @@ Set `"stream": true` to enable SSE (Server-Sent Events) streaming.
 Each event starts with `data: `, followed by JSON, ending with a double newline `\n\n`:
 
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acestep/acestep-v15-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{...},"finish_reason":null}]}
 
 ```
 
@@ -425,9 +424,9 @@ data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000
 
 | Phase | Delta Content | Description |
 |---|---|---|
-| 1. Initialization | `{"role":"assistant","content":"Generating music"}` | Establishes the connection |
-| 2. Heartbeat | `{"content":"."}` | Sent every 2 seconds during generation to keep the connection alive |
-| 3. LM Content | `{"content":"## Metadata\n..."}` | Metadata and lyrics pushed after generation completes |
+| 1. Initialization | `{"role":"assistant","content":""}` | Establishes the connection |
+| 2. LM Content | `{"content":"\n\n## Metadata\n..."}` | Metadata and lyrics pushed after LM generation (if LM was used) |
+| 3. Heartbeat | `{"content":"."}` | Sent every 2 seconds during audio generation to keep the connection alive |
 | 4. Audio Data | `{"audio":[{"type":"audio_url","audio_url":{"url":"data:..."}}]}` | Audio base64 data |
 | 5. Finish | `finish_reason: "stop"` | Generation complete |
 | 6. Termination | `data: [DONE]` | End-of-stream marker |
@@ -435,15 +434,15 @@ data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1706688000
 ### Streaming Response Example
 
 ```
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"content":"\n\n## Metadata\n**Caption:** Upbeat pop\n**BPM:** 120"},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"content":"\n\n## Metadata\n**Caption:** Upbeat pop\n**BPM:** 120"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{"audio":[{"type":"audio_url","audio_url":{"url":"data:audio/mpeg;base64,..."}}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{"audio":[{"type":"audio_url","audio_url":{"url":"data:audio/mpeg;base64,..."}}]},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v1.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1706688000,"model":"acemusic/acestep-v15-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 

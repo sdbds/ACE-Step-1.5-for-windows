@@ -31,7 +31,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
     
     generation_section["config_path"].change(
         fn=gen_h.update_model_type_settings,
-        inputs=[generation_section["config_path"]],
+        inputs=[generation_section["config_path"], generation_section["generation_mode"]],
         outputs=[
             generation_section["inference_steps"],
             generation_section["guidance_scale"],
@@ -41,6 +41,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["cfg_interval_end"],
             generation_section["task_type"],
             generation_section["generation_mode"],
+            generation_section["init_llm_checkbox"],
         ]
     )
     
@@ -77,6 +78,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["compile_model_checkbox"],
             generation_section["quantization_checkbox"],
             generation_section["mlx_dit_checkbox"],
+            generation_section["generation_mode"],  # preserve current mode across init
         ],
         outputs=[
             generation_section["init_status"], 
@@ -91,6 +93,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["cfg_interval_end"],
             generation_section["task_type"],
             generation_section["generation_mode"],
+            generation_section["init_llm_checkbox"],
             # GPU-config-aware limits (updated after initialization)
             generation_section["audio_duration"],
             generation_section["batch_size_input"],
@@ -183,6 +186,9 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
     )
     
     # ========== Instruction UI Updates ==========
+    # Visibility of track_name / complete_track_classes / repainting_group is
+    # handled by compute_mode_ui_updates; this handler only refreshes the
+    # instruction text when relevant inputs change.
     for trigger in [generation_section["task_type"], generation_section["track_name"], generation_section["complete_track_classes"], generation_section["reference_audio"]]:
         trigger.change(
             fn=lambda *args: gen_h.update_instruction_ui(dit_handler, *args),
@@ -195,9 +201,6 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             ],
             outputs=[
                 generation_section["instruction_display_gen"],
-                generation_section["track_name"],
-                generation_section["complete_track_classes"],
-                generation_section["repainting_group"],
             ]
         )
     
@@ -330,8 +333,11 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
     
     # ========== Generation Mode Change ==========
     generation_section["generation_mode"].change(
-        fn=lambda mode: gen_h.handle_generation_mode_change(mode, llm_handler),
-        inputs=[generation_section["generation_mode"]],
+        fn=lambda mode, prev: gen_h.handle_generation_mode_change(mode, prev, llm_handler),
+        inputs=[
+            generation_section["generation_mode"],
+            generation_section["previous_generation_mode"],
+        ],
         outputs=[
             generation_section["simple_mode_group"],
             generation_section["custom_mode_group"],
@@ -351,7 +357,50 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["load_file_col"],
             generation_section["load_file"],
             generation_section["audio_cover_strength"],
+            generation_section["cover_noise_strength"],
+            # Extract/Lego-mode outputs (indices 19-29)
+            generation_section["captions"],
+            generation_section["lyrics"],
+            generation_section["bpm"],
+            generation_section["key_scale"],
+            generation_section["time_signature"],
+            generation_section["vocal_language"],
+            generation_section["audio_duration"],
+            generation_section["auto_score"],
+            generation_section["autogen_checkbox"],
+            generation_section["auto_lrc"],
+            generation_section["analyze_btn"],
+            # Dynamic repainting/stem labels (indices 30-32)
+            generation_section["repainting_header_html"],
+            generation_section["repainting_start"],
+            generation_section["repainting_end"],
+            # Previous mode state (index 33)
+            generation_section["previous_generation_mode"],
+            # Mode-specific help button groups (indices 34-36)
+            generation_section["remix_help_group"],
+            generation_section["extract_help_group"],
+            generation_section["complete_help_group"],
         ]
+    )
+    
+    # ========== Extract Mode: Auto-fill caption from track_name ==========
+    generation_section["track_name"].change(
+        fn=gen_h.handle_extract_track_name_change,
+        inputs=[
+            generation_section["track_name"],
+            generation_section["generation_mode"],
+        ],
+        outputs=[generation_section["captions"]],
+    )
+    
+    # ========== Extract/Lego Mode: Auto-fill audio_duration from src_audio ==========
+    generation_section["src_audio"].change(
+        fn=gen_h.handle_extract_src_audio_change,
+        inputs=[
+            generation_section["src_audio"],
+            generation_section["generation_mode"],
+        ],
+        outputs=[generation_section["audio_duration"]],
     )
     
     # ========== Simple Mode Instrumental Checkbox ==========
@@ -441,6 +490,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["use_cot_caption"],
             generation_section["use_cot_language"],
             generation_section["audio_cover_strength"],
+            generation_section["cover_noise_strength"],
             generation_section["think_checkbox"],
             generation_section["text2music_audio_code_string"],
             generation_section["repainting_start"],
@@ -531,32 +581,85 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         js=download_existing_js  # Run the above JS
     )
     # ========== Send to Remix / Repaint Handlers ==========
+    # Mode-UI outputs shared with generation_mode.change — applied atomically
+    # so we don't rely on a chained .change() event for visibility/label updates.
+    _mode_ui_outputs = [
+        generation_section["simple_mode_group"],
+        generation_section["custom_mode_group"],
+        generation_section["generate_btn"],
+        generation_section["simple_sample_created"],
+        generation_section["optional_params_accordion"],
+        generation_section["task_type"],
+        generation_section["src_audio_row"],
+        generation_section["repainting_group"],
+        generation_section["text2music_audio_codes_group"],
+        generation_section["track_name"],
+        generation_section["complete_track_classes"],
+        generation_section["generate_btn_row"],
+        generation_section["generation_mode"],
+        generation_section["results_wrapper"],
+        generation_section["think_checkbox"],
+        generation_section["load_file_col"],
+        generation_section["load_file"],
+        generation_section["audio_cover_strength"],
+        generation_section["cover_noise_strength"],
+        # Extract/Lego-mode outputs (indices 19-29)
+        generation_section["captions"],
+        generation_section["lyrics"],
+        generation_section["bpm"],
+        generation_section["key_scale"],
+        generation_section["time_signature"],
+        generation_section["vocal_language"],
+        generation_section["audio_duration"],
+        generation_section["auto_score"],
+        generation_section["autogen_checkbox"],
+        generation_section["auto_lrc"],
+        generation_section["analyze_btn"],
+        # Dynamic repainting/stem labels (indices 30-32)
+        generation_section["repainting_header_html"],
+        generation_section["repainting_start"],
+        generation_section["repainting_end"],
+        # Previous mode state (index 33)
+        generation_section["previous_generation_mode"],
+        # Mode-specific help button groups (indices 34-36)
+        generation_section["remix_help_group"],
+        generation_section["extract_help_group"],
+        generation_section["complete_help_group"],
+    ]
     for btn_idx in range(1, 9):
         results_section[f"send_to_remix_btn_{btn_idx}"].click(
-            fn=res_h.send_audio_to_remix,
+            fn=lambda audio, lm, ly, cap, cur_mode: res_h.send_audio_to_remix(
+                audio, lm, ly, cap, cur_mode, llm_handler),
             inputs=[
                 results_section[f"generated_audio_{btn_idx}"],
-                results_section["lm_metadata_state"]
+                results_section["lm_metadata_state"],
+                generation_section["lyrics"],
+                generation_section["captions"],
+                generation_section["generation_mode"],
             ],
             outputs=[
                 generation_section["src_audio"],
                 generation_section["generation_mode"],
                 generation_section["lyrics"],
                 generation_section["captions"],
-            ]
+            ] + _mode_ui_outputs,
         )
         results_section[f"send_to_repaint_btn_{btn_idx}"].click(
-            fn=res_h.send_audio_to_repaint,
+            fn=lambda audio, lm, ly, cap, cur_mode: res_h.send_audio_to_repaint(
+                audio, lm, ly, cap, cur_mode, llm_handler),
             inputs=[
                 results_section[f"generated_audio_{btn_idx}"],
-                results_section["lm_metadata_state"]
+                results_section["lm_metadata_state"],
+                generation_section["lyrics"],
+                generation_section["captions"],
+                generation_section["generation_mode"],
             ],
             outputs=[
                 generation_section["src_audio"],
                 generation_section["generation_mode"],
                 generation_section["lyrics"],
                 generation_section["captions"],
-            ]
+            ] + _mode_ui_outputs,
         )
     
     # ========== Score Calculation Handlers ==========
@@ -663,6 +766,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["repainting_end"],
             generation_section["instruction_display_gen"],
             generation_section["audio_cover_strength"],
+            generation_section["cover_noise_strength"],
             generation_section["task_type"],
             generation_section["use_adg"],
             generation_section["cfg_interval_start"],
@@ -855,6 +959,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["repainting_end"],
             generation_section["instruction_display_gen"],
             generation_section["audio_cover_strength"],
+            generation_section["cover_noise_strength"],
             generation_section["task_type"],
             generation_section["use_adg"],
             generation_section["cfg_interval_start"],

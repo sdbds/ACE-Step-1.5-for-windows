@@ -2624,6 +2624,7 @@ def create_app() -> FastAPI:
                     print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
 
             offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
+            compile_model = _env_bool("ACESTEP_COMPILE_MODEL", False)
 
             # Checkpoint directory
             checkpoint_dir = os.path.join(project_root, "checkpoints")
@@ -2649,7 +2650,7 @@ def create_app() -> FastAPI:
                 config_path=config_path,
                 device=device,
                 use_flash_attention=use_flash_attention,
-                compile_model=False,
+                compile_model=compile_model,
                 offload_to_cpu=offload_to_cpu,
                 offload_dit_to_cpu=offload_dit_to_cpu,
             )
@@ -2676,7 +2677,7 @@ def create_app() -> FastAPI:
                         config_path=config_path2,
                         device=device,
                         use_flash_attention=use_flash_attention,
-                        compile_model=False,
+                        compile_model=compile_model,
                         offload_to_cpu=offload_to_cpu,
                         offload_dit_to_cpu=offload_dit_to_cpu,
                     )
@@ -2705,7 +2706,7 @@ def create_app() -> FastAPI:
                         config_path=config_path3,
                         device=device,
                         use_flash_attention=use_flash_attention,
-                        compile_model=False,
+                        compile_model=compile_model,
                         offload_to_cpu=offload_to_cpu,
                         offload_dit_to_cpu=offload_dit_to_cpu,
                     )

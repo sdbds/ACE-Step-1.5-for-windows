@@ -39,16 +39,25 @@ from acestep.model_downloader import (
     check_model_exists,
     get_checkpoints_dir,
 )
-from acestep.constants import (
-    TASK_INSTRUCTIONS,
-    SFT_GEN_PROMPT,
-    DEFAULT_DIT_INSTRUCTION,
-)
+from acestep.constants import DEFAULT_DIT_INSTRUCTION, SFT_GEN_PROMPT, TASK_INSTRUCTIONS
 from acestep.core.generation.handler import (
+    AudioCodesMixin,
+    BatchPrepMixin,
+    ConditioningBatchMixin,
+    ConditioningEmbedMixin,
+    ConditioningMaskMixin,
+    ConditioningTargetMixin,
+    ConditioningTextMixin,
     DiffusionMixin,
     InitServiceMixin,
+    IoAudioMixin,
     LoraManagerMixin,
+    MemoryUtilsMixin,
+    MetadataMixin,
+    PaddingMixin,
     ProgressMixin,
+    PromptMixin,
+    TaskUtilsMixin,
 )
 from acestep.dit_alignment_score import MusicStampsAligner, MusicLyricScorer
 from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_effective_free_vram_gb
@@ -57,7 +66,25 @@ from acestep.gpu_config import get_gpu_memory_gb, get_global_gpu_config, get_eff
 warnings.filterwarnings("ignore")
 
 
-class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, ProgressMixin):
+class AceStepHandler(
+    DiffusionMixin,
+    AudioCodesMixin,
+    BatchPrepMixin,
+    ConditioningBatchMixin,
+    ConditioningEmbedMixin,
+    ConditioningMaskMixin,
+    ConditioningTargetMixin,
+    ConditioningTextMixin,
+    IoAudioMixin,
+    InitServiceMixin,
+    LoraManagerMixin,
+    MemoryUtilsMixin,
+    MetadataMixin,
+    PaddingMixin,
+    ProgressMixin,
+    PromptMixin,
+    TaskUtilsMixin,
+):
     """ACE-Step Business Logic Handler"""
 
     def __init__(self):
@@ -122,6 +149,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         # MLX DiT acceleration (macOS Apple Silicon only)
         self.mlx_decoder = None
         self.use_mlx_dit = False
+        self.mlx_dit_compiled = False
 
         # MLX VAE acceleration (macOS Apple Silicon only)
         self.mlx_vae = None
@@ -171,8 +199,13 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
     # ------------------------------------------------------------------
     # MLX DiT acceleration helpers
     # ------------------------------------------------------------------
-    def _init_mlx_dit(self) -> bool:
+    def _init_mlx_dit(self, compile_model: bool = False) -> bool:
         """Try to initialize the native MLX DiT decoder for Apple Silicon.
+
+        Args:
+            compile_model: If True, the diffusion step will be compiled with
+                ``mx.compile`` for kernel fusion during generation.  The
+                compilation itself happens lazily in ``mlx_generate_diffusion``.
 
         Returns True on success, False on failure (non-fatal).
         """
@@ -189,12 +222,17 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             convert_and_load(self.model, mlx_decoder)
             self.mlx_decoder = mlx_decoder
             self.use_mlx_dit = True
-            logger.info("[MLX-DiT] Native MLX DiT decoder initialized successfully.")
+            self.mlx_dit_compiled = compile_model
+            logger.info(
+                f"[MLX-DiT] Native MLX DiT decoder initialized successfully "
+                f"(mx.compile={compile_model})."
+            )
             return True
         except Exception as exc:
             logger.warning(f"[MLX-DiT] Failed to initialize MLX decoder (non-fatal): {exc}")
             self.mlx_decoder = None
             self.use_mlx_dit = False
+            self.mlx_dit_compiled = False
             return False
 
     def is_turbo_model(self) -> bool:
@@ -669,12 +707,12 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
 
         T = z_nlc.shape[1]
         # MLX unified memory: much larger chunk OK than PyTorch MPS.
-        # 2048 latent frames ≈ 87 seconds of audio — covers nearly all use cases.
+        # 2048 latent frames ~= 87 seconds of audio; covers nearly all use cases.
         MLX_CHUNK = 2048
         MLX_OVERLAP = 64
 
         if T <= MLX_CHUNK:
-            # No tiling needed — caller handles mx.eval()
+            # No tiling needed; caller handles mx.eval()
             return decode_fn(z_nlc)
 
         # Overlap-discard tiling for very long sequences
@@ -859,7 +897,8 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             config_path: Model config directory name (e.g., "acestep-v15-turbo")
             device: Device type
             use_flash_attention: Whether to use flash attention (requires flash_attn package)
-            compile_model: Whether to use torch.compile to optimize the model
+            compile_model: Whether to compile the model. On CUDA/XPU uses
+                torch.compile; on MPS redirects to mx.compile for MLX components.
             offload_to_cpu: Whether to offload models to CPU when not in use
             offload_dit_to_cpu: Whether to offload DiT model to CPU when not in use (only effective if offload_to_cpu is True)
             prefer_source: Preferred download source ("huggingface", "modelscope", or None for auto-detect)
@@ -919,13 +958,21 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
             
-            # MPS safety: torch.compile and torchao quantization are not supported on MPS
+            # MPS safety: torch.compile and torchao quantization are not supported
+            # on MPS.  When the user requests compilation on MPS, we redirect the
+            # intent to mx.compile for the MLX components (DiT, VAE) instead of
+            # silently dropping it.
+            mlx_compile_requested = False
             if device == "mps":
                 if compile_model:
-                    logger.warning("[initialize_service] torch.compile is not supported on MPS — disabling.")
-                    compile_model = False
+                    logger.info(
+                        "[initialize_service] MPS detected: torch.compile is not "
+                        "supported — redirecting to mx.compile for MLX components."
+                    )
+                    mlx_compile_requested = True
+                    compile_model = False  # Disable torch.compile (unsupported on MPS)
                 if quantization is not None:
-                    logger.warning("[initialize_service] Quantization (torchao) is not supported on MPS — disabling.")
+                    logger.warning("[initialize_service] Quantization (torchao) is not supported on MPS; disabling.")
                     quantization = None
             
             self.compiled = compile_model
@@ -959,7 +1006,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 logger.info("[initialize_service] Main model not found, starting auto-download...")
                 success, msg = ensure_main_model(checkpoint_path, prefer_source=prefer_source)
                 if not success:
-                    return f"❌ Failed to download main model: {msg}", False
+                    return f"âŒ Failed to download main model: {msg}", False
                 logger.info(f"[initialize_service] {msg}")
 
             # Check and download the requested DiT model
@@ -971,8 +1018,19 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 logger.info(f"[initialize_service] DiT model '{config_path}' not found, starting auto-download...")
                 success, msg = ensure_dit_model(config_path, checkpoint_path, prefer_source=prefer_source)
                 if not success:
-                    return f"❌ Failed to download DiT model '{config_path}': {msg}", False
+                    return f"âŒ Failed to download DiT model '{config_path}': {msg}", False
                 logger.info(f"[initialize_service] {msg}")
+
+            # Check if model code files are up-to-date with GitHub repo versions
+            from acestep.model_downloader import _check_code_mismatch, _sync_model_code_files
+            mismatched = _check_code_mismatch(config_path, checkpoint_path)
+            if mismatched:
+                logger.warning(
+                    f"[initialize_service] Model code mismatch detected for '{config_path}': "
+                    f"{mismatched}. Auto-syncing from acestep/models/..."
+                )
+                _sync_model_code_files(config_path, checkpoint_path)
+                logger.info(f"[initialize_service] Model code files synced successfully.")
 
             # 1. Load main model
             # config_path is relative path (e.g., "acestep-v15-turbo"), concatenate to checkpoints directory
@@ -1068,7 +1126,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                         # Only quantize DiT layers; exclude tokenizer and detokenizer submodules.
                         # The tokenizer (ResidualFSQ) and detokenizer contain small Linear layers
                         # that are used for audio code decoding. Quantizing them causes device
-                        # mismatch errors during CPU↔GPU offloading because some torchao versions
+                        # mismatch errors during CPU/GPU offloading because some torchao versions
                         # don't fully support .to(device) on AffineQuantizedTensor, and these
                         # layers are too small to benefit from quantization anyway.
                         def _dit_filter_fn(module, fqn):
@@ -1138,32 +1196,47 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             # Determine actual attention implementation used
             actual_attn = getattr(self.config, "_attn_implementation", "eager")
 
-            # Try to initialize native MLX DiT for Apple Silicon acceleration
+            # Try to initialize native MLX DiT for Apple Silicon acceleration.
+            # On MPS with compilation requested, mx.compile is used instead of
+            # torch.compile (which is unsupported on MPS).
             mlx_dit_status = "Disabled"
-            if use_mlx_dit and device in ("mps", "cpu") and not compile_model:
-                mlx_ok = self._init_mlx_dit()
-                mlx_dit_status = "Active (native MLX)" if mlx_ok else "Unavailable (PyTorch fallback)"
+            if use_mlx_dit and device in ("mps", "cpu"):
+                mlx_ok = self._init_mlx_dit(compile_model=mlx_compile_requested)
+                if mlx_ok:
+                    mlx_dit_status = (
+                        "Active (native MLX, mx.compile)"
+                        if mlx_compile_requested
+                        else "Active (native MLX)"
+                    )
+                else:
+                    mlx_dit_status = "Unavailable (PyTorch fallback)"
             elif not use_mlx_dit:
                 mlx_dit_status = "Disabled by user"
                 self.mlx_decoder = None
                 self.use_mlx_dit = False
 
-            # Try to initialize native MLX VAE for Apple Silicon acceleration
+            # Try to initialize native MLX VAE for Apple Silicon acceleration.
+            # The MLX VAE applies mx.compile internally regardless of the user's
+            # compile_model setting (it always benefits from kernel fusion).
             mlx_vae_status = "Disabled"
-            if device in ("mps", "cpu") and not compile_model:
+            if device in ("mps", "cpu"):
                 mlx_vae_ok = self._init_mlx_vae()
                 mlx_vae_status = "Active (native MLX)" if mlx_vae_ok else "Unavailable (PyTorch fallback)"
             else:
                 self.mlx_vae = None
                 self.use_mlx_vae = False
             
-            status_msg = f"✅ Model initialized successfully on {device}\n"
+            status_msg = f"âœ… Model initialized successfully on {device}\n"
             status_msg += f"Main model: {acestep_v15_checkpoint_path}\n"
             status_msg += f"VAE: {vae_checkpoint_path}\n"
             status_msg += f"Text encoder: {text_encoder_path}\n"
             status_msg += f"Dtype: {self.dtype}\n"
             status_msg += f"Attention: {actual_attn}\n"
-            status_msg += f"Compiled: {compile_model}\n"
+            compiled_label = (
+                "mx.compile (MLX)" if mlx_compile_requested
+                else str(compile_model)
+            )
+            status_msg += f"Compiled: {compiled_label}\n"
             status_msg += f"Offload to CPU: {self.offload_to_cpu}\n"
             status_msg += f"Offload DiT to CPU: {self.offload_dit_to_cpu}\n"
             status_msg += f"MLX DiT: {mlx_dit_status}\n"
@@ -1186,7 +1259,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             return status_msg, True
 
         except Exception as e:
-            error_msg = f"❌ Error initializing model: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            error_msg = f"âŒ Error initializing model: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.exception("[initialize_service] Error initializing model")
             return error_msg, False
 
@@ -3484,6 +3557,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         repainting_end: Optional[Union[float, List[float]]] = None,
         instructions: Optional[Union[str, List[str]]] = None,
         audio_cover_strength: float = 1.0,
+        cover_noise_strength: float = 0.0,
         use_adg: bool = False,
         cfg_interval_start: float = 0.0,
         cfg_interval_end: float = 1.0,
@@ -3512,6 +3586,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             repainting_end: End time(s) for repainting region in seconds (optional)
             instructions: Instruction text(s) for generation (optional)
             audio_cover_strength: Strength of audio cover mode (default: 1.0)
+            cover_noise_strength: Strength of cover noise init (0=pure noise, 1=closest to src audio) (default: 0.0)
             use_adg: Whether to use ADG (Adaptive Diffusion Guidance) (default: False)
             cfg_interval_start: Start of CFG interval (0.0-1.0, default: 0.0)
             cfg_interval_end: End of CFG interval (0.0-1.0, default: 1.0)
@@ -3602,6 +3677,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             instructions=instructions,
             audio_code_hints=audio_code_hints,
             audio_cover_strength=audio_cover_strength,
+            cover_noise_strength=cover_noise_strength,
         )
 
         processed_data = self.preprocess_batch(batch)
@@ -3656,6 +3732,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             "non_cover_text_attention_mask": non_cover_text_attention_masks,
             "precomputed_lm_hints_25Hz": precomputed_lm_hints_25Hz,
             "audio_cover_strength": audio_cover_strength,
+            "cover_noise_strength": cover_noise_strength,
             "infer_method": infer_method,
             "infer_steps": infer_steps,
             "diffusion_guidance_sale": guidance_scale,
@@ -3730,6 +3807,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                             encoder_hidden_states_non_cover=enc_hs_nc,
                             encoder_attention_mask_non_cover=enc_am_nc,
                             context_latents_non_cover=ctx_nc,
+                            disable_tqdm=self.disable_tqdm,
                         )
                         _tc = outputs.get("time_costs", {})
                         _dt = _tc.get("diffusion_time_cost", 0)
@@ -3853,7 +3931,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         # (e.g. 8 GB) decoding the whole batch at once can OOM.  Process one
         # sample at a time so peak VRAM stays constant regardless of batch size.
         if B > 1:
-            logger.info(f"[tiled_decode] Batch size {B} > 1 — decoding samples sequentially to save VRAM")
+            logger.info(f"[tiled_decode] Batch size {B} > 1; decoding samples sequentially to save VRAM")
             per_sample_results = []
             for b_idx in range(B):
                 single = latents[b_idx : b_idx + 1]  # [1, C, T]
@@ -4065,7 +4143,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         # Move latents to CPU
         latents_cpu = latents.cpu().to(vae_cpu_dtype)
         
-        # Decode on CPU (no tiling needed — CPU has plenty of RAM)
+        # Decode on CPU (no tiling needed; CPU has plenty of RAM)
         try:
             with torch.inference_mode():
                 decoder_output = self.vae.decode(latents_cpu)
@@ -4078,7 +4156,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 self._recursive_to_device(self.vae, original_device, vae_gpu_dtype)
         
         logger.info(f"[_decode_on_cpu] CPU decode complete, result shape={result.shape}")
-        return result  # result stays on CPU — fine for audio post-processing
+        return result  # result stays on CPU; fine for audio post-processing
     
     def tiled_encode(self, audio, chunk_size=None, overlap=None, offload_latent_to_cpu=True):
         """
@@ -4304,6 +4382,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         repainting_end: Optional[float] = None,
         instruction: str = DEFAULT_DIT_INSTRUCTION,
         audio_cover_strength: float = 1.0,
+        cover_noise_strength: float = 0.0,
         task_type: str = "text2music",
         use_adg: bool = False,
         cfg_interval_start: float = 0.0,
@@ -4335,7 +4414,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
         if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
             return {
                 "audios": [],
-                "status_message": "❌ Model not fully initialized. Please initialize all components first.",
+                "status_message": "âŒ Model not fully initialized. Please initialize all components first.",
                 "extra_outputs": {},
                 "success": False,
                 "error": "Model not fully initialized",
@@ -4398,6 +4477,17 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                     # Convert to the format expected by the service: List[List[torch.Tensor]]
                     # Each batch item has a list of reference audios
                     refer_audios = [[processed_ref_audio] for _ in range(actual_batch_size)]
+                else:
+                    return {
+                        "audios": [],
+                        "status_message": (
+                            "Reference audio is invalid, unreadable, or silent. "
+                            "Please upload a valid audible audio file."
+                        ),
+                        "extra_outputs": {},
+                        "success": False,
+                        "error": "Invalid reference audio",
+                    }
             else:
                 refer_audios = [[torch.zeros(2, 30*self.sample_rate)] for _ in range(actual_batch_size)]
 
@@ -4481,6 +4571,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                     repainting_end=repainting_end_batch,
                     instructions=instructions_batch,  # Pass instructions to service
                     audio_cover_strength=audio_cover_strength,  # Pass audio cover strength
+                    cover_noise_strength=cover_noise_strength,  # Pass cover noise strength
                     use_adg=use_adg,  # Pass use_adg parameter
                     cfg_interval_start=cfg_interval_start,  # Pass CFG interval start
                     cfg_interval_end=cfg_interval_end,  # Pass CFG interval end
@@ -4563,7 +4654,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                     logger.debug(f"[generate_music] Before VAE decode: allocated={self._memory_allocated()/1024**3:.2f}GB, max={self._max_memory_allocated()/1024**3:.2f}GB")
                     
                     # When native MLX VAE is active, bypass VRAM checks and CPU
-                    # offload entirely — MLX uses unified memory, not PyTorch VRAM.
+                    # offload entirely; MLX uses unified memory, not PyTorch VRAM.
                     _using_mlx_vae = self.use_mlx_vae and self.mlx_vae is not None
                     _vae_cpu = False
 
@@ -4572,7 +4663,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                         import os as _os
                         _vae_cpu = _os.environ.get("ACESTEP_VAE_ON_CPU", "0").lower() in ("1", "true", "yes")
                         if not _vae_cpu:
-                            # MPS (Apple Silicon) uses unified memory — get_effective_free_vram_gb()
+                            # MPS (Apple Silicon) uses unified memory; get_effective_free_vram_gb()
                             # relies on CUDA and always returns 0 on Mac, which would incorrectly
                             # force VAE decode onto the CPU.  Skip the auto-CPU logic for MPS.
                             if self.device == "mps":
@@ -4582,7 +4673,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                                 logger.info(f"[generate_music] Effective free VRAM before VAE decode: {_effective_free:.2f} GB")
                                 # If less than 0.5 GB free, VAE decode on GPU will almost certainly OOM
                                 if _effective_free < 0.5:
-                                    logger.warning(f"[generate_music] Only {_effective_free:.2f} GB free VRAM — auto-enabling CPU VAE decode")
+                                    logger.warning(f"[generate_music] Only {_effective_free:.2f} GB free VRAM; auto-enabling CPU VAE decode")
                                     _vae_cpu = True
                         if _vae_cpu:
                             logger.info("[generate_music] Moving VAE to CPU for decode (ACESTEP_VAE_ON_CPU=1)...")
@@ -4654,8 +4745,8 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
                 # Extract audio tensor: [channels, samples] format, CPU, float32
                 audio_tensor = pred_wavs[i].cpu()
                 audio_tensors.append(audio_tensor)
-
-            status_message = f"✅ Generation completed successfully!"
+            
+            status_message = "Generation completed successfully!"
             logger.info(f"[generate_music] Done! Generated {len(audio_tensors)} audio tensors.")
 
             # Extract intermediate information from outputs
@@ -4706,7 +4797,7 @@ class AceStepHandler(DiffusionMixin, InitServiceMixin, LoraManagerMixin, Progres
             }
 
         except Exception as e:
-            error_msg = f"❌ Error: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"âŒ Error: {str(e)}\n{traceback.format_exc()}"
             logger.exception("[generate_music] Generation failed")
             return {
                 "audios": [],

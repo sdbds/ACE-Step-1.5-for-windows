@@ -16,7 +16,10 @@ from typing import Dict, Any, Optional, List
 import gradio as gr
 from loguru import logger
 from acestep.gradio_ui.i18n import t
-from acestep.gradio_ui.events.generation_handlers import parse_and_validate_timesteps
+from acestep.gradio_ui.events.generation_handlers import (
+    parse_and_validate_timesteps,
+    compute_mode_ui_updates,
+)
 from acestep.inference import generate_music, GenerationParams, GenerationConfig
 from acestep.audio_utils import save_audio
 from acestep.gpu_config import (
@@ -420,60 +423,118 @@ def send_audio_to_src_with_metadata(audio_file, lm_metadata):
     )
 
 
-def _extract_metadata_for_editing(lm_metadata):
+def _extract_metadata_for_editing(lm_metadata, current_lyrics="", current_caption=""):
     """Extract lyrics and caption from lm_metadata for repaint/remix operations.
+    
+    Falls back to current UI values when lm_metadata is missing or incomplete,
+    so that existing user input is not overwritten with empty strings.
     
     Args:
         lm_metadata: Metadata dictionary from LM generation (or None)
+        current_lyrics: Current lyrics value from the UI (fallback)
+        current_caption: Current caption value from the UI (fallback)
     
     Returns:
-        Tuple of (lyrics, caption) as strings (empty strings if not found)
+        Tuple of (lyrics, caption) as strings
     """
-    lyrics = ""
-    caption = ""
+    lyrics = current_lyrics or ""
+    caption = current_caption or ""
     if lm_metadata and isinstance(lm_metadata, dict):
-        lyrics = lm_metadata.get("lyrics", "")
-        caption = lm_metadata.get("caption", "")
+        lyrics = lm_metadata.get("lyrics", lyrics)
+        caption = lm_metadata.get("caption", caption)
     return lyrics, caption
 
 
-def send_audio_to_remix(audio_file, lm_metadata):
+def send_audio_to_remix(audio_file, lm_metadata, current_lyrics, current_caption,
+                        current_mode, llm_handler=None):
     """Send generated audio to src_audio and switch mode to Remix.
-    Also populate lyrics and caption fields from the generated audio.
+
+    Also populate lyrics and caption fields from the generated audio,
+    and apply all Remix-mode UI updates atomically (visibility, labels)
+    so the UI is correct without relying on a chained .change() event.
+    
+    Args:
+        audio_file: Generated audio file path.
+        lm_metadata: LM metadata dict (may be None).
+        current_lyrics: Current lyrics text in the UI.
+        current_caption: Current caption text in the UI.
+        current_mode: The mode that is currently active (e.g. "Extract").
+        llm_handler: Optional LLM handler (for think-checkbox state).
     
     Returns:
-        Tuple of (src_audio, generation_mode, lyrics, caption)
+        Tuple of (src_audio, generation_mode, lyrics, caption,
+                  *mode_ui_updates)  — 4 + 37 = 41 values.
     """
+    # 4 data outputs + 37 mode-UI outputs
+    n_outputs = 41
     if audio_file is None:
-        return (gr.skip(),) * 4
+        return (gr.skip(),) * n_outputs
     
-    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    lyrics, caption = _extract_metadata_for_editing(
+        lm_metadata, current_lyrics, current_caption
+    )
+    
+    mode_updates = list(compute_mode_ui_updates(
+        "Remix", llm_handler, previous_mode=current_mode,
+    ))
+    # mode_updates[19] = captions, mode_updates[20] = lyrics — merge the
+    # data values into the visibility update so there are no duplicate
+    # outputs for the same component.
+    mode_updates[19] = gr.update(value=caption, visible=True, interactive=True)
+    mode_updates[20] = gr.update(value=lyrics, visible=True, interactive=True)
     
     return (
         audio_file,                       # src_audio
         gr.update(value="Remix"),         # generation_mode -> Remix
         lyrics,                           # lyrics
         caption,                          # caption
+        *mode_updates,                    # 37 mode-UI updates
     )
 
 
-def send_audio_to_repaint(audio_file, lm_metadata):
+def send_audio_to_repaint(audio_file, lm_metadata, current_lyrics, current_caption,
+                          current_mode, llm_handler=None):
     """Send generated audio to src_audio and switch mode to Repaint.
-    Also populate lyrics field with lyrics from the generated audio.
+
+    Also populate lyrics and caption fields from the generated audio,
+    and apply all Repaint-mode UI updates atomically (visibility, labels)
+    so the UI is correct without relying on a chained .change() event.
+    
+    Args:
+        audio_file: Generated audio file path.
+        lm_metadata: LM metadata dict (may be None).
+        current_lyrics: Current lyrics text in the UI.
+        current_caption: Current caption text in the UI.
+        current_mode: The mode that is currently active (e.g. "Extract").
+        llm_handler: Optional LLM handler (for think-checkbox state).
     
     Returns:
-        Tuple of (src_audio, generation_mode, lyrics, caption)
+        Tuple of (src_audio, generation_mode, lyrics, caption,
+                  *mode_ui_updates)  — 4 + 37 = 41 values.
     """
+    n_outputs = 41
     if audio_file is None:
-        return (gr.skip(),) * 4
+        return (gr.skip(),) * n_outputs
     
-    lyrics, caption = _extract_metadata_for_editing(lm_metadata)
+    lyrics, caption = _extract_metadata_for_editing(
+        lm_metadata, current_lyrics, current_caption
+    )
+    
+    mode_updates = list(compute_mode_ui_updates(
+        "Repaint", llm_handler, previous_mode=current_mode,
+    ))
+    # mode_updates[19] = captions, mode_updates[20] = lyrics — merge the
+    # data values into the visibility update so there are no duplicate
+    # outputs for the same component.
+    mode_updates[19] = gr.update(value=caption, visible=True, interactive=True)
+    mode_updates[20] = gr.update(value=lyrics, visible=True, interactive=True)
     
     return (
         audio_file,                       # src_audio
         gr.update(value="Repaint"),       # generation_mode -> Repaint
         lyrics,                           # lyrics
         caption,                          # caption
+        *mode_updates,                    # 37 mode-UI updates
     )
 
 
@@ -483,7 +544,7 @@ def generate_with_progress(
     inference_steps, guidance_scale, random_seed_checkbox, seed,
     reference_audio, audio_duration, batch_size_input, src_audio,
     text2music_audio_code_string, repainting_start, repainting_end,
-    instruction_display_gen, audio_cover_strength, task_type,
+    instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
     use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method, custom_timesteps, audio_format, lm_temperature,
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language, is_format_caption,
@@ -571,6 +632,7 @@ def generate_with_progress(
         repainting_start=repainting_start,
         repainting_end=repainting_end,
         audio_cover_strength=audio_cover_strength,
+        cover_noise_strength=cover_noise_strength,
         thinking=think_checkbox,
         lm_temperature=lm_temperature,
         lm_cfg_scale=lm_cfg_scale,
@@ -1439,7 +1501,7 @@ def capture_current_params(
     inference_steps, guidance_scale, random_seed_checkbox, seed,
     reference_audio, audio_duration, batch_size_input, src_audio,
     text2music_audio_code_string, repainting_start, repainting_end,
-    instruction_display_gen, audio_cover_strength, task_type,
+    instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
     use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method, custom_timesteps, audio_format, lm_temperature,
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language,
@@ -1476,6 +1538,7 @@ def capture_current_params(
         "repainting_end": repainting_end,
         "instruction_display_gen": instruction_display_gen,
         "audio_cover_strength": audio_cover_strength,
+        "cover_noise_strength": cover_noise_strength,
         "task_type": task_type,
         "use_adg": use_adg,
         "cfg_interval_start": cfg_interval_start,
@@ -1516,7 +1579,7 @@ def generate_with_batch_management(
     inference_steps, guidance_scale, random_seed_checkbox, seed,
     reference_audio, audio_duration, batch_size_input, src_audio,
     text2music_audio_code_string, repainting_start, repainting_end,
-    instruction_display_gen, audio_cover_strength, task_type,
+    instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
     use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method, custom_timesteps, audio_format, lm_temperature,
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language, is_format_caption,
@@ -1551,7 +1614,7 @@ def generate_with_batch_management(
         inference_steps, guidance_scale, random_seed_checkbox, seed,
         reference_audio, audio_duration, batch_size_input, src_audio,
         text2music_audio_code_string, repainting_start, repainting_end,
-        instruction_display_gen, audio_cover_strength, task_type,
+        instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
         use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method, custom_timesteps, audio_format, lm_temperature,
         think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
         use_cot_metas, use_cot_caption, use_cot_language, is_format_caption,
@@ -1636,6 +1699,7 @@ def generate_with_batch_management(
         "repainting_end": repainting_end,
         "instruction_display_gen": instruction_display_gen,
         "audio_cover_strength": audio_cover_strength,
+        "cover_noise_strength": cover_noise_strength,
         "task_type": task_type,
         "use_adg": use_adg,
         "cfg_interval_start": cfg_interval_start,
@@ -1822,6 +1886,7 @@ def generate_next_batch_background(
         params.setdefault("repainting_end", -1)
         params.setdefault("instruction_display_gen", "")
         params.setdefault("audio_cover_strength", 1.0)
+        params.setdefault("cover_noise_strength", 0.0)
         params.setdefault("task_type", "text2music")
         params.setdefault("use_adg", False)
         params.setdefault("cfg_interval_start", 0.0)
@@ -1878,6 +1943,7 @@ def generate_next_batch_background(
             repainting_end=params.get("repainting_end"),
             instruction_display_gen=params.get("instruction_display_gen"),
             audio_cover_strength=params.get("audio_cover_strength"),
+            cover_noise_strength=params.get("cover_noise_strength", 0.0),
             task_type=params.get("task_type"),
             use_adg=params.get("use_adg"),
             cfg_interval_start=params.get("cfg_interval_start"),
