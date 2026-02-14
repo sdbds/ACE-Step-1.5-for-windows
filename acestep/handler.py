@@ -195,6 +195,7 @@ class AceStepHandler(
             return False
         if not torch.cuda.is_available():
             return False
+        return True
 
     # ------------------------------------------------------------------
     # MLX DiT acceleration helpers
