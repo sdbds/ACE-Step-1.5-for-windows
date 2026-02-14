@@ -194,7 +194,7 @@
     "cover_strength_label": "オーディオカバー強度",
     "cover_strength_info": "カバーモードを使用するデノイジングステップ数を制御。",
     "remix_strength_label": "リミックス強度",
-    "remix_strength_info": "リミックスがソースオーディオからどれだけ逸脱するかを制御（低い = オリジナルに近い）。",
+    "remix_strength_info": "リミックスがソースオーディオにどれだけ忠実かを制御（高い = オリジナルに近い）。",
     "cover_noise_strength_label": "カバー強度",
     "cover_noise_strength_info": "Remixモードでのメロディ復元を制御します。推奨：SFTモデルを使用し、値を0.1〜0.25に設定。わずかに上げるとメロディが復元されますが、スタイル変換には追加のプロンプト調整が必要な場合があります。（0 = 純粋なノイズ/カバーなし、1 = オリジナルに最も近い）。",
     "score_sensitivity_label": "品質スコア感度",

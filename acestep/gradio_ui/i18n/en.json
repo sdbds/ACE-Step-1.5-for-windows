@@ -193,7 +193,7 @@
     "cover_strength_label": "Audio Cover Strength",
     "cover_strength_info": "Control how many denoising steps use cover mode.",
     "remix_strength_label": "Remix Strength",
-    "remix_strength_info": "Control how much the remix deviates from the source audio (lower = closer to original).",
+    "remix_strength_info": "Control how closely the remix follows the source audio (higher = closer to original).",
     "cover_noise_strength_label": "Cover Strength",
     "cover_noise_strength_info": "Controls melody retention in Remix mode. Recommended: use the SFT model with a value of 0.1–0.25. A small increase restores the melody, but style transfer may require additional prompt tuning. (0 = pure noise/no cover, 1 = closest to original audio).",
     "score_sensitivity_label": "Quality Score Sensitivity",

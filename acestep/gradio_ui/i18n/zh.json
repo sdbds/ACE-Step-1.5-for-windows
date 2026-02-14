@@ -194,7 +194,7 @@
     "cover_strength_label": "音频覆盖强度",
     "cover_strength_info": "控制使用覆盖模式的去噪步骤数量。",
     "remix_strength_label": "混音强度",
-    "remix_strength_info": "控制混音与原始音频的偏离程度（越低越接近原始音频）。",
+    "remix_strength_info": "控制混音对原始音频的还原程度（越高越接近原始音频）。",
     "cover_noise_strength_label": "翻唱强度",
     "cover_noise_strength_info": "控制 Remix 模式下的旋律还原程度。推荐：使用 SFT 模型，值设为 0.1–0.25。稍微提升即可还原旋律，但风格迁移可能需要额外的 prompt 调参。（0 = 纯噪声/无翻唱效果，1 = 最接近原始音频）。",
     "score_sensitivity_label": "质量评分敏感度",
