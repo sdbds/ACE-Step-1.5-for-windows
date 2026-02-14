@@ -376,6 +376,10 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["repainting_end"],
             # Previous mode state (index 33)
             generation_section["previous_generation_mode"],
+            # Mode-specific help button groups (indices 34-36)
+            generation_section["remix_help_group"],
+            generation_section["extract_help_group"],
+            generation_section["complete_help_group"],
         ]
     )
     
@@ -617,6 +621,10 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
         generation_section["repainting_end"],
         # Previous mode state (index 33)
         generation_section["previous_generation_mode"],
+        # Mode-specific help button groups (indices 34-36)
+        generation_section["remix_help_group"],
+        generation_section["extract_help_group"],
+        generation_section["complete_help_group"],
     ]
     for btn_idx in range(1, 9):
         results_section[f"send_to_remix_btn_{btn_idx}"].click(

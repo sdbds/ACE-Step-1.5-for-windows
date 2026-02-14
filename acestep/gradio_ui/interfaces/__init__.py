@@ -31,6 +31,7 @@ from acestep.gradio_ui.interfaces.generation import (
 from acestep.gradio_ui.interfaces.result import create_results_section
 from acestep.gradio_ui.interfaces.training import create_training_section
 from acestep.gradio_ui.events import setup_event_handlers, setup_training_event_handlers
+from acestep.gradio_ui.help_content import create_help_button, HELP_MODAL_CSS
 
 
 def create_gradio_interface(dit_handler, llm_handler, dataset_handler, init_params=None, language='en') -> gr.Blocks:
@@ -196,7 +197,7 @@ def create_gradio_interface(dit_handler, llm_handler, dataset_handler, init_para
             opacity: 1;
             transform: scale(1.15);
         }
-        """,
+        """ + HELP_MODAL_CSS,
     ) as demo:
         
         gr.HTML(f"""
@@ -205,6 +206,7 @@ def create_gradio_interface(dit_handler, llm_handler, dataset_handler, init_para
             <p>{t("app.subtitle")}</p>
         </div>
         """)
+        create_help_button("getting_started")
         
         # Dataset Explorer Section (hidden)
         dataset_section = create_dataset_section(dataset_handler)

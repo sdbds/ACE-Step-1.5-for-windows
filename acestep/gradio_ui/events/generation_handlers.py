@@ -1095,7 +1095,7 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
             Used to clear polluted values when leaving Extract/Lego.
 
     Returns:
-        Tuple of 34 gr.update objects matching the standard mode-change
+        Tuple of 37 gr.update objects matching the standard mode-change
         output list (see event wiring in events/__init__.py).
         Indices 0-18: original outputs.
         Indices 19-29: Extract/Lego-mode outputs (captions, lyrics, bpm,
@@ -1104,6 +1104,8 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
         Indices 30-32: dynamic repainting labels (repainting_header_html,
         repainting_start label, repainting_end label).
         Index 33: updated previous_generation_mode state.
+        Indices 34-36: mode-specific help button groups
+        (remix_help_group, extract_help_group, complete_help_group).
     """
     task_type = MODE_TO_TASK_TYPE.get(mode, "text2music")
 
@@ -1322,6 +1324,10 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
         repainting_end_update,                         # 32: repainting_end
         # --- Previous mode state (33) ---
         mode,                                          # 33: previous_generation_mode
+        # --- Mode-specific help button groups (34-36) ---
+        gr.update(visible=is_cover),                   # 34: remix_help_group
+        gr.update(visible=(is_extract or is_lego)),    # 35: extract_help_group
+        gr.update(visible=is_complete),                # 36: complete_help_group
     )
 
 
@@ -1335,7 +1341,7 @@ def handle_generation_mode_change(mode: str, previous_mode: str, llm_handler=Non
         llm_handler: Optional LLM handler.
     
     Returns:
-        Tuple of 34 updates for UI components (see output list in event wiring).
+        Tuple of 37 updates for UI components (see output list in event wiring).
     """
     return compute_mode_ui_updates(mode, llm_handler, previous_mode=previous_mode)
 

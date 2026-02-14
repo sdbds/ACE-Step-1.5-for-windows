@@ -8,6 +8,7 @@ The outer gr.Tab wrapper is now created in __init__.py.
 import os
 import gradio as gr
 from acestep.gradio_ui.i18n import t
+from acestep.gradio_ui.help_content import create_help_button
 from acestep.constants import DEBUG_TRAINING
 
 
@@ -41,6 +42,7 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
     with gr.Tabs():
         # ==================== Dataset Builder Tab ====================
         with gr.Tab(t("training.tab_dataset_builder")):
+            create_help_button("training_dataset")
             # ========== Load Existing OR Scan New ==========
             gr.HTML(f"""
             <div style="padding: 10px; margin-bottom: 10px; border: 1px solid #4a4a6a; border-radius: 8px; background: linear-gradient(135deg, #2a2a4a 0%, #1a1a3a 100%);">
@@ -352,6 +354,7 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
         
         # ==================== Training Tab ====================
         with gr.Tab(t("training.tab_train_lora")):
+            create_help_button("training_train")
             with gr.Row():
                 with gr.Column(scale=2):
                     gr.HTML(f"<h3>📊 {t('training.train_section_tensors')}</h3>")

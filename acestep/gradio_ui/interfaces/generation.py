@@ -17,6 +17,7 @@ from acestep.constants import (
     MODE_TO_TASK_TYPE,
 )
 from acestep.gradio_ui.i18n import t
+from acestep.gradio_ui.help_content import create_help_button
 from acestep.gradio_ui.events.generation_handlers import get_ui_control_config, _is_pure_base_model
 from acestep.gpu_config import get_global_gpu_config, GPUConfig, find_best_lm_model_on_disk, get_gpu_device_name, GPU_TIER_LABELS, GPU_TIER_CHOICES
 
@@ -109,6 +110,7 @@ def _create_service_config_content(dit_handler, llm_handler, defaults, init_para
     accordion_visible = not service_mode
 
     with gr.Accordion(t("service.title"), open=accordion_open, visible=accordion_visible, elem_classes=["has-info-container"]) as service_config_accordion:
+        create_help_button("service_config")
         # Language selector
         with gr.Row():
             language_dropdown = gr.Dropdown(
@@ -324,9 +326,10 @@ def create_advanced_settings_section(dit_handler, llm_handler, init_params=None,
                 lora_status = gr.Textbox(label="LoRA Status", value="No LoRA loaded", interactive=False, scale=2)
 
         # ═══════════════════════════════════════════
-        # DiT Diffusion Parameters
+        # DiT Diffusion Parameters (with help button)
         # ═══════════════════════════════════════════
         with gr.Accordion(t("generation.advanced_dit_section"), open=True, elem_classes=["has-info-container"]):
+            create_help_button("generation_advanced")
             with gr.Row():
                 inference_steps = gr.Slider(
                     minimum=_ui_config["inference_steps_minimum"],
@@ -562,6 +565,7 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
 
         # --- Simple Mode Components (only visible in Simple mode) ---
         with gr.Group(visible=False, elem_classes=["has-info-container"]) as simple_mode_group:
+            create_help_button("generation_simple")
             with gr.Row(equal_height=True):
                 simple_query_input = gr.Textbox(
                     label=t("generation.simple_query_label"),
@@ -613,6 +617,9 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
 
         # --- Track selectors (for extract/lego/complete, base model only) ---
         # Placed immediately below source audio for logical grouping
+        # Help buttons for extract/lego are shown alongside their track selectors
+        with gr.Group(visible=False) as extract_help_group:
+            create_help_button("generation_extract")
         track_name = gr.Dropdown(
             choices=TRACK_NAMES,
             value=None,
@@ -620,6 +627,8 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
             info=t("generation.track_name_info"), elem_classes=["has-info-container"],
             visible=False,
         )
+        with gr.Group(visible=False) as complete_help_group:
+            create_help_button("generation_complete")
         complete_track_classes = gr.CheckboxGroup(
             choices=TRACK_NAMES,
             label=t("generation.track_classes_label"),
@@ -665,7 +674,9 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
             visible=True,
         )
 
-        # --- Cover Strength slider (only visible in Remix mode) ---
+        # --- Cover Strength slider (only visible in Remix mode) + Remix help ---
+        with gr.Group(visible=False) as remix_help_group:
+            create_help_button("generation_remix")
         cover_noise_strength = gr.Slider(
             minimum=0.0, maximum=1.0, value=0.0, step=0.01,
             label=t("generation.cover_noise_strength_label"),
@@ -675,6 +686,7 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
 
         # --- Custom Mode: Reference Audio | (Caption + Enhance) | (Lyrics + Instrumental + Enhance) | 🎲 ---
         with gr.Group(visible=True, elem_classes=["has-info-container"]) as custom_mode_group:
+            create_help_button("generation_custom")
             with gr.Row(equal_height=True):
                 # Left: Reference Audio
                 with gr.Column(scale=2, min_width=200):
@@ -717,6 +729,7 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
 
         # --- Repainting controls (also used for Lego stem area) ---
         with gr.Group(visible=False) as repainting_group:
+            create_help_button("generation_repaint")
             repainting_header_html = gr.HTML(f"<h5>{t('generation.repainting_controls')}</h5>")
             with gr.Row():
                 repainting_start = gr.Number(label=t("generation.repainting_start"), value=0.0, step=0.1)
@@ -817,6 +830,10 @@ def create_generation_tab_section(dit_handler, llm_handler, init_params=None, la
         "generate_btn_row": generate_btn_row,
         "autogen_checkbox": autogen_checkbox,
         "auto_lrc": auto_lrc,
+        # Mode-specific help button groups (visibility toggled with mode)
+        "remix_help_group": remix_help_group,
+        "extract_help_group": extract_help_group,
+        "complete_help_group": complete_help_group,
         # GPU config values for validation (passed through)
         "max_duration": max_duration,
         "max_batch_size": max_batch_size,
