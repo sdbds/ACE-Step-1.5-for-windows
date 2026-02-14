@@ -338,9 +338,9 @@ def _safe_checkpoint_dir(user_dir: str) -> Optional[str]:
         return None
     safe_root = os.path.realpath(os.path.abspath(SAFE_CHECKPOINT_ROOT))
     if os.path.isabs(candidate):
-        normalized = os.path.realpath(candidate)
-    else:
-        normalized = os.path.realpath(os.path.join(safe_root, candidate))
+        # Reject absolute paths to prevent escaping SAFE_CHECKPOINT_ROOT
+        return None
+    normalized = os.path.realpath(os.path.join(safe_root, candidate))
     try:
         common = os.path.commonpath([safe_root, normalized])
     except ValueError:
