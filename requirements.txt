@@ -31,6 +31,7 @@ torchao===0.15.0
 toml
 huggingface_hub[hf_xet]
 modelscope
+loguru
 
 # Training dependencies (required for LoRA/LoKr training)
 peft>=0.18.0
