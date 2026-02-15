@@ -194,5 +194,95 @@ class GenerationHandlersTests(unittest.TestCase):
         self.assertEqual(batch_update["maximum"], 8)
 
 
+@unittest.skipIf(generation_handlers is None, f"generation_handlers import unavailable: {_IMPORT_ERROR}")
+class AutoCheckboxTests(unittest.TestCase):
+    """Tests for optional-parameter Auto checkbox handler functions."""
+
+    def test_on_auto_checkbox_change_checked_returns_default_and_non_interactive(self):
+        """When Auto is checked, field should reset to default and become non-interactive."""
+        result = generation_handlers.on_auto_checkbox_change(True, "bpm")
+        # gr.update returns a dict-like object; check value and interactive
+        self.assertIsNone(result["value"])
+        self.assertFalse(result["interactive"])
+
+    def test_on_auto_checkbox_change_unchecked_returns_interactive(self):
+        """When Auto is unchecked, field should become interactive (no value reset)."""
+        result = generation_handlers.on_auto_checkbox_change(False, "bpm")
+        self.assertTrue(result["interactive"])
+
+    def test_on_auto_checkbox_change_all_fields(self):
+        """All supported field names should produce valid defaults when checked."""
+        expected = {
+            "bpm": None,
+            "key_scale": "",
+            "time_signature": "",
+            "vocal_language": "unknown",
+            "audio_duration": -1,
+        }
+        for field_name, expected_value in expected.items():
+            result = generation_handlers.on_auto_checkbox_change(True, field_name)
+            self.assertEqual(result["value"], expected_value, f"Field {field_name}")
+            self.assertFalse(result["interactive"], f"Field {field_name}")
+
+    def test_reset_all_auto_returns_correct_count(self):
+        """reset_all_auto should return exactly 10 gr.update objects."""
+        result = generation_handlers.reset_all_auto()
+        self.assertEqual(len(result), 10)
+
+    def test_reset_all_auto_checkboxes_are_true(self):
+        """First 5 outputs (auto checkboxes) should all be set to True."""
+        result = generation_handlers.reset_all_auto()
+        for i in range(5):
+            self.assertTrue(result[i]["value"], f"Auto checkbox at index {i}")
+
+    def test_reset_all_auto_fields_are_defaults(self):
+        """Last 5 outputs (fields) should be reset to auto defaults."""
+        result = generation_handlers.reset_all_auto()
+        self.assertIsNone(result[5]["value"])         # bpm
+        self.assertEqual(result[6]["value"], "")       # key_scale
+        self.assertEqual(result[7]["value"], "")       # time_signature
+        self.assertEqual(result[8]["value"], "unknown") # vocal_language
+        self.assertEqual(result[9]["value"], -1)       # audio_duration
+
+    def test_uncheck_auto_for_populated_fields_all_default(self):
+        """When all fields have default values, all auto checkboxes should stay checked."""
+        result = generation_handlers.uncheck_auto_for_populated_fields(
+            bpm=None, key_scale="", time_signature="",
+            vocal_language="unknown", audio_duration=-1,
+        )
+        self.assertEqual(len(result), 10)
+        # Auto checkboxes should be True (checked)
+        for i in range(5):
+            self.assertTrue(result[i]["value"], f"Auto checkbox at index {i}")
+        # Fields should be non-interactive
+        for i in range(5, 10):
+            self.assertFalse(result[i]["interactive"], f"Field at index {i}")
+
+    def test_uncheck_auto_for_populated_fields_all_populated(self):
+        """When all fields have non-default values, all auto checkboxes should be unchecked."""
+        result = generation_handlers.uncheck_auto_for_populated_fields(
+            bpm=120, key_scale="C major", time_signature="4",
+            vocal_language="en", audio_duration=30.0,
+        )
+        # Auto checkboxes should be False (unchecked)
+        for i in range(5):
+            self.assertFalse(result[i]["value"], f"Auto checkbox at index {i}")
+        # Fields should be interactive
+        for i in range(5, 10):
+            self.assertTrue(result[i]["interactive"], f"Field at index {i}")
+
+    def test_uncheck_auto_for_populated_fields_mixed(self):
+        """Mixed populated/default fields should only uncheck populated ones."""
+        result = generation_handlers.uncheck_auto_for_populated_fields(
+            bpm=120, key_scale="", time_signature="4",
+            vocal_language="unknown", audio_duration=-1,
+        )
+        self.assertFalse(result[0]["value"])   # bpm_auto unchecked
+        self.assertTrue(result[1]["value"])    # key_auto stays checked
+        self.assertFalse(result[2]["value"])   # timesig_auto unchecked
+        self.assertTrue(result[3]["value"])    # vocal_lang_auto stays checked
+        self.assertTrue(result[4]["value"])    # duration_auto stays checked
+
+
 if __name__ == "__main__":
     unittest.main()
