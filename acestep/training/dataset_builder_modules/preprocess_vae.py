@@ -33,9 +33,6 @@ def vae_encode(vae, audio, dtype):
     if audio.device != model_device:
         audio = audio.to(model_device)
 
-    Note: Caller is responsible for ensuring audio is on the correct device
-    and dtype before calling this function (avoids per-call device probing).
-    """
     latent = vae.encode(audio).latent_dist.sample()
     target_latents = latent.transpose(1, 2).to(dtype)
     return target_latents
