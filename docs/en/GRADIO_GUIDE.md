@@ -259,7 +259,7 @@ This is where I belong
 | **Key Scale** | Auto | Musical key (e.g., "C Major", "Am", "F# minor") |
 | **Time Signature** | Auto | Time signature: 2 (2/4), 3 (3/4), 4 (4/4), 6 (6/8) |
 | **Audio Duration** | Auto/-1 | Target length in seconds (10-600). -1 for automatic |
-| **Batch Size** | 2 | Number of audio variations to generate (1-8) |
+| **Batch Size** | 2 | Number of audio variations to generate (1-8). **Value persists across mode changes and enhancement actions**. Can be set via `--batch_size` CLI argument |
 
 ---
 

@@ -162,6 +162,7 @@ def main():
     parser.add_argument("--offload_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=auto_offload, help=f"Offload models to CPU (default: {'True' if auto_offload else 'False'}, auto-detected based on GPU VRAM)")
     parser.add_argument("--offload_dit_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Offload DiT to CPU (default: False)")
     parser.add_argument("--download-source", type=str, default=None, choices=["huggingface", "modelscope", "auto"], help="Preferred model download source (default: auto-detect based on network)")
+    parser.add_argument("--batch_size", type=int, default=None, help="Default batch size for generation (1-8). Defaults to min(2, GPU_max) if not specified")
 
     # API mode argument
     parser.add_argument("--enable-api", action="store_true", help="Enable API endpoints (default: False)")
@@ -361,6 +362,7 @@ def main():
                 'language': args.language,
                 'gpu_config': gpu_config,  # Pass GPU config to UI
                 'output_dir': output_dir,  # Pass output dir to UI
+                'default_batch_size': args.batch_size,  # Pass user-specified default batch size
             }
             
             print("Service initialization completed successfully!")
@@ -374,6 +376,7 @@ def main():
                 'gpu_config': gpu_config,
                 'language': args.language,
                 'output_dir': output_dir,  # Pass output dir to UI
+                'default_batch_size': args.batch_size,  # Pass user-specified default batch size
             }
         
         demo = create_demo(init_params=init_params, language=args.language)

@@ -79,6 +79,7 @@ def setup_event_handlers(demo, dit_handler, llm_handler, dataset_handler, datase
             generation_section["quantization_checkbox"],
             generation_section["mlx_dit_checkbox"],
             generation_section["generation_mode"],  # preserve current mode across init
+            generation_section["batch_size_input"],  # preserve current batch_size across init
         ],
         outputs=[
             generation_section["init_status"], 

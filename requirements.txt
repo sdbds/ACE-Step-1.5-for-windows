@@ -1,4 +1,4 @@
-# PyTorch with CUDA 12.8 (for Windows/Linux)
+# PyTorch with CUDA 12.8 / 13.0
 safetensors==0.7.0
 --extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.9.1; sys_platform == 'win32'
@@ -47,7 +47,7 @@ mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'
 triton-windows>=3.0.0,<3.5; sys_platform == 'win32'
 triton>=3.0.0; sys_platform != 'win32'
 flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu130torch2.9.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'
-flash-attn; sys_platform != 'win32'
+flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'
 xxhash
 
 # Local package - install with: pip install -e acestep/third_parts/nano-vllm

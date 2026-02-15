@@ -591,7 +591,10 @@ class GenerateMusicRequest(BaseModel):
         description="Custom timesteps (comma-separated, e.g., '0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0'). Overrides inference_steps and shift."
     )
 
-    audio_format: str = "mp3"
+    audio_format: str = Field(
+        default="mp3",
+        description="Output audio format. Supported formats: 'flac', 'mp3', 'opus', 'aac', 'wav', 'wav32'. Default: 'mp3'"
+    )
     use_tiled_decode: bool = True
 
     # 5Hz LM (server-side): used for metadata completion and (when thinking=True) codes generation.

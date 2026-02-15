@@ -35,7 +35,14 @@ def _compute_init_defaults(dit_handler, llm_handler, init_params, language):
     lm_initialized = init_params.get('init_llm', False) if init_params else False
     max_duration = gpu_config.max_duration_with_lm if lm_initialized else gpu_config.max_duration_without_lm
     max_batch_size = gpu_config.max_batch_size_with_lm if lm_initialized else gpu_config.max_batch_size_without_lm
-    default_batch_size = min(2, max_batch_size)
+    
+    # Use CLI-specified default batch size if provided, otherwise default to min(2, max_batch_size)
+    cli_batch_size = (init_params or {}).get('default_batch_size')
+    if cli_batch_size is not None:
+        default_batch_size = min(cli_batch_size, max_batch_size)
+    else:
+        default_batch_size = min(2, max_batch_size)
+    
     init_lm_default = gpu_config.init_lm_default
     
     default_offload = gpu_config.offload_to_cpu_default
@@ -421,7 +428,7 @@ def create_advanced_settings_section(dit_handler, llm_handler, init_params=None,
         with gr.Accordion(t("generation.advanced_output_section"), open=False, elem_classes=["has-info-container"]):
             with gr.Row():
                 audio_format = gr.Dropdown(
-                    choices=[("FLAC", "flac"), ("MP3", "mp3"), ("WAV (16-bit)", "wav"), ("WAV (32-bit Float)", "wav32")],
+                    choices=[("FLAC", "flac"), ("MP3", "mp3"), ("Opus", "opus"), ("AAC", "aac"), ("WAV (16-bit)", "wav"), ("WAV (32-bit Float)", "wav32")],
                     value="mp3",
                     label=t("generation.audio_format_label"),
                     info=t("generation.audio_format_info"), elem_classes=["has-info-container"],
