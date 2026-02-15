@@ -283,7 +283,24 @@ if [[ ! -d "$SCRIPT_DIR/.venv" ]]; then
     echo "Running: uv sync"
     echo
 
-    cd "$SCRIPT_DIR" && uv sync
+    if ! (cd "$SCRIPT_DIR" && uv sync); then
+        echo
+        echo "[Retry] Online sync failed, retrying in offline mode..."
+        echo
+        if ! (cd "$SCRIPT_DIR" && uv sync --offline); then
+            echo
+            echo "========================================"
+            echo "[Error] Failed to setup environment"
+            echo "========================================"
+            echo
+            echo "Both online and offline modes failed."
+            echo "Please check:"
+            echo "  1. Your internet connection (required for first-time setup)"
+            echo "  2. Ensure you have enough disk space"
+            echo "  3. Try running: uv sync manually"
+            exit 1
+        fi
+    fi
 
     echo
     echo "========================================"
@@ -296,18 +313,35 @@ echo "Starting ACE-Step Gradio UI..."
 echo
 
 # Build command with optional parameters
-CMD="uv run acestep --port $PORT --server-name $SERVER_NAME --language $LANGUAGE"
-[[ -n "$SHARE" ]] && CMD="$CMD $SHARE"
-[[ -n "$CONFIG_PATH" ]] && CMD="$CMD $CONFIG_PATH"
-[[ -n "$LM_MODEL_PATH" ]] && CMD="$CMD $LM_MODEL_PATH"
-[[ -n "$OFFLOAD_TO_CPU" ]] && CMD="$CMD $OFFLOAD_TO_CPU"
-[[ -n "$INIT_LLM" ]] && CMD="$CMD $INIT_LLM"
-[[ -n "$DOWNLOAD_SOURCE" ]] && CMD="$CMD $DOWNLOAD_SOURCE"
-[[ -n "$INIT_SERVICE" ]] && CMD="$CMD $INIT_SERVICE"
-[[ -n "$BATCH_SIZE" ]] && CMD="$CMD $BATCH_SIZE"
-[[ -n "$ENABLE_API" ]] && CMD="$CMD $ENABLE_API"
-[[ -n "$API_KEY" ]] && CMD="$CMD $API_KEY"
-[[ -n "$AUTH_USERNAME" ]] && CMD="$CMD $AUTH_USERNAME"
-[[ -n "$AUTH_PASSWORD" ]] && CMD="$CMD $AUTH_PASSWORD"
+ACESTEP_ARGS="acestep --port $PORT --server-name $SERVER_NAME --language $LANGUAGE"
+[[ -n "$SHARE" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $SHARE"
+[[ -n "$CONFIG_PATH" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $CONFIG_PATH"
+[[ -n "$LM_MODEL_PATH" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $LM_MODEL_PATH"
+[[ -n "$OFFLOAD_TO_CPU" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $OFFLOAD_TO_CPU"
+[[ -n "$INIT_LLM" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $INIT_LLM"
+[[ -n "$DOWNLOAD_SOURCE" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $DOWNLOAD_SOURCE"
+[[ -n "$INIT_SERVICE" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $INIT_SERVICE"
+[[ -n "$BATCH_SIZE" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $BATCH_SIZE"
+[[ -n "$ENABLE_API" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $ENABLE_API"
+[[ -n "$API_KEY" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $API_KEY"
+[[ -n "$AUTH_USERNAME" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $AUTH_USERNAME"
+[[ -n "$AUTH_PASSWORD" ]] && ACESTEP_ARGS="$ACESTEP_ARGS $AUTH_PASSWORD"
 
-cd "$SCRIPT_DIR" && $CMD
+cd "$SCRIPT_DIR" && uv run $ACESTEP_ARGS || {
+    echo
+    echo "[Retry] Online dependency resolution failed, retrying in offline mode..."
+    echo
+    uv run --offline $ACESTEP_ARGS || {
+        echo
+        echo "========================================"
+        echo "[Error] Failed to start ACE-Step"
+        echo "========================================"
+        echo
+        echo "Both online and offline modes failed."
+        echo "Please check:"
+        echo "  1. Your internet connection (for first-time setup)"
+        echo "  2. If dependencies were previously installed (offline mode requires a prior successful install)"
+        echo "  3. Try running: uv sync --offline"
+        exit 1
+    }
+}
