@@ -623,10 +623,12 @@ class GenerateMusicRequest(BaseModel):
 
 
 class LoadLoRARequest(BaseModel):
-    lora_path: str = Field(..., description="Path to LoRA adapter directory")
+    lora_path: str = Field(..., description="Path to LoRA adapter directory or LoKr/LyCORIS safetensors file")
+    adapter_name: Optional[str] = Field(default=None, description="Optional adapter name (uses path-derived name if omitted)")
 
 
 class SetLoRAScaleRequest(BaseModel):
+    adapter_name: Optional[str] = Field(default=None, description="Optional adapter name; defaults to active adapter")
     scale: float = Field(..., ge=0.0, le=1.0, description="LoRA scale (0.0-1.0)")
 
 
@@ -3439,10 +3441,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="Model not initialized")
 
         try:
-            result = handler.load_lora(request.lora_path)
+            adapter_name = request.adapter_name.strip() if isinstance(request.adapter_name, str) else None
+            if adapter_name:
+                result = handler.add_lora(request.lora_path, adapter_name=adapter_name)
+            else:
+                result = handler.load_lora(request.lora_path)
 
             if result.startswith("✅"):
-                return _wrap_response({"message": result, "lora_path": request.lora_path})
+                response_data = {"message": result, "lora_path": request.lora_path}
+                if adapter_name:
+                    response_data["adapter_name"] = adapter_name
+                return _wrap_response(response_data)
             else:
                 raise HTTPException(status_code=400, detail=result)
         except HTTPException:
@@ -3497,10 +3506,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="Model not initialized")
 
         try:
-            result = handler.set_lora_scale(request.scale)
+            adapter_name = request.adapter_name.strip() if isinstance(request.adapter_name, str) else None
+            if adapter_name:
+                result = handler.set_lora_scale(adapter_name, request.scale)
+            else:
+                result = handler.set_lora_scale(request.scale)
 
             if result.startswith("✅") or result.startswith("⚠️"):
-                return _wrap_response({"message": result, "scale": request.scale})
+                response_data = {"message": result, "scale": request.scale}
+                if adapter_name:
+                    response_data["adapter_name"] = adapter_name
+                return _wrap_response(response_data)
             else:
                 return _wrap_response(None, code=400, error=result)
         except Exception as e:
@@ -3514,11 +3530,18 @@ def create_app() -> FastAPI:
         if handler is None or handler.model is None:
             raise HTTPException(status_code=500, detail="Model not initialized")
 
+        status = handler.get_lora_status()
         return _wrap_response({
-            "lora_loaded": bool(getattr(handler, "lora_loaded", False)),
-            "use_lora": bool(getattr(handler, "use_lora", False)),
-            "lora_scale": float(getattr(handler, "lora_scale", 1.0)),
+            # Legacy fields for existing clients
+            "lora_loaded": bool(status.get("loaded", getattr(handler, "lora_loaded", False))),
+            "use_lora": bool(status.get("active", getattr(handler, "use_lora", False))),
+            "lora_scale": float(status.get("scale", getattr(handler, "lora_scale", 1.0))),
             "adapter_type": getattr(handler, "_adapter_type", None),
+            # Extended fields from refactored LoRA service
+            "scales": status.get("scales", {}),
+            "active_adapter": status.get("active_adapter"),
+            "adapters": status.get("adapters", []),
+            "synthetic_default_mode": bool(status.get("synthetic_default_mode", False)),
         })
 
     @app.post("/v1/dataset/scan")
