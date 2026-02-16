@@ -35,7 +35,7 @@ try:
     from .handler import AceStepHandler
     from .llm_inference import LLMHandler
     from .dataset_handler import DatasetHandler
-    from .gradio_ui import create_gradio_interface
+    from .ui.gradio import create_gradio_interface
     from .gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB, VRAM_AUTO_OFFLOAD_THRESHOLD_GB, is_mps_platform
     from .model_downloader import ensure_lm_model
 except ImportError:
@@ -46,7 +46,7 @@ except ImportError:
     from acestep.handler import AceStepHandler
     from acestep.llm_inference import LLMHandler
     from acestep.dataset_handler import DatasetHandler
-    from acestep.gradio_ui import create_gradio_interface
+    from acestep.ui.gradio import create_gradio_interface
     from acestep.gpu_config import get_gpu_config, get_gpu_memory_gb, print_gpu_config_info, set_global_gpu_config, VRAM_16GB_MIN_GB, VRAM_AUTO_OFFLOAD_THRESHOLD_GB, is_mps_platform
     from acestep.model_downloader import ensure_lm_model
 
@@ -160,7 +160,10 @@ def main():
     parser.add_argument("--backend", type=str, default=_default_backend, choices=["vllm", "pt", "mlx"], help=f"5Hz LM backend (default: {_default_backend}, use 'mlx' for native Apple Silicon acceleration)")
     parser.add_argument("--use_flash_attention", type=lambda x: x.lower() in ['true', '1', 'yes'], default=None, help="Use flash attention (default: auto-detect)")
     parser.add_argument("--offload_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=auto_offload, help=f"Offload models to CPU (default: {'True' if auto_offload else 'False'}, auto-detected based on GPU VRAM)")
-    parser.add_argument("--offload_dit_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=False, help="Offload DiT to CPU (default: False)")
+    _default_offload_dit = gpu_config.offload_dit_to_cpu_default if not _is_mac else False
+    parser.add_argument("--offload_dit_to_cpu", type=lambda x: x.lower() in ['true', '1', 'yes'], default=_default_offload_dit, help=f"Offload DiT to CPU after diffusion (default: {_default_offload_dit}, auto-detected based on GPU tier)")
+    _default_quantization = "int8_weight_only" if (gpu_config.quantization_default and not _is_mac) else None
+    parser.add_argument("--quantization", type=str, default=_default_quantization, choices=["int8_weight_only", "int4_weight_only", None], help=f"DiT quantization method (default: {_default_quantization}, auto-detected based on GPU tier)")
     parser.add_argument("--download-source", type=str, default=None, choices=["huggingface", "modelscope", "auto"], help="Preferred model download source (default: auto-detect based on network)")
     parser.add_argument("--batch_size", type=int, default=None, help="Default batch size for generation (1-8). Defaults to min(2, GPU_max) if not specified")
 
@@ -271,6 +274,9 @@ def main():
             compile_model = os.environ.get(
                 "ACESTEP_COMPILE_MODEL", ""
             ).strip().lower() in {"1", "true", "yes", "y", "on"}
+            # compile_model must be True when quantization is used
+            if args.quantization and not compile_model:
+                compile_model = True
 
             init_status, enable_generate = dit_handler.initialize_service(
                 project_root=project_root,
@@ -280,6 +286,7 @@ def main():
                 compile_model=compile_model,
                 offload_to_cpu=args.offload_to_cpu,
                 offload_dit_to_cpu=args.offload_dit_to_cpu,
+                quantization=args.quantization,
                 prefer_source=prefer_source
             )
             
@@ -355,6 +362,7 @@ def main():
                 'use_flash_attention': use_flash_attention,
                 'offload_to_cpu': args.offload_to_cpu,
                 'offload_dit_to_cpu': args.offload_dit_to_cpu,
+                'quantization': args.quantization,
                 'init_status': init_status,
                 'enable_generate': enable_generate,
                 'dit_handler': dit_handler,
@@ -406,7 +414,7 @@ def main():
         # Enable API endpoints if requested
         if args.enable_api:
             print("Enabling API endpoints...")
-            from acestep.gradio_ui.api_routes import setup_api_routes
+            from acestep.ui.gradio.api.api_routes import setup_api_routes
 
             # Launch Gradio first with prevent_thread_lock=True
             demo.launch(

@@ -8,6 +8,8 @@ from .conditioning_masks import ConditioningMaskMixin
 from .conditioning_target import ConditioningTargetMixin
 from .conditioning_text import ConditioningTextMixin
 from .diffusion import DiffusionMixin
+from .generate_music_execute import GenerateMusicExecuteMixin
+from .generate_music_request import GenerateMusicRequestMixin
 from .init_service import InitServiceMixin
 from .io_audio import IoAudioMixin
 from .lyric_score import LyricScoreMixin
@@ -22,6 +24,10 @@ from .service_generate_execute import ServiceGenerateExecuteMixin
 from .service_generate_outputs import ServiceGenerateOutputsMixin
 from .service_generate_request import ServiceGenerateRequestMixin
 from .task_utils import TaskUtilsMixin
+from .vae_decode import VaeDecodeMixin
+from .vae_decode_chunks import VaeDecodeChunksMixin
+from .vae_encode import VaeEncodeMixin
+from .vae_encode_chunks import VaeEncodeChunksMixin
 
 __all__ = [
     "AudioCodesMixin",
@@ -32,6 +38,8 @@ __all__ = [
     "ConditioningTargetMixin",
     "ConditioningTextMixin",
     "DiffusionMixin",
+    "GenerateMusicExecuteMixin",
+    "GenerateMusicRequestMixin",
     "InitServiceMixin",
     "IoAudioMixin",
     "LyricScoreMixin",
@@ -46,4 +54,8 @@ __all__ = [
     "ServiceGenerateOutputsMixin",
     "ServiceGenerateRequestMixin",
     "TaskUtilsMixin",
+    "VaeDecodeMixin",
+    "VaeDecodeChunksMixin",
+    "VaeEncodeMixin",
+    "VaeEncodeChunksMixin",
 ]

@@ -112,6 +112,8 @@ class TrainingConfig:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     mixed_precision: str = "bf16"
+    use_fp8: bool = False
+    gradient_checkpointing: bool = False
     seed: int = 42
     output_dir: str = "./lora_output"
     use_fp8: bool = False  # Use FP8 quantization for decoder weights
@@ -148,6 +150,8 @@ class TrainingConfig:
             "weight_decay": self.weight_decay,
             "max_grad_norm": self.max_grad_norm,
             "mixed_precision": self.mixed_precision,
+            "use_fp8": self.use_fp8,
+            "gradient_checkpointing": self.gradient_checkpointing,
             "seed": self.seed,
             "output_dir": self.output_dir,
             "use_fp8": self.use_fp8,

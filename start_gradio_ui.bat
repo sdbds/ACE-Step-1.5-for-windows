@@ -268,18 +268,25 @@ if exist "%~dp0python_embeded\python.exe" (
 
         if !ERRORLEVEL! NEQ 0 (
             echo.
-            echo ========================================
-            echo [Error] Failed to setup environment
-            echo ========================================
+            echo [Retry] Online sync failed, retrying in offline mode...
             echo.
-            echo Please check the error messages above.
-            echo You may need to:
-            echo   1. Check your internet connection
-            echo   2. Ensure you have enough disk space
-            echo   3. Try running: uv sync manually
-            echo.
-            pause
-            exit /b 1
+            uv sync --offline
+
+            if !ERRORLEVEL! NEQ 0 (
+                echo.
+                echo ========================================
+                echo [Error] Failed to setup environment
+                echo ========================================
+                echo.
+                echo Both online and offline modes failed.
+                echo Please check:
+                echo   1. Your internet connection ^(required for first-time setup^)
+                echo   2. Ensure you have enough disk space
+                echo   3. Try running: uv sync manually
+                echo.
+                pause
+                exit /b 1
+            )
         )
 
         echo.
@@ -293,21 +300,42 @@ if exist "%~dp0python_embeded\python.exe" (
     echo.
 
     REM Build command with optional parameters
-    set "CMD=uv run acestep --port %PORT% --server-name %SERVER_NAME% --language %LANGUAGE%"
-    if not "%SHARE%"=="" set "CMD=!CMD! %SHARE%"
-    if not "%CONFIG_PATH%"=="" set "CMD=!CMD! %CONFIG_PATH%"
-    if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
-    if not "%OFFLOAD_TO_CPU%"=="" set "CMD=!CMD! %OFFLOAD_TO_CPU%"
-    if not "%INIT_LLM%"=="" set "CMD=!CMD! %INIT_LLM%"
-    if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
-    if not "%INIT_SERVICE%"=="" set "CMD=!CMD! %INIT_SERVICE%"
-    if not "%BATCH_SIZE%"=="" set "CMD=!CMD! %BATCH_SIZE%"
-    if not "%ENABLE_API%"=="" set "CMD=!CMD! %ENABLE_API%"
-    if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
-    if not "%AUTH_USERNAME%"=="" set "CMD=!CMD! %AUTH_USERNAME%"
-    if not "%AUTH_PASSWORD%"=="" set "CMD=!CMD! %AUTH_PASSWORD%"
+    set "ACESTEP_ARGS=acestep --port %PORT% --server-name %SERVER_NAME% --language %LANGUAGE%"
+    if not "%SHARE%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %SHARE%"
+    if not "%CONFIG_PATH%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %CONFIG_PATH%"
+    if not "%LM_MODEL_PATH%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %LM_MODEL_PATH%"
+    if not "%OFFLOAD_TO_CPU%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %OFFLOAD_TO_CPU%"
+    if not "%INIT_LLM%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %INIT_LLM%"
+    if not "%DOWNLOAD_SOURCE%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %DOWNLOAD_SOURCE%"
+    if not "%INIT_SERVICE%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %INIT_SERVICE%"
+    if not "%BATCH_SIZE%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %BATCH_SIZE%"
+    if not "%ENABLE_API%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %ENABLE_API%"
+    if not "%API_KEY%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %API_KEY%"
+    if not "%AUTH_USERNAME%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %AUTH_USERNAME%"
+    if not "%AUTH_PASSWORD%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %AUTH_PASSWORD%"
 
-    !CMD!
+    uv run !ACESTEP_ARGS!
+    if !ERRORLEVEL! NEQ 0 (
+        echo.
+        echo [Retry] Online dependency resolution failed, retrying in offline mode...
+        echo.
+        uv run --offline !ACESTEP_ARGS!
+        if !ERRORLEVEL! NEQ 0 (
+            echo.
+            echo ========================================
+            echo [Error] Failed to start ACE-Step
+            echo ========================================
+            echo.
+            echo Both online and offline modes failed.
+            echo Please check:
+            echo   1. Your internet connection ^(for first-time setup^)
+            echo   2. If dependencies were previously installed ^(offline mode requires a prior successful install^)
+            echo   3. Try running: uv sync --offline
+            echo.
+            pause
+            exit /b 1
+        )
+    )
 )
 
 pause

@@ -38,7 +38,7 @@ from acestep.model_downloader import (
     check_model_exists,
     get_checkpoints_dir,
 )
-from acestep.constants import DEFAULT_DIT_INSTRUCTION, SFT_GEN_PROMPT, TASK_INSTRUCTIONS
+from acestep.constants import DEFAULT_DIT_INSTRUCTION, SFT_GEN_PROMPT
 from acestep.core.generation.handler import (
     AudioCodesMixin,
     BatchPrepMixin,
@@ -48,6 +48,8 @@ from acestep.core.generation.handler import (
     ConditioningTargetMixin,
     ConditioningTextMixin,
     DiffusionMixin,
+    GenerateMusicExecuteMixin,
+    GenerateMusicRequestMixin,
     InitServiceMixin,
     IoAudioMixin,
     LyricScoreMixin,
@@ -59,6 +61,10 @@ from acestep.core.generation.handler import (
     ProgressMixin,
     PromptMixin,
     TaskUtilsMixin,
+    VaeDecodeChunksMixin,
+    VaeDecodeMixin,
+    VaeEncodeChunksMixin,
+    VaeEncodeMixin,
     ServiceGenerateRequestMixin,
     ServiceGenerateExecuteMixin,
     ServiceGenerateOutputsMixin,
@@ -71,6 +77,8 @@ warnings.filterwarnings("ignore")
 
 class AceStepHandler(
     DiffusionMixin,
+    GenerateMusicExecuteMixin,
+    GenerateMusicRequestMixin,
     AudioCodesMixin,
     BatchPrepMixin,
     ConditioningBatchMixin,
@@ -89,6 +97,10 @@ class AceStepHandler(
     ProgressMixin,
     PromptMixin,
     TaskUtilsMixin,
+    VaeDecodeChunksMixin,
+    VaeDecodeMixin,
+    VaeEncodeChunksMixin,
+    VaeEncodeMixin,
     ServiceGenerateRequestMixin,
     ServiceGenerateExecuteMixin,
     ServiceGenerateOutputsMixin,
@@ -177,13 +189,13 @@ class AceStepHandler(
         Returns True on success, False on failure (non-fatal).
         """
         try:
-            from acestep.mlx_dit import mlx_available
+            from acestep.models.mlx import mlx_available
             if not mlx_available():
                 logger.info("[MLX-DiT] MLX not available on this platform; skipping.")
                 return False
 
-            from acestep.mlx_dit.model import MLXDiTDecoder
-            from acestep.mlx_dit.convert import convert_and_load
+            from acestep.models.mlx.dit_model import MLXDiTDecoder
+            from acestep.models.mlx.dit_convert import convert_and_load
 
             mlx_decoder = MLXDiTDecoder.from_config(self.config)
             convert_and_load(self.model, mlx_decoder)
@@ -221,7 +233,7 @@ class AceStepHandler(
         Returns True on success, False on failure (non-fatal).
         """
         try:
-            from acestep.mlx_vae import mlx_available
+            from acestep.models.mlx import mlx_available
             if not mlx_available():
                 logger.info("[MLX-VAE] MLX not available on this platform; skipping.")
                 return False
@@ -229,8 +241,8 @@ class AceStepHandler(
             import os
             import mlx.core as mx
             from mlx.utils import tree_map
-            from acestep.mlx_vae.model import MLXAutoEncoderOobleck
-            from acestep.mlx_vae.convert import convert_and_load
+            from acestep.models.mlx.vae_model import MLXAutoEncoderOobleck
+            from acestep.models.mlx.vae_convert import convert_and_load
 
             mlx_vae = MLXAutoEncoderOobleck.from_pytorch_config(self.vae)
             convert_and_load(self.vae, mlx_vae)
@@ -1065,527 +1077,6 @@ class AceStepHandler(
             context_latents=context_latents,
         )
 
-    # MPS-safe chunk parameters (class-level for testability)
-    _MPS_DECODE_CHUNK_SIZE = 32
-    _MPS_DECODE_OVERLAP = 8
-
-    def tiled_decode(self, latents, chunk_size: Optional[int] = None, overlap: int = 64, offload_wav_to_cpu: Optional[bool] = None):
-        """
-        Decode latents using tiling to reduce VRAM usage.
-        Uses overlap-discard strategy to avoid boundary artifacts.
-        
-        Args:
-            latents: [Batch, Channels, Length]
-            chunk_size: Size of latent chunk to process at once (auto-tuned if None)
-            overlap: Overlap size in latent frames
-            offload_wav_to_cpu: If True, offload decoded wav audio to CPU immediately to save VRAM
-        """
-        # ---- MLX fast path (macOS Apple Silicon) ----
-        if self.use_mlx_vae and self.mlx_vae is not None:
-            try:
-                result = self._mlx_vae_decode(latents)
-                return result
-            except Exception as exc:
-                logger.warning(
-                    f"[tiled_decode] MLX VAE decode failed ({type(exc).__name__}: {exc}), "
-                    f"falling back to PyTorch VAE..."
-                )
-
-        # ---- PyTorch path (CUDA / MPS / CPU) ----
-        if chunk_size is None:
-            chunk_size = self._get_auto_decode_chunk_size()
-        if offload_wav_to_cpu is None:
-            offload_wav_to_cpu = self._should_offload_wav_to_cpu()
-        
-        logger.info(f"[tiled_decode] chunk_size={chunk_size}, offload_wav_to_cpu={offload_wav_to_cpu}, latents_shape={latents.shape}")
-        
-        # MPS Conv1d has a hard output-size limit that the OobleckDecoder
-        # exceeds during temporal upsampling with large chunks.  Reduce
-        # chunk_size to keep each VAE decode within the MPS kernel limits
-        # while keeping computation on the fast MPS accelerator.
-        _is_mps = (self.device == "mps")
-        if _is_mps:
-            _mps_chunk = self._MPS_DECODE_CHUNK_SIZE
-            _mps_overlap = self._MPS_DECODE_OVERLAP
-            _needs_reduction = (chunk_size > _mps_chunk) or (overlap > _mps_overlap)
-            if _needs_reduction:
-                logger.info(
-                    f"[tiled_decode] VAE decode via PyTorch MPS; reducing chunk_size from {chunk_size} "
-                    f"to {min(chunk_size, _mps_chunk)} and overlap from {overlap} "
-                    f"to {min(overlap, _mps_overlap)} to avoid MPS conv output limit."
-                )
-                chunk_size = min(chunk_size, _mps_chunk)
-                overlap = min(overlap, _mps_overlap)
-        
-        try:
-            return self._tiled_decode_inner(latents, chunk_size, overlap, offload_wav_to_cpu)
-        except (NotImplementedError, RuntimeError) as exc:
-            if not _is_mps:
-                raise  # only catch MPS-related errors
-            # Safety fallback: if the MPS tiled path still fails (e.g. very
-            # short latent that went through direct decode, or a future PyTorch
-            # MPS regression), transparently retry on CPU.
-            logger.warning(
-                f"[tiled_decode] MPS decode failed ({type(exc).__name__}: {exc}), "
-                f"falling back to CPU VAE decode..."
-            )
-            return self._tiled_decode_cpu_fallback(latents)
-
-    def _tiled_decode_cpu_fallback(self, latents):
-        """Last-resort CPU VAE decode when MPS fails unexpectedly."""
-        _first_param = next(self.vae.parameters())
-        vae_device = _first_param.device
-        vae_dtype = _first_param.dtype
-        try:
-            self.vae = self.vae.cpu().float()
-            latents_cpu = latents.to(device="cpu", dtype=torch.float32)
-            decoder_output = self.vae.decode(latents_cpu)
-            result = decoder_output.sample
-            del decoder_output
-            return result
-        finally:
-            # Always restore VAE to original device/dtype
-            self.vae = self.vae.to(vae_dtype).to(vae_device)
-
-    def _tiled_decode_inner(self, latents, chunk_size, overlap, offload_wav_to_cpu):
-        """Core tiled decode logic (extracted for fallback wrapping)."""
-        B, C, T = latents.shape
-        
-        # ---- Batch-sequential decode ----
-        # VAE decode VRAM scales linearly with batch size.  On tight-VRAM GPUs
-        # (e.g. 8 GB) decoding the whole batch at once can OOM.  Process one
-        # sample at a time so peak VRAM stays constant regardless of batch size.
-        if B > 1:
-            logger.info(f"[tiled_decode] Batch size {B} > 1; decoding samples sequentially to save VRAM")
-            per_sample_results = []
-            for b_idx in range(B):
-                single = latents[b_idx : b_idx + 1]  # [1, C, T]
-                decoded = self._tiled_decode_inner(single, chunk_size, overlap, offload_wav_to_cpu)
-                # Move to CPU immediately to free GPU VRAM for next sample
-                per_sample_results.append(decoded.cpu() if decoded.device.type != "cpu" else decoded)
-                self._empty_cache()
-            # Concatenate on CPU then move back if needed
-            result = torch.cat(per_sample_results, dim=0)  # [B, channels, samples]
-            if latents.device.type != "cpu" and not offload_wav_to_cpu:
-                result = result.to(latents.device)
-            return result
-        
-        # Adjust overlap for very small chunk sizes to ensure positive stride
-        effective_overlap = overlap
-        while chunk_size - 2 * effective_overlap <= 0 and effective_overlap > 0:
-            effective_overlap = effective_overlap // 2
-        if effective_overlap != overlap:
-            logger.warning(f"[tiled_decode] Reduced overlap from {overlap} to {effective_overlap} for chunk_size={chunk_size}")
-        overlap = effective_overlap
-        
-        # If short enough, decode directly
-        if T <= chunk_size:
-            try:
-                decoder_output = self.vae.decode(latents)
-                result = decoder_output.sample
-                del decoder_output
-                return result
-            except torch.cuda.OutOfMemoryError:
-                logger.warning("[tiled_decode] OOM on direct decode, falling back to CPU VAE decode")
-                self._empty_cache()
-                return self._decode_on_cpu(latents)
-
-        # Calculate stride (core size)
-        stride = chunk_size - 2 * overlap
-        if stride <= 0:
-            raise ValueError(f"chunk_size {chunk_size} must be > 2 * overlap {overlap}")
-        
-        num_steps = math.ceil(T / stride)
-        
-        if offload_wav_to_cpu:
-            # Optimized path: offload wav to CPU immediately to save VRAM
-            try:
-                return self._tiled_decode_offload_cpu(latents, B, T, stride, overlap, num_steps)
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(f"[tiled_decode] OOM during offload_cpu decode with chunk_size={chunk_size}, falling back to CPU VAE decode")
-                self._empty_cache()
-                return self._decode_on_cpu(latents)
-        else:
-            # Default path: keep everything on GPU
-            try:
-                return self._tiled_decode_gpu(latents, B, T, stride, overlap, num_steps)
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(f"[tiled_decode] OOM during GPU decode with chunk_size={chunk_size}, falling back to CPU offload path")
-                self._empty_cache()
-                try:
-                    return self._tiled_decode_offload_cpu(latents, B, T, stride, overlap, num_steps)
-                except torch.cuda.OutOfMemoryError:
-                    logger.warning("[tiled_decode] OOM even with offload path, falling back to full CPU VAE decode")
-                    self._empty_cache()
-                    return self._decode_on_cpu(latents)
-    
-    def _tiled_decode_gpu(self, latents, B, T, stride, overlap, num_steps):
-        """Standard tiled decode keeping all data on GPU."""
-        decoded_audio_list = []
-        upsample_factor = None
-        
-        for i in tqdm(range(num_steps), desc="Decoding audio chunks", disable=self.disable_tqdm):
-            # Core range in latents
-            core_start = i * stride
-            core_end = min(core_start + stride, T)
-            
-            # Window range (with overlap)
-            win_start = max(0, core_start - overlap)
-            win_end = min(T, core_end + overlap)
-            
-            # Extract chunk
-            latent_chunk = latents[:, :, win_start:win_end]
-            
-            # Decode
-            # [Batch, Channels, AudioSamples]
-            decoder_output = self.vae.decode(latent_chunk)
-            audio_chunk = decoder_output.sample
-            del decoder_output
-            
-            # Determine upsample factor from the first chunk
-            if upsample_factor is None:
-                upsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-            
-            # Calculate trim amounts in audio samples
-            # How much overlap was added at the start?
-            added_start = core_start - win_start  # latent frames
-            trim_start = int(round(added_start * upsample_factor))
-            
-            # How much overlap was added at the end?
-            added_end = win_end - core_end  # latent frames
-            trim_end = int(round(added_end * upsample_factor))
-            
-            # Trim audio
-            audio_len = audio_chunk.shape[-1]
-            end_idx = audio_len - trim_end if trim_end > 0 else audio_len
-            
-            audio_core = audio_chunk[:, :, trim_start:end_idx]
-            decoded_audio_list.append(audio_core)
-            
-        # Concatenate
-        final_audio = torch.cat(decoded_audio_list, dim=-1)
-        return final_audio
-    
-    def _tiled_decode_offload_cpu(self, latents, B, T, stride, overlap, num_steps):
-        """Optimized tiled decode that offloads to CPU immediately to save VRAM."""
-        # First pass: decode first chunk to get upsample_factor and audio channels
-        first_core_start = 0
-        first_core_end = min(stride, T)
-        first_win_start = 0
-        first_win_end = min(T, first_core_end + overlap)
-        
-        first_latent_chunk = latents[:, :, first_win_start:first_win_end]
-        first_decoder_output = self.vae.decode(first_latent_chunk)
-        first_audio_chunk = first_decoder_output.sample
-        del first_decoder_output
-        
-        upsample_factor = first_audio_chunk.shape[-1] / first_latent_chunk.shape[-1]
-        audio_channels = first_audio_chunk.shape[1]
-        
-        # Calculate total audio length and pre-allocate CPU tensor
-        total_audio_length = int(round(T * upsample_factor))
-        final_audio = torch.zeros(B, audio_channels, total_audio_length, 
-                                  dtype=first_audio_chunk.dtype, device='cpu')
-        
-        # Process first chunk: trim and copy to CPU
-        first_added_end = first_win_end - first_core_end
-        first_trim_end = int(round(first_added_end * upsample_factor))
-        first_audio_len = first_audio_chunk.shape[-1]
-        first_end_idx = first_audio_len - first_trim_end if first_trim_end > 0 else first_audio_len
-        
-        first_audio_core = first_audio_chunk[:, :, :first_end_idx]
-        audio_write_pos = first_audio_core.shape[-1]
-        final_audio[:, :, :audio_write_pos] = first_audio_core.cpu()
-        
-        # Free GPU memory
-        del first_audio_chunk, first_audio_core, first_latent_chunk
-        
-        # Process remaining chunks
-        for i in tqdm(range(1, num_steps), desc="Decoding audio chunks", disable=self.disable_tqdm):
-            # Core range in latents
-            core_start = i * stride
-            core_end = min(core_start + stride, T)
-            
-            # Window range (with overlap)
-            win_start = max(0, core_start - overlap)
-            win_end = min(T, core_end + overlap)
-            
-            # Extract chunk
-            latent_chunk = latents[:, :, win_start:win_end]
-            
-            # Decode on GPU
-            # [Batch, Channels, AudioSamples]
-            decoder_output = self.vae.decode(latent_chunk)
-            audio_chunk = decoder_output.sample
-            del decoder_output
-            
-            # Calculate trim amounts in audio samples
-            added_start = core_start - win_start  # latent frames
-            trim_start = int(round(added_start * upsample_factor))
-            
-            added_end = win_end - core_end  # latent frames
-            trim_end = int(round(added_end * upsample_factor))
-            
-            # Trim audio
-            audio_len = audio_chunk.shape[-1]
-            end_idx = audio_len - trim_end if trim_end > 0 else audio_len
-            
-            audio_core = audio_chunk[:, :, trim_start:end_idx]
-            
-            # Copy to pre-allocated CPU tensor
-            core_len = audio_core.shape[-1]
-            final_audio[:, :, audio_write_pos:audio_write_pos + core_len] = audio_core.cpu()
-            audio_write_pos += core_len
-            
-            # Free GPU memory immediately
-            del audio_chunk, audio_core, latent_chunk
-        
-        # Trim to actual length (in case of rounding differences)
-        final_audio = final_audio[:, :, :audio_write_pos]
-        
-        return final_audio
-    
-    def _decode_on_cpu(self, latents):
-        """
-        Emergency fallback: move VAE to CPU, decode there, then restore.
-        
-        This is used when GPU VRAM is too tight for even the smallest tiled decode.
-        Slower but guarantees no OOM on GPU.
-        """
-        logger.warning("[_decode_on_cpu] Moving VAE to CPU for decode (VRAM too tight for GPU decode)")
-        
-        # Remember original device
-        try:
-            original_device = next(self.vae.parameters()).device
-        except StopIteration:
-            original_device = torch.device("cpu")
-        
-        # Move VAE to CPU
-        vae_cpu_dtype = self._get_vae_dtype("cpu")
-        self._recursive_to_device(self.vae, "cpu", vae_cpu_dtype)
-        self._empty_cache()
-        
-        # Move latents to CPU
-        latents_cpu = latents.cpu().to(vae_cpu_dtype)
-        
-        # Decode on CPU (no tiling needed; CPU has plenty of RAM)
-        try:
-            with torch.inference_mode():
-                decoder_output = self.vae.decode(latents_cpu)
-                result = decoder_output.sample
-                del decoder_output
-        finally:
-            # Restore VAE to original device
-            if original_device.type != "cpu":
-                vae_gpu_dtype = self._get_vae_dtype(str(original_device))
-                self._recursive_to_device(self.vae, original_device, vae_gpu_dtype)
-        
-        logger.info(f"[_decode_on_cpu] CPU decode complete, result shape={result.shape}")
-        return result  # result stays on CPU; fine for audio post-processing
-    
-    def tiled_encode(self, audio, chunk_size=None, overlap=None, offload_latent_to_cpu=True):
-        """
-        Encode audio to latents using tiling to reduce VRAM usage.
-        Uses overlap-discard strategy to avoid boundary artifacts.
-        
-        Args:
-            audio: Audio tensor [Batch, Channels, Samples] or [Channels, Samples]
-            chunk_size: Size of audio chunk to process at once (in samples). 
-                       Default: 48000 * 30 = 1440000 (30 seconds at 48kHz)
-            overlap: Overlap size in audio samples. Default: 48000 * 2 = 96000 (2 seconds)
-            offload_latent_to_cpu: If True, offload encoded latents to CPU immediately to save VRAM
-            
-        Returns:
-            Latents tensor [Batch, Channels, T] (same format as vae.encode output)
-        """
-        # ---- MLX fast path (macOS Apple Silicon) ----
-        if self.use_mlx_vae and self.mlx_vae is not None:
-            # Handle 2D input [Channels, Samples]
-            input_was_2d = (audio.dim() == 2)
-            if input_was_2d:
-                audio = audio.unsqueeze(0)
-            try:
-                result = self._mlx_vae_encode_sample(audio)
-                if input_was_2d:
-                    result = result.squeeze(0)
-                return result
-            except Exception as exc:
-                logger.warning(
-                    f"[tiled_encode] MLX VAE encode failed ({type(exc).__name__}: {exc}), "
-                    f"falling back to PyTorch VAE..."
-                )
-                if input_was_2d:
-                    audio = audio.squeeze(0)
-
-        # ---- PyTorch path (CUDA / MPS / CPU) ----
-        # Default values for 48kHz audio, adaptive to GPU memory
-        if chunk_size is None:
-            gpu_memory = get_gpu_memory_gb()
-            if gpu_memory <= 0 and self.device == "mps":
-                mem_gb = self._get_effective_mps_memory_gb()
-                if mem_gb is not None:
-                    gpu_memory = mem_gb
-            if gpu_memory <= 8:
-                chunk_size = 48000 * 15  # 15 seconds for low VRAM
-            else:
-                chunk_size = 48000 * 30  # 30 seconds for normal VRAM
-        if overlap is None:
-            overlap = 48000 * 2  # 2 seconds overlap
-        
-        # Handle 2D input [Channels, Samples]
-        input_was_2d = (audio.dim() == 2)
-        if input_was_2d:
-            audio = audio.unsqueeze(0)
-        
-        B, C, S = audio.shape  # Batch, Channels, Samples
-        
-        # If short enough, encode directly
-        if S <= chunk_size:
-            vae_input = audio.to(self.device).to(self.vae.dtype)
-            with torch.inference_mode():
-                latents = self.vae.encode(vae_input).latent_dist.sample()
-            if input_was_2d:
-                latents = latents.squeeze(0)
-            return latents
-        
-        # Calculate stride (core size)
-        stride = chunk_size - 2 * overlap
-        if stride <= 0:
-            raise ValueError(f"chunk_size {chunk_size} must be > 2 * overlap {overlap}")
-        
-        num_steps = math.ceil(S / stride)
-        
-        if offload_latent_to_cpu:
-            result = self._tiled_encode_offload_cpu(audio, B, S, stride, overlap, num_steps, chunk_size)
-        else:
-            result = self._tiled_encode_gpu(audio, B, S, stride, overlap, num_steps, chunk_size)
-        
-        if input_was_2d:
-            result = result.squeeze(0)
-        
-        return result
-    
-    def _tiled_encode_gpu(self, audio, B, S, stride, overlap, num_steps, chunk_size):
-        """Standard tiled encode keeping all data on GPU."""
-        encoded_latent_list = []
-        downsample_factor = None
-        
-        for i in tqdm(range(num_steps), desc="Encoding audio chunks", disable=self.disable_tqdm):
-            # Core range in audio samples
-            core_start = i * stride
-            core_end = min(core_start + stride, S)
-            
-            # Window range (with overlap)
-            win_start = max(0, core_start - overlap)
-            win_end = min(S, core_end + overlap)
-            
-            # Extract chunk and move to GPU
-            audio_chunk = audio[:, :, win_start:win_end].to(self.device).to(self.vae.dtype)
-            
-            # Encode
-            with torch.inference_mode():
-                latent_chunk = self.vae.encode(audio_chunk).latent_dist.sample()
-            
-            # Determine downsample factor from the first chunk
-            if downsample_factor is None:
-                downsample_factor = audio_chunk.shape[-1] / latent_chunk.shape[-1]
-            
-            # Calculate trim amounts in latent frames
-            added_start = core_start - win_start  # audio samples
-            trim_start = int(round(added_start / downsample_factor))
-            
-            added_end = win_end - core_end  # audio samples
-            trim_end = int(round(added_end / downsample_factor))
-            
-            # Trim latent
-            latent_len = latent_chunk.shape[-1]
-            end_idx = latent_len - trim_end if trim_end > 0 else latent_len
-            
-            latent_core = latent_chunk[:, :, trim_start:end_idx]
-            encoded_latent_list.append(latent_core)
-            
-            del audio_chunk
-        
-        # Concatenate
-        final_latents = torch.cat(encoded_latent_list, dim=-1)
-        return final_latents
-    
-    def _tiled_encode_offload_cpu(self, audio, B, S, stride, overlap, num_steps, chunk_size):
-        """Optimized tiled encode that offloads latents to CPU immediately to save VRAM."""
-        # First pass: encode first chunk to get downsample_factor and latent channels
-        first_core_start = 0
-        first_core_end = min(stride, S)
-        first_win_start = 0
-        first_win_end = min(S, first_core_end + overlap)
-        
-        first_audio_chunk = audio[:, :, first_win_start:first_win_end].to(self.device).to(self.vae.dtype)
-        with torch.inference_mode():
-            first_latent_chunk = self.vae.encode(first_audio_chunk).latent_dist.sample()
-        
-        downsample_factor = first_audio_chunk.shape[-1] / first_latent_chunk.shape[-1]
-        latent_channels = first_latent_chunk.shape[1]
-        
-        # Calculate total latent length and pre-allocate CPU tensor
-        total_latent_length = int(round(S / downsample_factor))
-        final_latents = torch.zeros(B, latent_channels, total_latent_length, 
-                                   dtype=first_latent_chunk.dtype, device='cpu')
-        
-        # Process first chunk: trim and copy to CPU
-        first_added_end = first_win_end - first_core_end
-        first_trim_end = int(round(first_added_end / downsample_factor))
-        first_latent_len = first_latent_chunk.shape[-1]
-        first_end_idx = first_latent_len - first_trim_end if first_trim_end > 0 else first_latent_len
-        
-        first_latent_core = first_latent_chunk[:, :, :first_end_idx]
-        latent_write_pos = first_latent_core.shape[-1]
-        final_latents[:, :, :latent_write_pos] = first_latent_core.cpu()
-        
-        # Free GPU memory
-        del first_audio_chunk, first_latent_chunk, first_latent_core
-        
-        # Process remaining chunks
-        for i in tqdm(range(1, num_steps), desc="Encoding audio chunks", disable=self.disable_tqdm):
-            # Core range in audio samples
-            core_start = i * stride
-            core_end = min(core_start + stride, S)
-            
-            # Window range (with overlap)
-            win_start = max(0, core_start - overlap)
-            win_end = min(S, core_end + overlap)
-            
-            # Extract chunk and move to GPU
-            audio_chunk = audio[:, :, win_start:win_end].to(self.device).to(self.vae.dtype)
-            
-            # Encode on GPU
-            with torch.inference_mode():
-                latent_chunk = self.vae.encode(audio_chunk).latent_dist.sample()
-            
-            # Calculate trim amounts in latent frames
-            added_start = core_start - win_start  # audio samples
-            trim_start = int(round(added_start / downsample_factor))
-            
-            added_end = win_end - core_end  # audio samples
-            trim_end = int(round(added_end / downsample_factor))
-            
-            # Trim latent
-            latent_len = latent_chunk.shape[-1]
-            end_idx = latent_len - trim_end if trim_end > 0 else latent_len
-            
-            latent_core = latent_chunk[:, :, trim_start:end_idx]
-            
-            # Copy to pre-allocated CPU tensor
-            core_len = latent_core.shape[-1]
-            final_latents[:, :, latent_write_pos:latent_write_pos + core_len] = latent_core.cpu()
-            latent_write_pos += core_len
-            
-            # Free GPU memory immediately
-            del audio_chunk, latent_chunk, latent_core
-        
-        # Trim to actual length (in case of rounding differences)
-        final_latents = final_latents[:, :, :latent_write_pos]
-        
-        return final_latents
-
     def generate_music(
         self,
         captions: str,
@@ -1632,185 +1123,83 @@ class AceStepHandler(
             - success: Whether generation completed successfully
             - error: Error message if generation failed
         """
-        if progress is None:
-            def progress(*args, **kwargs):
-                """No-op progress callback when no UI progress handler is provided."""
-                pass
+        progress = self._resolve_generate_music_progress(progress)
 
         if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
-            return {
-                "audios": [],
-                "status_message": "âŒ Model not fully initialized. Please initialize all components first.",
-                "extra_outputs": {},
-                "success": False,
-                "error": "Model not fully initialized",
-            }
+            readiness_error = self._validate_generate_music_readiness()
+            return readiness_error
 
-        def _has_audio_codes(v: Union[str, List[str]]) -> bool:
-            """Return True when at least one non-empty audio-code string is present."""
-            if isinstance(v, list):
-                return any((x or "").strip() for x in v)
-            return bool(v and str(v).strip())
-
-        # Auto-detect task type based on audio_code_string
-        # If audio_code_string is provided and not empty, use cover task
-        # Otherwise, use text2music task (or keep current task_type if not text2music)
-        if task_type == "text2music":
-            if _has_audio_codes(audio_code_string):
-                # User has provided audio codes, switch to cover task
-                task_type = "cover"
-                # Update instruction for cover task
-                instruction = TASK_INSTRUCTIONS["cover"]
+        task_type, instruction = self._resolve_generate_music_task(
+            task_type=task_type,
+            audio_code_string=audio_code_string,
+            instruction=instruction,
+        )
 
         logger.info("[generate_music] Starting generation...")
         if progress:
             progress(0.51, desc="Preparing inputs...")
         logger.info("[generate_music] Preparing inputs...")
         
-        # Reset offload cost
-        self.current_offload_cost = 0.0
-
-        # Caption and lyrics are optional - can be empty
-        # Use provided batch_size or default
-        actual_batch_size = batch_size if batch_size is not None else self.batch_size
-        actual_batch_size = max(1, actual_batch_size)  # Ensure at least 1
-
-        # ---- Pre-inference VRAM guard ----
-        # Estimate whether the requested batch_size fits in free VRAM and
-        # auto-reduce if it does not.  This prevents OOM crashes at the cost
-        # of generating fewer samples.
-        actual_batch_size = self._vram_guard_reduce_batch(
-            actual_batch_size,
+        runtime = self._prepare_generate_music_runtime(
+            batch_size=batch_size,
             audio_duration=audio_duration,
+            repainting_end=repainting_end,
+            seed=seed,
+            use_random_seed=use_random_seed,
         )
-
-        actual_seed_list, seed_value_for_ui = self.prepare_seeds(actual_batch_size, seed, use_random_seed)
-        
-        # Convert special values to None
-        if audio_duration is not None and float(audio_duration) <= 0:
-            audio_duration = None
-        # if seed is not None and seed < 0:
-        #     seed = None
-        if repainting_end is not None and float(repainting_end) < 0:
-            repainting_end = None
+        actual_batch_size = runtime["actual_batch_size"]
+        actual_seed_list = runtime["actual_seed_list"]
+        seed_value_for_ui = runtime["seed_value_for_ui"]
+        audio_duration = runtime["audio_duration"]
+        repainting_end = runtime["repainting_end"]
             
         try:
-            # 1. Process reference audio
-            refer_audios = None
-            if reference_audio is not None:
-                logger.info("[generate_music] Processing reference audio...")
-                processed_ref_audio = self.process_reference_audio(reference_audio)
-                if processed_ref_audio is not None:
-                    # Convert to the format expected by the service: List[List[torch.Tensor]]
-                    # Each batch item has a list of reference audios
-                    refer_audios = [[processed_ref_audio] for _ in range(actual_batch_size)]
-                else:
-                    return {
-                        "audios": [],
-                        "status_message": (
-                            "Reference audio is invalid, unreadable, or silent. "
-                            "Please upload a valid audible audio file."
-                        ),
-                        "extra_outputs": {},
-                        "success": False,
-                        "error": "Invalid reference audio",
-                    }
-            else:
-                refer_audios = [[torch.zeros(2, 30*self.sample_rate)] for _ in range(actual_batch_size)]
-            
-            # 2. Process source audio
-            # If audio_code_string is provided, ignore src_audio and use codes instead
-            processed_src_audio = None
-            if src_audio is not None:
-                # Check if audio codes are provided - if so, ignore src_audio
-                if _has_audio_codes(audio_code_string):
-                    logger.info("[generate_music] Audio codes provided, ignoring src_audio and using codes instead")
-                else:
-                    logger.info("[generate_music] Processing source audio...")
-                    processed_src_audio = self.process_src_audio(src_audio)
-                
-            # 3. Prepare batch data
-            captions_batch, instructions_batch, lyrics_batch, vocal_languages_batch, metas_batch = self.prepare_batch_data(
-                actual_batch_size,
-                processed_src_audio,
-                audio_duration,
-                captions,
-                lyrics,
-                vocal_language,
-                instruction,
-                bpm,
-                key_scale,
-                time_signature
+            refer_audios, processed_src_audio, audio_error = self._prepare_reference_and_source_audio(
+                reference_audio=reference_audio,
+                src_audio=src_audio,
+                audio_code_string=audio_code_string,
+                actual_batch_size=actual_batch_size,
+                task_type=task_type,
             )
-            
-            is_repaint_task, is_lego_task, is_cover_task, can_use_repainting = self.determine_task_type(task_type, audio_code_string)
-            
-            repainting_start_batch, repainting_end_batch, target_wavs_tensor = self.prepare_padding_info(
-                actual_batch_size,
-                processed_src_audio,
-                audio_duration,
-                repainting_start,
-                repainting_end,
-                is_repaint_task,
-                is_lego_task,
-                is_cover_task,
-                can_use_repainting
-            )
-            
-            # Prepare audio_code_hints - use if audio_code_string is provided
-            # This works for both text2music (auto-switched to cover) and cover tasks
-            audio_code_hints_batch = None
-            if _has_audio_codes(audio_code_string):
-                if isinstance(audio_code_string, list):
-                    audio_code_hints_batch = audio_code_string
-                else:
-                    audio_code_hints_batch = [audio_code_string] * actual_batch_size
+            if audio_error is not None:
+                return audio_error
 
-            should_return_intermediate = (task_type == "text2music")
-            progress_desc = f"Generating music (batch size: {actual_batch_size})..."
-            infer_steps_for_progress = len(timesteps) if timesteps else inference_steps
-            progress(0.52, desc=progress_desc)
-            stop_event = None
-            progress_thread = None
-            try:
-                stop_event, progress_thread = self._start_diffusion_progress_estimator(
-                    progress=progress,
-                    start=0.52,
-                    end=0.79,
-                    infer_steps=infer_steps_for_progress,
-                    batch_size=actual_batch_size,
-                    duration_sec=audio_duration if audio_duration and audio_duration > 0 else None,
-                    desc=progress_desc,
-                )
-                outputs = self.service_generate(
-                    captions=captions_batch,
-                    lyrics=lyrics_batch,
-                    metas=metas_batch,  # Pass as dict, service will convert to string
-                    vocal_languages=vocal_languages_batch,
-                    refer_audios=refer_audios,  # Already in List[List[torch.Tensor]] format
-                    target_wavs=target_wavs_tensor,  # Shape: [batch_size, 2, frames]
-                    infer_steps=inference_steps,
-                    guidance_scale=guidance_scale,
-                    seed=actual_seed_list,  # Pass list of seeds, one per batch item
-                    repainting_start=repainting_start_batch,
-                    repainting_end=repainting_end_batch,
-                    instructions=instructions_batch,  # Pass instructions to service
-                    audio_cover_strength=audio_cover_strength,  # Pass audio cover strength
-                    cover_noise_strength=cover_noise_strength,  # Pass cover noise strength
-                    use_adg=use_adg,  # Pass use_adg parameter
-                    cfg_interval_start=cfg_interval_start,  # Pass CFG interval start
-                    cfg_interval_end=cfg_interval_end,  # Pass CFG interval end
-                    shift=shift,  # Pass shift parameter
-                    infer_method=infer_method,  # Pass infer method (ode or sde)
-                    audio_code_hints=audio_code_hints_batch,  # Pass audio code hints as list
-                    return_intermediate=should_return_intermediate,
-                    timesteps=timesteps,  # Pass custom timesteps if provided
-                )
-            finally:
-                if stop_event is not None:
-                    stop_event.set()
-                if progress_thread is not None:
-                    progress_thread.join(timeout=1.0)
+            service_inputs = self._prepare_generate_music_service_inputs(
+                actual_batch_size=actual_batch_size,
+                processed_src_audio=processed_src_audio,
+                audio_duration=audio_duration,
+                captions=captions,
+                lyrics=lyrics,
+                vocal_language=vocal_language,
+                instruction=instruction,
+                bpm=bpm,
+                key_scale=key_scale,
+                time_signature=time_signature,
+                task_type=task_type,
+                audio_code_string=audio_code_string,
+                repainting_start=repainting_start,
+                repainting_end=repainting_end,
+            )
+            service_run = self._run_generate_music_service_with_progress(
+                progress=progress,
+                actual_batch_size=actual_batch_size,
+                audio_duration=audio_duration,
+                inference_steps=inference_steps,
+                timesteps=timesteps,
+                service_inputs=service_inputs,
+                refer_audios=refer_audios,
+                guidance_scale=guidance_scale,
+                actual_seed_list=actual_seed_list,
+                audio_cover_strength=audio_cover_strength,
+                cover_noise_strength=cover_noise_strength,
+                use_adg=use_adg,
+                cfg_interval_start=cfg_interval_start,
+                cfg_interval_end=cfg_interval_end,
+                shift=shift,
+                infer_method=infer_method,
+            )
+            outputs = service_run["outputs"]
+            infer_steps_for_progress = service_run["infer_steps_for_progress"]
             
             logger.info("[generate_music] Model generation completed. Decoding latents...")
             pred_latents = outputs["target_latents"]  # [batch, latent_length, latent_dim]
@@ -2026,3 +1415,5 @@ class AceStepHandler(
                 "success": False,
                 "error": str(e),
             }
+
+

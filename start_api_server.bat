@@ -242,18 +242,25 @@ if exist "%~dp0python_embeded\python.exe" (
 
         if !ERRORLEVEL! NEQ 0 (
             echo.
-            echo ========================================
-            echo [Error] Failed to setup environment
-            echo ========================================
+            echo [Retry] Online sync failed, retrying in offline mode...
             echo.
-            echo Please check the error messages above.
-            echo You may need to:
-            echo   1. Check your internet connection
-            echo   2. Ensure you have enough disk space
-            echo   3. Try running: uv sync manually
-            echo.
-            pause
-            exit /b 1
+            uv sync --offline
+
+            if !ERRORLEVEL! NEQ 0 (
+                echo.
+                echo ========================================
+                echo [Error] Failed to setup environment
+                echo ========================================
+                echo.
+                echo Both online and offline modes failed.
+                echo Please check:
+                echo   1. Your internet connection ^(required for first-time setup^)
+                echo   2. Ensure you have enough disk space
+                echo   3. Try running: uv sync manually
+                echo.
+                pause
+                exit /b 1
+            )
         )
 
         echo.
@@ -267,12 +274,33 @@ if exist "%~dp0python_embeded\python.exe" (
     echo.
 
     REM Build command with optional parameters
-    set "CMD=uv run acestep-api --host %HOST% --port %PORT%"
-    if not "%API_KEY%"=="" set "CMD=!CMD! %API_KEY%"
-    if not "%DOWNLOAD_SOURCE%"=="" set "CMD=!CMD! %DOWNLOAD_SOURCE%"
-    if not "%LM_MODEL_PATH%"=="" set "CMD=!CMD! %LM_MODEL_PATH%"
+    set "ACESTEP_ARGS=acestep-api --host %HOST% --port %PORT%"
+    if not "%API_KEY%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %API_KEY%"
+    if not "%DOWNLOAD_SOURCE%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %DOWNLOAD_SOURCE%"
+    if not "%LM_MODEL_PATH%"=="" set "ACESTEP_ARGS=!ACESTEP_ARGS! %LM_MODEL_PATH%"
 
-    !CMD!
+    uv run !ACESTEP_ARGS!
+    if !ERRORLEVEL! NEQ 0 (
+        echo.
+        echo [Retry] Online dependency resolution failed, retrying in offline mode...
+        echo.
+        uv run --offline !ACESTEP_ARGS!
+        if !ERRORLEVEL! NEQ 0 (
+            echo.
+            echo ========================================
+            echo [Error] Failed to start ACE-Step API Server
+            echo ========================================
+            echo.
+            echo Both online and offline modes failed.
+            echo Please check:
+            echo   1. Your internet connection ^(for first-time setup^)
+            echo   2. If dependencies were previously installed ^(offline mode requires a prior successful install^)
+            echo   3. Try running: uv sync --offline
+            echo.
+            pause
+            exit /b 1
+        )
+    )
 )
 
 pause

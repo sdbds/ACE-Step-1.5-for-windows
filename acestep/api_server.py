@@ -50,7 +50,6 @@ from threading import Lock
 from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 from loguru import logger
-
 import torch
 
 try:
@@ -60,14 +59,17 @@ except ImportError:  # Optional dependency
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from acestep.api.train_api_service import (
+    initialize_training_state,
+    register_training_api_routes,
+)
 
 from acestep.handler import AceStepHandler
 from acestep.llm_inference import LLMHandler
 from acestep.constants import (
     DEFAULT_DIT_INSTRUCTION,
-    DEFAULT_LM_INSTRUCTION,
     TASK_INSTRUCTIONS,
 )
 from acestep.inference import (
@@ -77,16 +79,12 @@ from acestep.inference import (
     create_sample,
     format_sample,
 )
-from acestep.gradio_ui.events.results_handlers import _build_generation_info
+from acestep.ui.gradio.events.results_handlers import _build_generation_info
 from acestep.gpu_config import (
     get_gpu_config,
-    get_gpu_memory_gb,
-    print_gpu_config_info,
     set_global_gpu_config,
     get_recommended_lm_model,
     is_lm_model_supported,
-    GPUConfig,
-    VRAM_16GB_MIN_GB,
     VRAM_AUTO_OFFLOAD_THRESHOLD_GB,
 )
 
@@ -636,78 +634,6 @@ class ToggleLoRARequest(BaseModel):
     use_lora: bool = Field(..., description="Enable or disable LoRA")
 
 
-class ScanDirectoryRequest(BaseModel):
-    audio_dir: str = Field(..., description="Directory path to scan for audio files")
-    dataset_name: str = Field(default="my_lora_dataset", description="Dataset name")
-    custom_tag: str = Field(default="", description="Custom activation tag")
-    tag_position: str = Field(default="replace", description="Tag position: prepend/append/replace")
-    all_instrumental: bool = Field(default=True, description="All tracks instrumental")
-
-
-class LoadDatasetRequest(BaseModel):
-    dataset_path: str = Field(..., description="Path to dataset JSON file")
-
-
-class AutoLabelRequest(BaseModel):
-    skip_metas: bool = Field(default=False, description="Skip BPM/Key/TimeSig generation")
-    format_lyrics: bool = Field(default=False, description="Format user lyrics via LLM")
-    transcribe_lyrics: bool = Field(default=False, description="Transcribe lyrics from audio")
-    only_unlabeled: bool = Field(default=False, description="Only label unlabeled samples")
-
-    lm_model_path: Optional[str] = Field(default=None, description="Optional LM model path to use for labeling (temporary switch)")
-
-    save_path: Optional[str] = Field(default=None, description="Optional dataset JSON path to persist progress during auto-label")
-
-    chunk_size: int = Field(default=16, ge=1, description="Chunk size for batch audio encoding")
-    batch_size: int = Field(default=1, ge=1, description="Batch size for batch audio encoding")
-
-    @root_validator(pre=True)
-    def _backward_compatible_field_names(cls, values: Dict[str, Any]):
-        if values is None:
-            return values
-
-        if "chunk_size" not in values or values.get("chunk_size") is None:
-            for k in ("hunk_size", "hunksize"):
-                if k in values and values.get(k) is not None:
-                    values["chunk_size"] = values[k]
-                    break
-
-        if "batch_size" not in values or values.get("batch_size") is None:
-            for k in ("batchsize",):
-                if k in values and values.get(k) is not None:
-                    values["batch_size"] = values[k]
-                    break
-
-        return values
-
-
-class SaveDatasetRequest(BaseModel):
-    save_path: str = Field(..., description="Path to save dataset JSON")
-    dataset_name: str = Field(default="my_lora_dataset", description="Dataset name")
-    custom_tag: Optional[str] = Field(default=None, description="Custom activation tag")
-    tag_position: Optional[str] = Field(default=None, description="Tag position: prepend/append/replace")
-    all_instrumental: Optional[bool] = Field(default=None, description="All tracks instrumental")
-    genre_ratio: Optional[int] = Field(default=None, ge=0, le=100, description="Genre vs caption ratio")
-
-
-class UpdateSampleRequest(BaseModel):
-    sample_idx: int = Field(..., ge=0, description="Sample index")
-    caption: str = Field(default="", description="Music description")
-    genre: str = Field(default="", description="Genre tags")
-    prompt_override: Optional[str] = Field(default=None, description="caption/genre/None")
-    lyrics: str = Field(default="[Instrumental]", description="Lyrics")
-    bpm: Optional[int] = Field(default=None, description="BPM")
-    keyscale: str = Field(default="", description="Musical key")
-    timesignature: str = Field(default="", description="Time signature")
-    language: str = Field(default="unknown", description="Vocal language")
-    is_instrumental: bool = Field(default=True, description="Instrumental track")
-
-
-class PreprocessDatasetRequest(BaseModel):
-    output_dir: str = Field(..., description="Output directory for preprocessed tensors")
-    skip_existing: bool = Field(default=False, description="Skip tensors that already exist (by sample id filename)")
-
-
 def _stop_tensorboard(app: FastAPI) -> None:
     """Stop TensorBoard process if running."""
     try:
@@ -871,46 +797,36 @@ def _temporary_llm_model(app: FastAPI, llm: "LLMHandler", lm_model_path: Optiona
                     pass
 
 
-class StartTrainingRequest(BaseModel):
-    tensor_dir: str = Field(..., description="Directory with preprocessed tensors")
-    lora_rank: int = Field(default=64, ge=1, le=256, description="LoRA rank")
-    lora_alpha: int = Field(default=128, ge=1, le=512, description="LoRA alpha")
-    lora_dropout: float = Field(default=0.1, ge=0.0, le=1.0, description="LoRA dropout")
-    learning_rate: float = Field(default=1e-4, gt=0.0, description="Learning rate")
-    train_epochs: int = Field(default=10, ge=1, description="Training epochs")
-    train_batch_size: int = Field(default=1, ge=1, description="Batch size")
-    gradient_accumulation: int = Field(default=4, ge=1, description="Gradient accumulation steps")
-    save_every_n_epochs: int = Field(default=5, ge=1, description="Save checkpoint every N epochs")
-    training_shift: float = Field(default=3.0, ge=0.0, description="Training timestep shift")
-    training_seed: int = Field(default=42, description="Random seed")
-    lora_output_dir: str = Field(default="./lora_output", description="Output directory")
-    use_fp8: bool = Field(default=False, description="Use FP8 quantization for decoder weights (reduces VRAM, requires Ada/Hopper GPU)")
-    gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    """Write JSON atomically to reduce corruption risk during incremental saves."""
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=directory or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
-class StartLoKRTrainingRequest(BaseModel):
-    tensor_dir: str = Field(..., description="Directory with preprocessed tensors")
-    lokr_linear_dim: int = Field(default=64, ge=1, le=256, description="LoKR linear dimension")
-    lokr_linear_alpha: int = Field(default=128, ge=1, le=512, description="LoKR linear alpha")
-    lokr_factor: int = Field(default=-1, description="Kronecker factor (-1 = auto)")
-    lokr_decompose_both: bool = Field(default=False, description="Decompose both matrices")
-    lokr_use_tucker: bool = Field(default=False, description="Use Tucker decomposition")
-    lokr_use_scalar: bool = Field(default=False, description="Use scalar calibration")
-    lokr_weight_decompose: bool = Field(default=True, description="Enable DoRA mode")
-    learning_rate: float = Field(default=0.03, gt=0.0, description="Learning rate")
-    train_epochs: int = Field(default=500, ge=1, description="Training epochs")
-    train_batch_size: int = Field(default=1, ge=1, description="Batch size")
-    gradient_accumulation: int = Field(default=4, ge=1, description="Gradient accumulation steps")
-    save_every_n_epochs: int = Field(default=5, ge=1, description="Save checkpoint every N epochs")
-    training_shift: float = Field(default=3.0, ge=0.0, description="Training timestep shift")
-    training_seed: int = Field(default=42, description="Random seed")
-    output_dir: str = Field(default="./lokr_output", description="Output directory")
-    gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
+def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
+    """Append a single JSONL record for audit/progress tracing."""
 
-
-class ExportLoRARequest(BaseModel):
-    export_path: str = Field(..., description="Export destination path")
-    lora_output_dir: str = Field(..., description="Training output directory")
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 class CreateJobResponse(BaseModel):
@@ -1513,13 +1429,13 @@ def _validate_audio_path(path: Optional[str]) -> Optional[str]:
 
     Accepts absolute paths strictly only if they are within the system temporary directory.
     Otherwise, rejects absolute paths and paths containing '..' traversal sequences.
-    
+
     Returns the validated, normalized path or None if the input is None/empty.
     Raises HTTPException 400 if the path is unsafe.
     """
     if not path:
         return None
-    
+
     # Resolve requested path and system temp path to normalized absolute forms
     import tempfile
     system_temp = os.path.realpath(tempfile.gettempdir())
@@ -1712,6 +1628,7 @@ def create_app() -> FastAPI:
         app.state.executor = executor
         app.state.job_store = store
         app.state._python_executable = sys.executable
+        initialize_training_state(app)
 
         # Temporary directory for saving generated audio files
         app.state.temp_audio_dir = os.path.join(tempfile.gettempdir(), "acestep_audio")
@@ -1886,23 +1803,25 @@ def create_app() -> FastAPI:
                         selected_handler = app.state.handler2
                         selected_model_name = model2_name
                         model_matched = True
-                        print(f"[API Server] Job {job_id}: Using pre-loaded model: {model2_name}")
+                        print(f"[API Server] Job {job_id}: Using second model: {model2_name}")
 
+                # Check if it matches the third model
                 if not model_matched and app.state.handler3 and getattr(app.state, "_initialized3", False):
                     model3_name = _get_model_name(app.state._config_path3)
                     if req.model == model3_name:
                         selected_handler = app.state.handler3
                         selected_model_name = model3_name
                         model_matched = True
-                        print(f"[API Server] Job {job_id}: Using pre-loaded model: {model3_name}")
+                        print(f"[API Server] Job {job_id}: Using third model: {model3_name}")
 
-                # Dynamic switching: hot-swap the primary handler's DiT model
                 if not model_matched:
+                    # Dynamic switching: hot-swap the primary handler's DiT model
                     with app.state._model_switch_lock:
                         # Re-check after acquiring lock (another job may have switched)
                         current_primary = _get_model_name(app.state._config_path)
                         if req.model == current_primary:
                             selected_model_name = current_primary
+                            model_matched = True
                             print(f"[API Server] Job {job_id}: Model already switched to {current_primary}")
                         else:
                             print(f"[API Server] Job {job_id}: Switching primary model from {current_primary} to {req.model}...")
@@ -1911,10 +1830,20 @@ def create_app() -> FastAPI:
                             if ok:
                                 app.state._config_path = req.model
                                 selected_model_name = req.model
+                                model_matched = True
                                 print(f"[API Server] Job {job_id}: {status_msg}")
                             else:
                                 print(f"[API Server] Job {job_id}: Switch failed: {status_msg}, using {current_primary}")
                                 selected_model_name = current_primary
+                                available_models = [_get_model_name(app.state._config_path)]
+                                if app.state.handler2 and getattr(app.state, "_initialized2", False):
+                                    available_models.append(_get_model_name(app.state._config_path2))
+                                if app.state.handler3 and getattr(app.state, "_initialized3", False):
+                                    available_models.append(_get_model_name(app.state._config_path3))
+                                print(
+                                    f"[API Server] Job {job_id}: Model '{req.model}' not found/switchable in "
+                                    f"{available_models}, using primary: {selected_model_name}"
+                                )
 
             # Use selected handler for generation
             h: AceStepHandler = selected_handler
@@ -1938,7 +1867,7 @@ def create_app() -> FastAPI:
                                 "in .env or environment variables. For this request, optional LLM features "
                                 "(use_cot_caption, use_cot_language) will be auto-disabled."
                             )
-                            print(f"[API Server] LLM lazy load blocked: LLM was not initialized at startup")
+                            print("[API Server] LLM lazy load blocked: LLM was not initialized at startup")
                             return
 
                         project_root = _get_project_root()
@@ -2140,8 +2069,8 @@ def create_app() -> FastAPI:
 
                 # Parse timesteps string to list of floats if provided
                 parsed_timesteps = _parse_timesteps(req.timesteps)
-
-                # Determine actual inference steps (timesteps override inference_steps)
+                
+                # Calculate actual inference steps based on timesteps
                 actual_inference_steps = len(parsed_timesteps) if parsed_timesteps else req.inference_steps
 
                 # Auto-select instruction based on task_type if user didn't provide custom instruction
@@ -2149,7 +2078,7 @@ def create_app() -> FastAPI:
                 instruction_to_use = req.instruction
                 if instruction_to_use == DEFAULT_DIT_INSTRUCTION and req.task_type in TASK_INSTRUCTIONS:
                     raw_instruction = TASK_INSTRUCTIONS[req.task_type]
-                    
+
                     if req.task_type == "complete":
                          #  Use track_classes joined by pipes
                          if req.track_classes:
@@ -2621,9 +2550,9 @@ def create_app() -> FastAPI:
             print("[API Server] Initializing models at startup...")
 
             if auto_offload:
-                print(f"[API Server] Auto-enabling CPU offload (GPU < 16GB)")
+                print("[API Server] Auto-enabling CPU offload (GPU < 16GB)")
             elif gpu_memory_gb > 0:
-                print(f"[API Server] CPU offload disabled by default (GPU >= 16GB)")
+                print("[API Server] CPU offload disabled by default (GPU >= 16GB)")
             else:
                 print("[API Server] No GPU detected, running on CPU")
 
@@ -2639,7 +2568,7 @@ def create_app() -> FastAPI:
             else:
                 offload_to_cpu = auto_offload
                 if auto_offload:
-                    print(f"[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
+                    print("[API Server] Auto-setting offload_to_cpu=True based on GPU memory")
 
             offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
             compile_model = _env_bool("ACESTEP_COMPILE_MODEL", False)
@@ -2753,19 +2682,19 @@ def create_app() -> FastAPI:
 
             # Step 2: Apply user override if set
             if not init_llm_env or init_llm_env == "auto":
-                print(f"[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
+                print("[API Server] ACESTEP_INIT_LLM=auto, using GPU auto-detection result")
             elif init_llm_env in {"1", "true", "yes", "y", "on"}:
                 if init_llm:
-                    print(f"[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
+                    print("[API Server] ACESTEP_INIT_LLM=true (GPU already supports LLM, no override needed)")
                 else:
                     init_llm = True
-                    print(f"[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
+                    print("[API Server] ACESTEP_INIT_LLM=true, overriding GPU auto-detection (force enable)")
             else:
                 if not init_llm:
-                    print(f"[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
+                    print("[API Server] ACESTEP_INIT_LLM=false (GPU already disabled LLM, no override needed)")
                 else:
                     init_llm = False
-                    print(f"[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
+                    print("[API Server] ACESTEP_INIT_LLM=false, overriding GPU auto-detection (force disable)")
 
             if init_llm:
                 print("[API Server] Loading LLM model...")
@@ -2956,7 +2885,7 @@ def create_app() -> FastAPI:
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
             verify_token_from_request(body, authorization)
-            
+
             # Explicitly validate manual string paths from JSON input
             p = RequestParser(body)
             req = _build_request(
@@ -2970,7 +2899,7 @@ def create_app() -> FastAPI:
             if not isinstance(body, dict):
                 raise HTTPException(status_code=400, detail="JSON payload must be an object")
             verify_token_from_request(body, authorization)
-            
+
             p = RequestParser(body)
             req = _build_request(
                 p,
@@ -2980,7 +2909,7 @@ def create_app() -> FastAPI:
 
         elif content_type.startswith("multipart/form-data"):
             form = await request.form()
-            
+
             # Parse form data correctly to support lists ---
             form_dict = {}
             for k in form.keys():
@@ -3257,11 +3186,19 @@ def create_app() -> FastAPI:
             preloaded.add(_get_model_name(app.state._config_path3))
 
         models = []
-        for name in sorted(installed):
+        candidate_names = {name for name in installed if name}
+        if current_model:
+            candidate_names.add(current_model)
+        candidate_names.update(name for name in preloaded if name)
+
+        for name in sorted(candidate_names):
+            is_active = name == current_model
             models.append({
                 "name": name,
-                "is_active": name == current_model,
-                "is_preloaded": name in preloaded or name == current_model,
+                "is_active": is_active,
+                "is_preloaded": name in preloaded or is_active,
+                # Backward-compatible alias for older clients.
+                "is_default": is_active,
             })
 
         return _wrap_response({
@@ -3347,8 +3284,6 @@ def create_app() -> FastAPI:
 
                 lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
                 lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
-
-                h: AceStepHandler = app.state.handler
                 status, ok = llm.initialize(
                     checkpoint_dir=checkpoint_dir,
                     lm_model_path=lm_model_path,
@@ -3544,808 +3479,6 @@ def create_app() -> FastAPI:
             "synthetic_default_mode": bool(status.get("synthetic_default_mode", False)),
         })
 
-    @app.post("/v1/dataset/scan")
-    async def scan_dataset_directory(request: ScanDirectoryRequest, _: None = Depends(verify_api_key)):
-        """Scan directory for audio files and create dataset."""
-        from acestep.training.dataset_builder import DatasetBuilder
-
-        try:
-            builder = DatasetBuilder()
-            builder.metadata.name = request.dataset_name
-            builder.metadata.custom_tag = request.custom_tag
-            builder.metadata.tag_position = request.tag_position
-            builder.metadata.all_instrumental = request.all_instrumental
-
-            samples, status = builder.scan_directory(request.audio_dir.strip())
-
-            if not samples:
-                return _wrap_response(None, code=400, error=status)
-
-            builder.set_all_instrumental(request.all_instrumental)
-            if request.custom_tag:
-                builder.set_custom_tag(request.custom_tag, request.tag_position)
-
-            app.state.dataset_builder = builder
-            app.state.dataset_json_path = os.path.join(request.audio_dir.strip(), f"{builder.metadata.name}.json")
-
-            # Return full sample data with all metadata
-            samples_data = [
-                {
-                    "index": i,
-                    "filename": s.filename,
-                    "audio_path": s.audio_path,
-                    "duration": s.duration,
-                    "caption": s.caption,
-                    "genre": s.genre,
-                    "prompt_override": s.prompt_override,
-                    "lyrics": s.lyrics,
-                    "bpm": s.bpm,
-                    "keyscale": s.keyscale,
-                    "timesignature": s.timesignature,
-                    "language": s.language,
-                    "is_instrumental": s.is_instrumental,
-                    "labeled": s.labeled,
-                }
-                for i, s in enumerate(builder.samples)
-            ]
-
-            return _wrap_response({
-                "message": status,
-                "num_samples": len(samples),
-                "samples": samples_data
-            })
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Scan failed: {str(e)}")
-
-    @app.post("/v1/dataset/load")
-    async def load_dataset(request: LoadDatasetRequest, _: None = Depends(verify_api_key)):
-        """Load existing dataset from JSON file."""
-        from acestep.training.dataset_builder import DatasetBuilder
-
-        try:
-            builder = DatasetBuilder()
-            samples, status = builder.load_dataset(request.dataset_path.strip())
-
-            if not samples:
-                return _wrap_response({
-                    "message": status,
-                    "dataset_name": "",
-                    "num_samples": 0,
-                    "labeled_count": 0,
-                    "samples": []
-                }, code=400, error=status)
-
-            app.state.dataset_builder = builder
-
-            # Return full sample data with all metadata
-            samples_data = [
-                {
-                    "index": i,
-                    "filename": s.filename,
-                    "audio_path": s.audio_path,
-                    "duration": s.duration,
-                    "caption": s.caption,
-                    "genre": s.genre,
-                    "prompt_override": s.prompt_override,
-                    "lyrics": s.lyrics,
-                    "bpm": s.bpm,
-                    "keyscale": s.keyscale,
-                    "timesignature": s.timesignature,
-                    "language": s.language,
-                    "is_instrumental": s.is_instrumental,
-                    "labeled": s.labeled,
-                }
-                for i, s in enumerate(builder.samples)
-            ]
-
-            return _wrap_response({
-                "message": status,
-                "dataset_name": builder.metadata.name,
-                "num_samples": len(samples),
-                "labeled_count": builder.get_labeled_count(),
-                "samples": samples_data
-            })
-        except Exception as e:
-            error_msg = f"Load failed: {str(e)}"
-            return _wrap_response({
-                "message": error_msg,
-                "dataset_name": "",
-                "num_samples": 0,
-                "labeled_count": 0,
-                "samples": []
-            }, code=500, error=error_msg)
-
-    @app.post("/v1/dataset/auto_label")
-    async def auto_label_dataset(request: AutoLabelRequest, _: None = Depends(verify_api_key)):
-        """Auto-label all samples using AI."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
-
-        handler: AceStepHandler = app.state.handler
-        llm: LLMHandler = app.state.llm_handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        if llm is None or not llm.llm_initialized:
-            raise HTTPException(status_code=500, detail="LLM not initialized")
-
-        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
-        mgr.offload_decoder_to_cpu()
-
-        try:
-            with _temporary_llm_model(app, llm, request.lm_model_path):
-                resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
-                resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
-                resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
-
-                if resolved_save_path:
-                    try:
-                        dataset = {
-                            "metadata": builder.metadata.to_dict(),
-                            "samples": [s.to_dict() for s in builder.samples],
-                        }
-                        _atomic_write_json(resolved_save_path, dataset)
-                    except Exception:
-                        logger.exception("Auto-label initial save failed")
-
-                def sample_labeled_callback(sample_idx: int, sample, status: str):
-                    if resolved_save_path is None:
-                        return
-                    if "✅" not in status:
-                        return
-
-                    try:
-                        if resolved_jsonl_path is not None:
-                            _append_jsonl(
-                                resolved_jsonl_path,
-                                {
-                                    "ts": time.time(),
-                                    "index": sample_idx,
-                                    "status": status,
-                                    "sample": sample.to_dict(),
-                                },
-                            )
-                        dataset = {
-                            "metadata": builder.metadata.to_dict(),
-                            "samples": [s.to_dict() for s in builder.samples],
-                        }
-                        _atomic_write_json(resolved_save_path, dataset)
-                    except Exception:
-                        logger.exception("Auto-label incremental save failed")
-
-                samples, status = builder.label_all_samples(
-                    dit_handler=handler,
-                    llm_handler=llm,
-                    format_lyrics=request.format_lyrics,
-                    transcribe_lyrics=request.transcribe_lyrics,
-                    skip_metas=request.skip_metas,
-                    only_unlabeled=request.only_unlabeled,
-                    chunk_size=request.chunk_size,
-                    batch_size=request.batch_size,
-                    progress_callback=None,
-                    sample_labeled_callback=sample_labeled_callback,
-                )
-
-                # Return full sample data with all metadata
-                samples_data = [
-                    {
-                        "index": i,
-                        "filename": s.filename,
-                        "audio_path": s.audio_path,
-                        "duration": s.duration,
-                        "caption": s.caption,
-                        "genre": s.genre,
-                        "prompt_override": s.prompt_override,
-                        "lyrics": s.lyrics,
-                        "bpm": s.bpm,
-                        "keyscale": s.keyscale,
-                        "timesignature": s.timesignature,
-                        "language": s.language,
-                        "is_instrumental": s.is_instrumental,
-                        "labeled": s.labeled,
-                    }
-                    for i, s in enumerate(builder.samples)
-                ]
-
-                if mgr.decoder_moved:
-                    status += "\nℹ️ Decoder was temporarily offloaded during labeling and restored afterward."
-
-                return _wrap_response({
-                    "message": status,
-                    "labeled_count": builder.get_labeled_count(),
-                    "samples": samples_data
-                })
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Auto-label failed: {str(e)}")
-        finally:
-            mgr.restore()
-
-    @app.post("/v1/dataset/auto_label_async")
-    async def auto_label_dataset_async(request: AutoLabelRequest, _: None = Depends(verify_api_key)):
-        """Start auto-labeling task asynchronously and return task_id immediately."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded. Please scan or load a dataset first.")
-
-        handler: AceStepHandler = app.state.handler
-        llm: LLMHandler = app.state.llm_handler
-
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        if llm is None or not llm.llm_initialized:
-            raise HTTPException(status_code=500, detail="LLM not initialized")
-
-        # Generate task ID
-        task_id = str(uuid4())
-
-        # Filter samples to label
-        if request.only_unlabeled:
-            samples_to_label = [s for s in builder.samples if not s.labeled or not s.caption]
-        else:
-            samples_to_label = builder.samples
-
-        total = len(samples_to_label)
-        if total == 0:
-            return _wrap_response({
-                "task_id": task_id,
-                "message": "All samples already labeled" if request.only_unlabeled else "No samples to label",
-                "total": 0
-            })
-
-        # Create task
-        resolved_save_path = (request.save_path.strip() if request.save_path else None) or getattr(app.state, "dataset_json_path", None)
-        resolved_save_path = os.path.normpath(resolved_save_path) if resolved_save_path else None
-        with _auto_label_lock:
-            _auto_label_tasks[task_id] = AutoLabelTask(
-                task_id=task_id,
-                status="running",
-                progress=(f"Starting... (save_path={resolved_save_path})" if resolved_save_path else "Starting..."),
-                current=0,
-                total=total,
-                save_path=resolved_save_path,
-                created_at=time.time(),
-                updated_at=time.time(),
-            )
-            global _auto_label_latest_task_id
-            _auto_label_latest_task_id = task_id
-
-        # Create initial dataset JSON immediately so users can see the file path is valid.
-        if resolved_save_path:
-            try:
-                dataset = {
-                    "metadata": builder.metadata.to_dict(),
-                    "samples": [s.to_dict() for s in builder.samples],
-                }
-                _atomic_write_json(resolved_save_path, dataset)
-            except Exception as e:
-                logger.exception("Auto-label initial save failed")
-                with _auto_label_lock:
-                    task = _auto_label_tasks.get(task_id)
-                    if task:
-                        task.progress = f"⚠️ Initial save failed: {str(e)}"
-                        task.updated_at = time.time()
-
-        # Background labeling function
-        def run_labeling():
-            mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
-            mgr.offload_decoder_to_cpu()
-
-            try:
-                with _temporary_llm_model(app, llm, request.lm_model_path):
-                    # Progress callback
-                    def progress_callback(msg: str):
-                        with _auto_label_lock:
-                            task = _auto_label_tasks.get(task_id)
-                            if task:
-                                task.progress = msg
-                                task.updated_at = time.time()
-                                import re
-                                match = re.match(r'^(?:VAE encoding|Tokenizing|Labeling|Encoding) (\d+)/(\d+)', msg)
-                                if match:
-                                    task.current = int(match.group(1))
-                                    task.total = int(match.group(2))
-
-                    resolved_jsonl_path = f"{resolved_save_path}.autolabel.jsonl" if resolved_save_path else None
-
-                    def sample_labeled_callback(sample_idx: int, sample, status: str):
-                        if "✅" not in status:
-                            return
-
-                        with _auto_label_lock:
-                            task = _auto_label_tasks.get(task_id)
-                            if task:
-                                task.progress = status
-                                task.last_updated_index = sample_idx
-                                task.last_updated_sample = sample.to_dict()
-                                task.updated_at = time.time()
-
-                        if resolved_save_path is None:
-                            return
-                        try:
-                            if resolved_jsonl_path is not None:
-                                _append_jsonl(
-                                    resolved_jsonl_path,
-                                    {
-                                        "ts": time.time(),
-                                        "index": sample_idx,
-                                        "status": status,
-                                        "sample": sample.to_dict(),
-                                    },
-                                )
-                            dataset = {
-                                "metadata": builder.metadata.to_dict(),
-                                "samples": [s.to_dict() for s in builder.samples],
-                            }
-                            _atomic_write_json(resolved_save_path, dataset)
-                        except Exception:
-                            logger.exception("Auto-label incremental save failed")
-                            with _auto_label_lock:
-                                task = _auto_label_tasks.get(task_id)
-                                if task:
-                                    task.progress = "⚠️ Auto-label incremental save failed (see server logs)"
-                                    task.updated_at = time.time()
-
-                    # Run labeling
-                    samples, status = builder.label_all_samples(
-                        dit_handler=handler,
-                        llm_handler=llm,
-                        format_lyrics=request.format_lyrics,
-                        transcribe_lyrics=request.transcribe_lyrics,
-                        skip_metas=request.skip_metas,
-                        only_unlabeled=request.only_unlabeled,
-                        chunk_size=request.chunk_size,
-                        batch_size=request.batch_size,
-                        progress_callback=progress_callback,
-                        sample_labeled_callback=sample_labeled_callback,
-                    )
-
-                    # Prepare result
-                    samples_data = [
-                        {
-                            "index": i,
-                            "filename": s.filename,
-                            "audio_path": s.audio_path,
-                            "duration": s.duration,
-                            "caption": s.caption,
-                            "genre": s.genre,
-                            "prompt_override": s.prompt_override,
-                            "lyrics": s.lyrics,
-                            "bpm": s.bpm,
-                            "keyscale": s.keyscale,
-                            "timesignature": s.timesignature,
-                            "language": s.language,
-                            "is_instrumental": s.is_instrumental,
-                            "labeled": s.labeled,
-                        }
-                        for i, s in enumerate(builder.samples)
-                    ]
-
-                    if mgr.decoder_moved:
-                        status += "\nℹ️ Decoder was temporarily offloaded during labeling and restored afterward."
-
-                    # Update task status
-                    with _auto_label_lock:
-                        task = _auto_label_tasks.get(task_id)
-                        if task:
-                            task.status = "completed"
-                            task.progress = status
-                            task.current = task.total
-                            task.updated_at = time.time()
-                            task.result = {
-                                "message": status,
-                                "labeled_count": builder.get_labeled_count(),
-                                "samples": samples_data
-                            }
-            except Exception as e:
-                with _auto_label_lock:
-                    task = _auto_label_tasks.get(task_id)
-                    if task:
-                        task.status = "failed"
-                        task.error = str(e)
-                        task.progress = f"Failed: {str(e)}"
-                        task.updated_at = time.time()
-            finally:
-                mgr.restore()
-
-        # Start background task
-        import threading
-        thread = threading.Thread(target=run_labeling, daemon=True)
-        thread.start()
-
-        return _wrap_response({
-            "task_id": task_id,
-            "message": "Auto-labeling task started",
-            "total": total
-        })
-
-    @app.get("/v1/dataset/auto_label_status/{task_id}")
-    async def get_auto_label_status(task_id: str, _: None = Depends(verify_api_key)):
-        """Get auto-labeling task status and progress."""
-        with _auto_label_lock:
-            task = _auto_label_tasks.get(task_id)
-            if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
-
-            response_data = {
-                "task_id": task.task_id,
-                "status": task.status,
-                "progress": task.progress,
-                "current": task.current,
-                "total": task.total,
-                "save_path": task.save_path,
-                "last_updated_index": task.last_updated_index,
-                "last_updated_sample": task.last_updated_sample,
-            }
-
-            if task.status == "completed" and task.result:
-                response_data["result"] = task.result
-            elif task.status == "failed" and task.error:
-                response_data["error"] = task.error
-
-            return _wrap_response(response_data)
-
-    @app.get("/v1/dataset/preprocess_status")
-    async def get_preprocess_status_latest(_: None = Depends(verify_api_key)):
-        with _preprocess_lock:
-            if _preprocess_latest_task_id is None:
-                return _wrap_response({
-                    "task_id": None,
-                    "status": "idle",
-                    "progress": "",
-                    "current": 0,
-                    "total": 0,
-                })
-
-            task = _preprocess_tasks.get(_preprocess_latest_task_id)
-            if task is None:
-                return _wrap_response({
-                    "task_id": _preprocess_latest_task_id,
-                    "status": "idle",
-                    "progress": "",
-                    "current": 0,
-                    "total": 0,
-                })
-
-            response_data = {
-                "task_id": task.task_id,
-                "status": task.status,
-                "progress": task.progress,
-                "current": task.current,
-                "total": task.total,
-            }
-
-            if task.status == "completed" and task.result:
-                response_data["result"] = task.result
-            elif task.status == "failed" and task.error:
-                response_data["error"] = task.error
-            return _wrap_response(response_data)
-
-    @app.get("/v1/dataset/auto_label_status")
-    async def get_auto_label_status_latest(_: None = Depends(verify_api_key)):
-        with _auto_label_lock:
-            if _auto_label_latest_task_id is None:
-                return _wrap_response({
-                    "task_id": None,
-                    "status": "idle",
-                    "progress": "",
-                    "current": 0,
-                    "total": 0,
-                })
-            task = _auto_label_tasks.get(_auto_label_latest_task_id)
-            if task is None:
-                return _wrap_response({
-                    "task_id": _auto_label_latest_task_id,
-                    "status": "idle",
-                    "progress": "",
-                    "current": 0,
-                    "total": 0,
-                })
-
-            response_data = {
-                "task_id": task.task_id,
-                "status": task.status,
-                "progress": task.progress,
-                "current": task.current,
-                "total": task.total,
-                "save_path": task.save_path,
-                "last_updated_index": task.last_updated_index,
-                "last_updated_sample": task.last_updated_sample,
-            }
-            if task.status == "completed" and task.result:
-                response_data["result"] = task.result
-            elif task.status == "failed" and task.error:
-                response_data["error"] = task.error
-            return _wrap_response(response_data)
-
-    @app.post("/v1/dataset/save")
-    async def save_dataset(request: SaveDatasetRequest, _: None = Depends(verify_api_key)):
-        """Save dataset to JSON file."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset to save")
-
-        try:
-            # Update metadata fields if provided
-            if request.custom_tag is not None:
-                builder.metadata.custom_tag = request.custom_tag
-            if request.tag_position is not None:
-                builder.metadata.tag_position = request.tag_position
-            if request.all_instrumental is not None:
-                builder.metadata.all_instrumental = request.all_instrumental
-            if request.genre_ratio is not None:
-                builder.metadata.genre_ratio = request.genre_ratio
-
-            status = builder.save_dataset(request.save_path.strip(), request.dataset_name)
-
-            if status.startswith("✅"):
-                app.state.dataset_json_path = request.save_path.strip()
-
-            if status.startswith("✅"):
-                return _wrap_response({"message": status, "save_path": request.save_path})
-            return _wrap_response(None, code=400, error=status)
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Save failed: {str(e)}")
-
-    @app.post("/v1/dataset/preprocess")
-    async def preprocess_dataset(request: PreprocessDatasetRequest, _: None = Depends(verify_api_key)):
-        """Preprocess dataset to tensor files for training."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded")
-
-        handler: AceStepHandler = app.state.handler
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        preprocess_notes = []
-        llm: LLMHandler = app.state.llm_handler
-        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
-        mgr.offload_decoder_to_cpu()
-        mgr.unload_llm()
-
-        try:
-            # Run preprocessing in thread pool to avoid blocking event loop
-            output_paths, status = await asyncio.to_thread(
-                builder.preprocess_to_tensors,
-                dit_handler=handler,
-                output_dir=request.output_dir.strip(),
-                skip_existing=request.skip_existing,
-                progress_callback=None,
-            )
-
-            if status.startswith("✅"):
-                if mgr.llm_unloaded:
-                    status += "\nℹ️ LLM was temporarily unloaded during preprocessing and restored afterward."
-                if mgr.decoder_moved:
-                    status += "\nℹ️ Decoder was temporarily offloaded during preprocessing and restored afterward."
-                if preprocess_notes:
-                    status += "\n" + "\n".join(preprocess_notes)
-
-                return _wrap_response({
-                    "message": status,
-                    "output_dir": request.output_dir,
-                    "num_tensors": len(output_paths)
-                })
-            return _wrap_response(None, code=400, error=status)
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Preprocessing failed: {str(e)}")
-        finally:
-            mgr.restore()
-
-    @app.post("/v1/dataset/preprocess_async")
-    async def preprocess_dataset_async(request: PreprocessDatasetRequest, _: None = Depends(verify_api_key)):
-        """Start preprocessing task asynchronously and return task_id immediately."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded")
-
-        handler: AceStepHandler = app.state.handler
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        # Generate task ID
-        task_id = str(uuid4())
-
-        # Count labeled samples
-        labeled_samples = [s for s in builder.samples if s.labeled]
-        total = len(labeled_samples)
-
-        if total == 0:
-            return _wrap_response({
-                "task_id": task_id,
-                "message": "No labeled samples to preprocess",
-                "total": 0
-            })
-
-        # Create task
-        with _preprocess_lock:
-            _preprocess_tasks[task_id] = PreprocessTask(
-                task_id=task_id,
-                status="running",
-                progress="Starting preprocessing...",
-                current=0,
-                total=total,
-                created_at=time.time(),
-            )
-            global _preprocess_latest_task_id
-            _preprocess_latest_task_id = task_id
-
-        # Background preprocessing function
-        def run_preprocessing():
-            mgr = _RuntimeComponentManager(handler=handler, llm=app.state.llm_handler, app_state=app.state)
-
-            try:
-                preprocess_notes = []
-                mgr.offload_decoder_to_cpu()
-                mgr.unload_llm()
-
-                # Progress callback
-                def progress_callback(msg: str):
-                    with _preprocess_lock:
-                        task = _preprocess_tasks.get(task_id)
-                        if task:
-                            # Extract progress from message like "Preprocessing 5/100: filename.mp3"
-                            import re
-                            match = re.match(r'Preprocessing (\d+)/(\d+)', msg)
-                            if match:
-                                task.current = int(match.group(1))
-                                task.progress = msg
-
-                # Run preprocessing
-                output_paths, status = builder.preprocess_to_tensors(
-                    dit_handler=handler,
-                    output_dir=request.output_dir.strip(),
-                    skip_existing=request.skip_existing,
-                    progress_callback=progress_callback,
-                )
-
-                if mgr.llm_unloaded:
-                    status += "\nℹ️ LLM was temporarily unloaded during preprocessing and restored afterward."
-                if mgr.decoder_moved:
-                    status += "\nℹ️ Decoder was temporarily offloaded during preprocessing and restored afterward."
-                if preprocess_notes:
-                    status += "\n" + "\n".join(preprocess_notes)
-
-                # Update task status
-                with _preprocess_lock:
-                    task = _preprocess_tasks.get(task_id)
-                    if task:
-                        task.status = "completed"
-                        task.progress = status
-                        task.current = task.total
-                        task.result = {
-                            "message": status,
-                            "output_dir": request.output_dir,
-                            "num_tensors": len(output_paths)
-                        }
-            except Exception as e:
-                with _preprocess_lock:
-                    task = _preprocess_tasks.get(task_id)
-                    if task:
-                        task.status = "failed"
-                        task.error = str(e)
-                        task.progress = f"Failed: {str(e)}"
-            finally:
-                mgr.restore()
-
-        # Start background task
-        import threading
-        thread = threading.Thread(target=run_preprocessing, daemon=True)
-        thread.start()
-
-        return _wrap_response({
-            "task_id": task_id,
-            "message": "Preprocessing task started",
-            "total": total
-        })
-
-    @app.get("/v1/dataset/preprocess_status/{task_id}")
-    async def get_preprocess_status(task_id: str, _: None = Depends(verify_api_key)):
-        """Get preprocessing task status and progress."""
-        with _preprocess_lock:
-            task = _preprocess_tasks.get(task_id)
-            if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
-
-            response_data = {
-                "task_id": task.task_id,
-                "status": task.status,
-                "progress": task.progress,
-                "current": task.current,
-                "total": task.total,
-            }
-
-            if task.status == "completed" and task.result:
-                response_data["result"] = task.result
-            elif task.status == "failed" and task.error:
-                response_data["error"] = task.error
-
-            return _wrap_response(response_data)
-
-    @app.get("/v1/dataset/samples")
-    async def get_all_samples(_: None = Depends(verify_api_key)):
-        """Get all samples in the current dataset."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded")
-
-        # Return full sample data with all metadata
-        samples_data = [
-            {
-                "index": i,
-                "filename": s.filename,
-                "audio_path": s.audio_path,
-                "duration": s.duration,
-                "caption": s.caption,
-                "genre": s.genre,
-                "prompt_override": s.prompt_override,
-                "lyrics": s.lyrics,
-                "bpm": s.bpm,
-                "keyscale": s.keyscale,
-                "timesignature": s.timesignature,
-                "language": s.language,
-                "is_instrumental": s.is_instrumental,
-                "labeled": s.labeled,
-            }
-            for i, s in enumerate(builder.samples)
-        ]
-
-        return _wrap_response({
-            "dataset_name": builder.metadata.name,
-            "num_samples": len(builder.samples),
-            "labeled_count": builder.get_labeled_count(),
-            "samples": samples_data
-        })
-
-    @app.get("/v1/dataset/sample/{sample_idx}")
-    async def get_sample(sample_idx: int, _: None = Depends(verify_api_key)):
-        """Get a specific sample by index."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded")
-
-        if sample_idx < 0 or sample_idx >= len(builder.samples):
-            raise HTTPException(status_code=404, detail=f"Sample index {sample_idx} out of range")
-
-        sample = builder.samples[sample_idx]
-        payload = sample.to_dict()
-        payload["index"] = sample_idx
-        return _wrap_response(payload)
-
-    @app.put("/v1/dataset/sample/{sample_idx}")
-    async def update_sample(sample_idx: int, request: UpdateSampleRequest, _: None = Depends(verify_api_key)):
-        """Update a sample's metadata."""
-        builder = app.state.dataset_builder
-        if builder is None:
-            raise HTTPException(status_code=400, detail="No dataset loaded")
-
-        try:
-            sample, status = builder.update_sample(
-                sample_idx,
-                caption=request.caption,
-                genre=request.genre,
-                prompt_override=request.prompt_override,
-                lyrics=request.lyrics if not request.is_instrumental else "[Instrumental]",
-                bpm=request.bpm,
-                keyscale=request.keyscale,
-                timesignature=request.timesignature,
-                language="unknown" if request.is_instrumental else request.language,
-                is_instrumental=request.is_instrumental,
-                labeled=True,
-            )
-
-            if status.startswith("✅"):
-                sample_payload = sample.to_dict()
-                sample_payload["index"] = sample_idx
-                return _wrap_response({"message": status, "sample": sample_payload})
-            else:
-                return _wrap_response(None, code=400, error=status)
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Update failed: {str(e)}")
-
     @app.post("/v1/reinitialize")
     async def reinitialize_service(_: None = Depends(verify_api_key)):
         """Reinitialize components that were unloaded during training/preprocessing."""
@@ -4435,603 +3568,16 @@ def create_app() -> FastAPI:
         except Exception as e:
             return _wrap_response(None, code=500, error=f"Reinitialization failed: {str(e)}")
 
-    @app.post("/v1/training/start")
-    async def start_training(request: StartTrainingRequest, _: None = Depends(verify_api_key)):
-        """Start LoRA training from preprocessed tensors."""
-        training_state = app.state.training_state
-
-        if training_state.get("is_training", False):
-            raise HTTPException(status_code=400, detail="Training already in progress")
-
-        handler: AceStepHandler = app.state.handler
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        # Check if decoder exists
-        if not hasattr(handler.model, 'decoder') or handler.model.decoder is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
-            )
-
-        # If a previous run wrapped the decoder via Lightning Fabric, unwrap it.
-        handler.model.decoder = _unwrap_module(handler.model.decoder)
-
-        # Dynamic component management: offload what training doesn't need,
-        # then restore after training completes/stops.
-        llm: LLMHandler = app.state.llm_handler
-        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
-        mgr.move_decoder_to(str(handler.device))
-        mgr.offload_vae_to_cpu()
-        mgr.offload_text_encoder_to_cpu()
-        mgr.offload_model_encoder_to_cpu()
-        mgr.unload_llm()
-
-        try:
-            from acestep.training.trainer import LoRATrainer
-            from acestep.training.configs import LoRAConfig as LoRAConfigClass, TrainingConfig
-        except ImportError as e:
-            raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
-
-        try:
-            lora_config = LoRAConfigClass(
-                r=request.lora_rank,
-                alpha=request.lora_alpha,
-                dropout=request.lora_dropout,
-            )
-
-            training_config = TrainingConfig(
-                shift=request.training_shift,
-                learning_rate=request.learning_rate,
-                batch_size=request.train_batch_size,
-                gradient_accumulation_steps=request.gradient_accumulation,
-                max_epochs=request.train_epochs,
-                save_every_n_epochs=request.save_every_n_epochs,
-                seed=request.training_seed,
-                output_dir=request.lora_output_dir,
-                use_fp8=request.use_fp8,
-                gradient_checkpointing=request.gradient_checkpointing,
-            )
-
-            fp8_status = ""
-            if request.use_fp8:
-                try:
-                    try:
-                        from torchao.float8 import convert_to_float8_training  # type: ignore
-                    except Exception:
-                        from torchao.float8.float8_linear_utils import convert_to_float8_training  # type: ignore
-
-                    _ = convert_to_float8_training
-                    fp8_status = "✅ FP8 training requested (torchao float8)"
-                except ImportError:
-                    fp8_status = "⚠️ torchao not available, using bf16"
-                except Exception as e:
-                    fp8_status = f"⚠️ FP8 failed ({e}), using bf16"
-
-            trainer = LoRATrainer(
-                dit_handler=handler,
-                lora_config=lora_config,
-                training_config=training_config,
-            )
-
-            # TensorBoard log directory
-            tensorboard_logdir = os.path.join(request.lora_output_dir, "logs")
-            os.makedirs(tensorboard_logdir, exist_ok=True)
-
-            import time
-            run_id = str(uuid4())
-            training_state["is_training"] = True
-            training_state["should_stop"] = False
-            training_state["run_id"] = run_id
-            training_state["trainer"] = trainer
-            training_state["tensor_dir"] = request.tensor_dir
-            training_state["tensorboard_logdir"] = tensorboard_logdir
-            training_state["current_step"] = 0
-            training_state["current_loss"] = None
-            training_state["status"] = "Starting..."
-            training_state["loss_history"] = []  # Track loss history for plotting
-            training_state["training_log"] = "Starting..."  # Accumulated log text for frontend
-            training_state["start_time"] = time.time()  # Track training start time
-            training_state["current_epoch"] = 0
-            training_state["last_step_time"] = time.time()  # For speed calculation
-            training_state["steps_per_second"] = 0.0
-            training_state["estimated_time_remaining"] = 0.0
-            training_state["error"] = None
-            training_state["config"] = {
-                "lora_rank": request.lora_rank,
-                "lora_alpha": request.lora_alpha,
-                "learning_rate": request.learning_rate,
-                "epochs": request.train_epochs,
-            }
-
-            training_state["_component_manager"] = mgr
-
-            # Start TensorBoard server if not already running
-            training_state["tensorboard_url"] = _start_tensorboard(app, tensorboard_logdir)
-
-            def _run_training_sync():
-                """Run training synchronously in thread pool."""
-                try:
-                    local_run_id = run_id
-                    if training_state.get("training_log"):
-                        training_state["training_log"] += "\n🚀 Training thread started"
-                    else:
-                        training_state["training_log"] = "🚀 Training thread started"
-                    for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
-                        if training_state.get("run_id") != local_run_id:
-                            break
-                        training_state["current_step"] = step
-                        training_state["current_loss"] = loss
-                        training_state["status"] = status
-
-                        # Accumulate loss history (only valid values)
-                        if step > 0 and loss is not None and loss == loss:  # Check for NaN
-                            training_state["loss_history"].append({"step": step, "loss": float(loss)})
-                            # Keep last 1000 points to avoid unbounded growth
-                            if len(training_state["loss_history"]) > 1000:
-                                training_state["loss_history"] = training_state["loss_history"][-1000:]
-
-                            # Extract epoch from status (e.g., "Epoch 1/1000, Step 5, Loss: 0.1234")
-                        import re
-                        epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
-                        if epoch_match:
-                            training_state["current_epoch"] = int(epoch_match.group(1))
-
-                            # Calculate training speed and ETA
-                        current_time = time.time()
-                        if step > 1:
-                            elapsed_since_last = current_time - training_state["last_step_time"]
-                            if elapsed_since_last > 0:
-                                training_state["steps_per_second"] = 1.0 / elapsed_since_last
-
-                                    # Calculate ETA based on total steps
-                                total_epochs = training_state["config"]["epochs"]
-                                    # Estimate total steps (rough estimate)
-                                if training_state["current_epoch"] > 0:
-                                    steps_per_epoch = step / training_state["current_epoch"]
-                                    total_steps = int(steps_per_epoch * total_epochs)
-                                    remaining_steps = total_steps - step
-                                    training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
-
-                        training_state["last_step_time"] = current_time
-
-                        if loss is not None and loss == loss:
-                            log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
-                        else:
-                            log_entry = f"Step {step}: {status}"
-                        if training_state["training_log"]:
-                            training_state["training_log"] += "\n" + log_entry
-                        else:
-                            training_state["training_log"] = log_entry
-                            # Keep last 100 lines to avoid unbounded growth
-                        log_lines = training_state["training_log"].split("\n")
-                        if len(log_lines) > 100:
-                            training_state["training_log"] = "\n".join(log_lines[-100:])
-
-                        if training_state.get("should_stop", False):
-                            break
-
-                    training_state["is_training"] = False
-                except Exception as e:
-                    training_state["is_training"] = False
-                    training_state["error"] = str(e)
-                finally:
-                    # Restore components regardless of stop/failure.
-                    try:
-                        if handler.model is not None and getattr(handler.model, "decoder", None) is not None:
-                            handler.model.decoder = _unwrap_module(handler.model.decoder)
-                            handler.model.decoder.eval()
-                    except Exception:
-                        pass
-                    try:
-                        cm = training_state.pop("_component_manager", None)
-                        if cm is not None:
-                            cm.restore()
-                    except Exception:
-                        pass
-
-            import threading
-            threading.Thread(target=_run_training_sync, daemon=True).start()
-
-            message = "Training started"
-            if fp8_status:
-                message += f"\n{fp8_status}"
-
-            return _wrap_response({
-                "message": message,
-                "tensor_dir": request.tensor_dir,
-                "output_dir": request.lora_output_dir,
-                "config": training_state["config"],
-                "fp8_enabled": request.use_fp8
-            })
-
-        except Exception as e:
-            training_state["is_training"] = False
-            try:
-                mgr.restore()
-            except Exception:
-                pass
-            return _wrap_response(None, code=500, error=f"Failed to start training: {str(e)}")
-
-    @app.post("/v1/training/start_lokr")
-    async def start_lokr_training(request: StartLoKRTrainingRequest, _: None = Depends(verify_api_key)):
-        """Start LoKR training from preprocessed tensors."""
-        training_state = app.state.training_state
-
-        if training_state.get("is_training", False):
-            raise HTTPException(status_code=400, detail="Training already in progress")
-
-        handler: AceStepHandler = app.state.handler
-        if handler is None or handler.model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        if not hasattr(handler.model, 'decoder') or handler.model.decoder is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Decoder not found. Please reload the model via /v1/reinitialize before training."
-            )
-
-        # If a previous run wrapped the decoder via Lightning Fabric, unwrap it.
-        handler.model.decoder = _unwrap_module(handler.model.decoder)
-
-        llm: LLMHandler = app.state.llm_handler
-        mgr = _RuntimeComponentManager(handler=handler, llm=llm, app_state=app.state)
-        mgr.move_decoder_to(str(handler.device))
-        mgr.offload_vae_to_cpu()
-        mgr.offload_text_encoder_to_cpu()
-        mgr.offload_model_encoder_to_cpu()
-        mgr.unload_llm()
-
-        try:
-            from acestep.training.trainer import LoKRTrainer
-            from acestep.training.configs import LoKRConfig as LoKRConfigClass, TrainingConfig
-        except ImportError as e:
-            raise HTTPException(status_code=500, detail=f"Missing training dependencies: {e}")
-
-        try:
-            _factor = request.lokr_factor
-            if _factor != -1:
-                _factor = int(_factor)
-                if _factor == 0:
-                    _factor = 1
-                _factor = min(_factor, 8)
-
-            lokr_config = LoKRConfigClass(
-                linear_dim=request.lokr_linear_dim,
-                linear_alpha=request.lokr_linear_alpha,
-                factor=_factor,
-                decompose_both=request.lokr_decompose_both,
-                use_tucker=request.lokr_use_tucker,
-                use_scalar=request.lokr_use_scalar,
-                weight_decompose=request.lokr_weight_decompose,
-            )
-
-            training_config = TrainingConfig(
-                shift=request.training_shift,
-                learning_rate=request.learning_rate,
-                batch_size=request.train_batch_size,
-                gradient_accumulation_steps=request.gradient_accumulation,
-                max_epochs=request.train_epochs,
-                save_every_n_epochs=request.save_every_n_epochs,
-                seed=request.training_seed,
-                output_dir=request.output_dir,
-                gradient_checkpointing=request.gradient_checkpointing,
-            )
-
-            trainer = LoKRTrainer(
-                dit_handler=handler,
-                lokr_config=lokr_config,
-                training_config=training_config,
-            )
-
-            tensorboard_logdir = os.path.join(request.output_dir, "logs")
-            os.makedirs(tensorboard_logdir, exist_ok=True)
-
-            import time as _time
-            run_id = str(uuid4())
-            training_state["is_training"] = True
-            training_state["should_stop"] = False
-            training_state["run_id"] = run_id
-            training_state["trainer"] = trainer
-            training_state["tensor_dir"] = request.tensor_dir
-            training_state["tensorboard_logdir"] = tensorboard_logdir
-            training_state["current_step"] = 0
-            training_state["current_loss"] = None
-            training_state["status"] = "Starting..."
-            training_state["loss_history"] = []
-            training_state["training_log"] = "Starting..."
-            training_state["start_time"] = _time.time()
-            training_state["current_epoch"] = 0
-            training_state["last_step_time"] = _time.time()
-            training_state["steps_per_second"] = 0.0
-            training_state["estimated_time_remaining"] = 0.0
-            training_state["error"] = None
-            training_state["config"] = {
-                "adapter_type": "lokr",
-                "lokr_linear_dim": request.lokr_linear_dim,
-                "lokr_linear_alpha": request.lokr_linear_alpha,
-                "lokr_factor": request.lokr_factor,
-                "lokr_decompose_both": request.lokr_decompose_both,
-                "lokr_use_tucker": request.lokr_use_tucker,
-                "lokr_use_scalar": request.lokr_use_scalar,
-                "lokr_weight_decompose": request.lokr_weight_decompose,
-                "learning_rate": request.learning_rate,
-                "epochs": request.train_epochs,
-            }
-
-            training_state["_component_manager"] = mgr
-
-            training_state["tensorboard_url"] = _start_tensorboard(app, tensorboard_logdir)
-
-            def _run_lokr_training_sync():
-                """Run LoKR training synchronously in thread pool."""
-                try:
-                    local_run_id = run_id
-                    if training_state.get("training_log"):
-                        training_state["training_log"] += "\n🚀 Training thread started"
-                    else:
-                        training_state["training_log"] = "🚀 Training thread started"
-                    for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
-                        if training_state.get("run_id") != local_run_id:
-                            break
-                        training_state["current_step"] = step
-                        training_state["current_loss"] = loss
-                        training_state["status"] = status
-
-                        if step > 0 and loss is not None and loss == loss:
-                            training_state["loss_history"].append({"step": step, "loss": float(loss)})
-                            if len(training_state["loss_history"]) > 1000:
-                                training_state["loss_history"] = training_state["loss_history"][-1000:]
-
-                        import re
-                        epoch_match = re.search(r"Epoch (\d+)/(\d+)", status)
-                        if epoch_match:
-                            training_state["current_epoch"] = int(epoch_match.group(1))
-
-                        current_time = _time.time()
-                        if step > 1:
-                            elapsed_since_last = current_time - training_state["last_step_time"]
-                            if elapsed_since_last > 0:
-                                training_state["steps_per_second"] = 1.0 / elapsed_since_last
-
-                                total_epochs = training_state["config"]["epochs"]
-                                if training_state["current_epoch"] > 0:
-                                    steps_per_epoch = step / training_state["current_epoch"]
-                                    total_steps = int(steps_per_epoch * total_epochs)
-                                    remaining_steps = total_steps - step
-                                    training_state["estimated_time_remaining"] = remaining_steps / training_state["steps_per_second"]
-
-                        training_state["last_step_time"] = current_time
-
-                        if loss is not None and loss == loss:
-                            log_entry = f"Step {step}: Loss {loss:.4f} - {status}"
-                        else:
-                            log_entry = f"Step {step}: {status}"
-                        if training_state["training_log"]:
-                            training_state["training_log"] += "\n" + log_entry
-                        else:
-                            training_state["training_log"] = log_entry
-                        log_lines = training_state["training_log"].split("\n")
-                        if len(log_lines) > 100:
-                            training_state["training_log"] = "\n".join(log_lines[-100:])
-
-                        if training_state.get("should_stop", False):
-                            break
-
-                    training_state["is_training"] = False
-                except Exception as e:
-                    training_state["is_training"] = False
-                    training_state["error"] = str(e)
-                finally:
-                    try:
-                        if handler.model is not None and getattr(handler.model, "decoder", None) is not None:
-                            handler.model.decoder = _unwrap_module(handler.model.decoder)
-                            handler.model.decoder.eval()
-                    except Exception:
-                        pass
-                    try:
-                        cm = training_state.get("_component_manager")
-                        if cm is not None:
-                            cm.restore()
-                    except Exception:
-                        pass
-
-            import threading
-            threading.Thread(target=_run_lokr_training_sync, daemon=True).start()
-
-            return _wrap_response({
-                "message": "LoKR training started",
-                "tensor_dir": request.tensor_dir,
-                "output_dir": request.output_dir,
-                "config": training_state["config"],
-            })
-
-        except Exception as e:
-            training_state["is_training"] = False
-            try:
-                mgr.restore()
-            except Exception:
-                pass
-            return _wrap_response(None, code=500, error=f"Failed to start LoKR training: {str(e)}")
-
-    @app.post("/v1/training/stop")
-    async def stop_training(_: None = Depends(verify_api_key)):
-        """Stop the current training process."""
-        training_state = app.state.training_state
-
-        if training_state.get("is_training", False):
-            training_state["should_stop"] = True
-        try:
-            _stop_tensorboard(app)
-        except Exception:
-            pass
-
-        # Clear UI-visible state immediately so the frontend doesn't mix old
-        # logs/status when switching adapter types.
-        # IMPORTANT: do NOT remove keys that the running training thread may
-        # still touch; reset them to safe values instead.
-        try:
-            training_state["current_step"] = 0
-            training_state["current_loss"] = None
-            training_state["status"] = "Stopping..."
-            training_state["loss_history"] = []
-            training_state["training_log"] = ""
-            training_state["tensorboard_url"] = None
-            training_state["tensorboard_logdir"] = None
-            training_state["steps_per_second"] = 0.0
-            training_state["estimated_time_remaining"] = 0.0
-            training_state["error"] = None
-        except Exception:
-            pass
-
-        if training_state.get("is_training", False):
-            return _wrap_response({"message": "Stopping training..."})
-        return _wrap_response({"message": "No training in progress"})
-
-    @app.post("/v1/training/load_tensor_info")
-    async def load_tensor_info(request: dict, _: None = Depends(verify_api_key)):
-        """Load preprocessed tensor dataset info from directory."""
-        tensor_dir = request.get("tensor_dir", "").strip()
-
-        if not tensor_dir:
-            raise HTTPException(status_code=400, detail="Please enter a tensor directory path")
-
-        if not os.path.exists(tensor_dir):
-            raise HTTPException(status_code=400, detail=f"Directory not found: {tensor_dir}")
-
-        if not os.path.isdir(tensor_dir):
-            raise HTTPException(status_code=400, detail=f"Not a directory: {tensor_dir}")
-
-        try:
-            # Check for manifest.json (created by preprocess_to_tensors)
-            manifest_path = os.path.join(tensor_dir, "manifest.json")
-            dataset_name = "Unknown"
-            num_samples = 0
-            custom_tag = ""
-            has_manifest = False
-
-            if os.path.exists(manifest_path):
-                try:
-                    with open(manifest_path, 'r', encoding='utf-8') as f:
-                        manifest = json.load(f)
-
-                    num_samples = manifest.get("num_samples", 0)
-                    metadata = manifest.get("metadata", {})
-                    dataset_name = metadata.get("name", "Unknown")
-                    custom_tag = metadata.get("custom_tag", "")
-                    has_manifest = True
-
-                    message = f"✅ Loaded preprocessed dataset: {dataset_name}\n"
-                    message += f"📊 Samples: {num_samples} preprocessed tensors"
-                    if custom_tag:
-                        message += f"\n🏷️ Custom Tag: {custom_tag}"
-
-                    return _wrap_response({
-                        "dataset_name": dataset_name,
-                        "num_samples": num_samples,
-                        "custom_tag": custom_tag,
-                        "tensor_dir": tensor_dir,
-                        "message": message
-                    })
-                except Exception as e:
-                    # Manifest exists but failed to parse, continue to fallback
-                    pass
-
-            # Fallback: count .pt files
-            pt_files = [f for f in os.listdir(tensor_dir) if f.endswith('.pt')]
-            num_samples = len(pt_files)
-
-            if num_samples == 0:
-                raise HTTPException(status_code=400, detail=f"No .pt tensor files found in {tensor_dir}")
-
-            message = f"✅ Found {num_samples} tensor files in {tensor_dir}\n"
-            message += "⚠️ No manifest.json found - using all .pt files"
-
-            return _wrap_response({
-                "dataset_name": dataset_name,
-                "num_samples": num_samples,
-                "custom_tag": custom_tag,
-                "tensor_dir": tensor_dir,
-                "message": message
-            })
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Failed to load tensor info: {str(e)}")
-
-    @app.get("/v1/training/status")
-    async def get_training_status(_: None = Depends(verify_api_key)):
-        """Get current training status."""
-        training_state = app.state.training_state
-
-        is_training = training_state.get("is_training", False)
-
-        response = {
-            "is_training": is_training,
-            "should_stop": training_state.get("should_stop", False),
-        }
-
-        if is_training:
-            response.update({
-                "current_step": training_state.get("current_step", 0),
-                "current_loss": training_state.get("current_loss"),
-                "status": training_state.get("status", "Training..."),
-                "config": training_state.get("config", {}),
-                "tensor_dir": training_state.get("tensor_dir", ""),
-                "loss_history": training_state.get("loss_history", []),
-                "tensorboard_url": training_state.get("tensorboard_url"),
-                "tensorboard_logdir": training_state.get("tensorboard_logdir"),
-                "training_log": training_state.get("training_log", ""),
-                "start_time": training_state.get("start_time"),
-                "current_epoch": training_state.get("current_epoch", 0),
-                "steps_per_second": training_state.get("steps_per_second", 0.0),
-                "estimated_time_remaining": training_state.get("estimated_time_remaining", 0.0),
-            })
-
-        if "error" in training_state:
-            response["error"] = training_state["error"]
-
-        return _wrap_response(response)
-
-    @app.post("/v1/training/export")
-    async def export_lora(request: ExportLoRARequest, _: None = Depends(verify_api_key)):
-        """Export trained LoRA weights."""
-        import shutil
-
-        final_dir = os.path.join(request.lora_output_dir, "final")
-        checkpoint_dir = os.path.join(request.lora_output_dir, "checkpoints")
-
-        if os.path.exists(final_dir):
-            source_path = final_dir
-        elif os.path.exists(checkpoint_dir):
-            checkpoints = [d for d in os.listdir(checkpoint_dir) if d.startswith("epoch_")]
-            if not checkpoints:
-                raise HTTPException(status_code=404, detail="No checkpoints found")
-
-            checkpoints.sort(key=lambda x: int(x.split("_")[1]))
-            latest = checkpoints[-1]
-            source_path = os.path.join(checkpoint_dir, latest)
-        else:
-            raise HTTPException(status_code=404, detail=f"No trained model found in {request.lora_output_dir}")
-
-        try:
-            export_path = request.export_path.strip()
-            os.makedirs(os.path.dirname(export_path) if os.path.dirname(export_path) else ".", exist_ok=True)
-
-            if os.path.exists(export_path):
-                shutil.rmtree(export_path)
-
-            shutil.copytree(source_path, export_path)
-
-            return _wrap_response({
-                "message": f"LoRA exported successfully",
-                "export_path": export_path,
-                "source": source_path
-            })
-
-        except Exception as e:
-            return _wrap_response(None, code=500, error=f"Export failed: {str(e)}")
+    register_training_api_routes(
+        app=app,
+        verify_api_key=verify_api_key,
+        wrap_response=_wrap_response,
+        start_tensorboard=_start_tensorboard,
+        stop_tensorboard=_stop_tensorboard,
+        temporary_llm_model=_temporary_llm_model,
+        atomic_write_json=_atomic_write_json,
+        append_jsonl=_append_jsonl,
+    )
 
     @app.get("/v1/audio")
     async def get_audio(path: str, request: Request, _: None = Depends(verify_api_key)):

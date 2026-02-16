@@ -50,6 +50,7 @@ from acestep.training.lokr_utils import (
     check_lycoris_available,
 )
 from acestep.training.data_module import PreprocessedDataModule
+from acestep.training.path_safety import safe_path
 
 
 # Turbo model shift=3.0 discrete timesteps (8 steps, same as inference)
@@ -607,6 +608,8 @@ class LoRATrainer:
         """
         self.dit_handler = dit_handler
         self.lora_config = lora_config
+        # Validate output_dir early so all downstream path operations are safe
+        training_config.output_dir = safe_path(training_config.output_dir)
         self.training_config = training_config
 
         self.module = None
@@ -646,7 +649,12 @@ class LoRATrainer:
                 return
 
             # Validate tensor directory
-            if not os.path.exists(tensor_dir):
+            try:
+                tensor_dir = safe_path(tensor_dir)
+            except ValueError:
+                yield 0, 0.0, f"❌ Rejected unsafe tensor directory: {tensor_dir}"
+                return
+            if not os.path.isdir(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
 
@@ -859,6 +867,12 @@ class LoRATrainer:
         global_step = 0
         checkpoint_info = None
 
+        if resume_from:
+            try:
+                resume_from = safe_path(resume_from)
+            except ValueError:
+                yield 0, 0.0, f"⚠️ Rejected unsafe checkpoint path: {resume_from}, starting fresh"
+                resume_from = None
         if resume_from and os.path.exists(resume_from):
             try:
                 yield 0, 0.0, f"🔄 Loading checkpoint from {resume_from}..."
@@ -1320,6 +1334,8 @@ class LoKRTrainer:
     ):
         self.dit_handler = dit_handler
         self.lokr_config = lokr_config
+        # Validate output_dir early so all downstream path operations are safe
+        training_config.output_dir = safe_path(training_config.output_dir)
         self.training_config = training_config
 
         self.module = None
@@ -1347,7 +1363,12 @@ class LoKRTrainer:
                 )
                 return
 
-            if not os.path.exists(tensor_dir):
+            try:
+                tensor_dir = safe_path(tensor_dir)
+            except ValueError:
+                yield 0, 0.0, f"❌ Rejected unsafe tensor directory: {tensor_dir}"
+                return
+            if not os.path.isdir(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
 

@@ -191,7 +191,24 @@ if [[ ! -d "$SCRIPT_DIR/.venv" ]]; then
     echo "Running: uv sync"
     echo
 
-    cd "$SCRIPT_DIR" && uv sync
+    if ! (cd "$SCRIPT_DIR" && uv sync); then
+        echo
+        echo "[Retry] Online sync failed, retrying in offline mode..."
+        echo
+        if ! (cd "$SCRIPT_DIR" && uv sync --offline); then
+            echo
+            echo "========================================"
+            echo "[Error] Failed to setup environment"
+            echo "========================================"
+            echo
+            echo "Both online and offline modes failed."
+            echo "Please check:"
+            echo "  1. Your internet connection (required for first-time setup)"
+            echo "  2. Ensure you have enough disk space"
+            echo "  3. Try running: uv sync manually"
+            exit 1
+        fi
+    fi
 
     echo
     echo "========================================"
@@ -204,9 +221,26 @@ echo "Starting ACE-Step API Server (MLX backend)..."
 echo
 
 # Build command with optional parameters
-CMD=(uv run acestep-api --host "$HOST" --port "$PORT")
-[[ -n "$API_KEY" ]] && CMD+=(--api-key "$API_KEY")
-[[ -n "$DOWNLOAD_SOURCE" ]] && CMD+=(--download-source "$DOWNLOAD_SOURCE")
-[[ -n "$LM_MODEL_PATH" ]] && CMD+=(--lm-model-path "$LM_MODEL_PATH")
+ACESTEP_ARGS=(acestep-api --host "$HOST" --port "$PORT")
+[[ -n "$API_KEY" ]] && ACESTEP_ARGS+=(--api-key "$API_KEY")
+[[ -n "$DOWNLOAD_SOURCE" ]] && ACESTEP_ARGS+=(--download-source "$DOWNLOAD_SOURCE")
+[[ -n "$LM_MODEL_PATH" ]] && ACESTEP_ARGS+=(--lm-model-path "$LM_MODEL_PATH")
 
-cd "$SCRIPT_DIR" && exec "${CMD[@]}"
+cd "$SCRIPT_DIR" && uv run "${ACESTEP_ARGS[@]}" || {
+    echo
+    echo "[Retry] Online dependency resolution failed, retrying in offline mode..."
+    echo
+    uv run --offline "${ACESTEP_ARGS[@]}" || {
+        echo
+        echo "========================================"
+        echo "[Error] Failed to start ACE-Step API Server"
+        echo "========================================"
+        echo
+        echo "Both online and offline modes failed."
+        echo "Please check:"
+        echo "  1. Your internet connection (for first-time setup)"
+        echo "  2. If dependencies were previously installed (offline mode requires a prior successful install)"
+        echo "  3. Try running: uv sync --offline"
+        exit 1
+    }
+}
