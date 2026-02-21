@@ -99,13 +99,73 @@ def _load_lokr_config(weights_path: str) -> LoKRConfig:
 
 
 def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
-    """Inject and load a LoKr LyCORIS adapter into ``decoder``."""
+    """Inject and load a LoKr LyCORIS adapter into ``decoder``.
+
+    Uses ``create_lycoris_from_weights`` to reconstruct the exact network
+    structure directly from the saved weight keys.  This avoids silent
+    mismatches that occur when the metadata ``lokr_config`` is missing,
+    incomplete, or out-of-sync with the actual trained weights — the old
+    config-based path called ``load_state_dict(strict=False)`` which
+    silently dropped every unmatched key, leaving LoKr modules at their
+    random/zero initialisation and producing garbage outputs.
+    """
     try:
-        from lycoris import LycorisNetwork, create_lycoris
+        from lycoris import LycorisNetwork
     except ImportError as exc:
         raise ImportError("LyCORIS library not installed. Please install with: pip install lycoris-lora") from exc
 
+    # Clean up any existing LyCORIS network left by a previous load or
+    # training run.  Without this, apply_to() wraps already-wrapped layers
+    # causing double-injection and completely wrong outputs.
+    prev_net = getattr(decoder, "_lycoris_net", None)
+    if prev_net is not None:
+        try:
+            if hasattr(prev_net, "restore"):
+                prev_net.restore()
+                logger.info("Restored previous LyCORIS network before loading new LoKr adapter")
+        except Exception:
+            logger.warning("Failed to restore previous LyCORIS network; continuing with best effort")
+        try:
+            delattr(decoder, "_lycoris_net")
+        except Exception:
+            pass
+
+    # Primary path: reconstruct network structure from saved weight keys.
+    # create_lycoris_from_weights inspects the state-dict keys, matches
+    # them to decoder submodules via the LORA_PREFIX naming convention,
+    # and rebuilds each LyCORIS module with the correct dim / factor /
+    # DoRA settings inferred from the weight tensors themselves.  This is
+    # strictly more robust than the old config-based path because it needs
+    # no metadata at all.
+    try:
+        from lycoris import create_lycoris_from_weights
+
+        lycoris_net, _weights_sd = create_lycoris_from_weights(
+            1.0, weights_path, decoder,
+        )
+        n_modules = len(lycoris_net.loras)
+        if n_modules == 0:
+            logger.warning(
+                f"No LoKr modules matched decoder from {weights_path} — "
+                "adapter will have no effect"
+            )
+        else:
+            logger.info(f"LoKr adapter: {n_modules} modules reconstructed from weights")
+        lycoris_net.apply_to()
+        decoder._lycoris_net = lycoris_net
+        return lycoris_net
+    except Exception:
+        logger.warning(
+            "create_lycoris_from_weights unavailable or failed; "
+            "falling back to config-based loading",
+            exc_info=True,
+        )
+
+    # Fallback: config-based loading (original approach).
+    from lycoris import create_lycoris
+
     lokr_config = _load_lokr_config(weights_path)
+    logger.info(f"Fallback LoKr config from metadata: {lokr_config.to_dict()}")
     LycorisNetwork.apply_preset(
         {
             "unet_target_name": lokr_config.target_modules,
@@ -151,7 +211,15 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
 
     lycoris_net.apply_to()
     decoder._lycoris_net = lycoris_net
-    lycoris_net.load_weights(weights_path)
+    load_result = lycoris_net.load_weights(weights_path)
+    if isinstance(load_result, dict):
+        missing = load_result.get("missing keys") or load_result.get("missing_keys") or []
+        unexpected = load_result.get("unexpected keys") or load_result.get("unexpected_keys") or []
+        if missing:
+            logger.warning(f"LoKr load_weights missing keys ({len(missing)}): {missing[:5]}")
+        if unexpected:
+            logger.warning(f"LoKr load_weights unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+    logger.info(f"LoKr adapter loaded via fallback config path ({len(lycoris_net.loras)} modules)")
     return lycoris_net
 
 

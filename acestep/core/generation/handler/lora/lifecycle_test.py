@@ -216,5 +216,54 @@ class LifecycleTests(unittest.TestCase):
         handler.model.decoder.load_state_dict.assert_not_called()
 
 
+    def test_load_lokr_adapter_cleans_up_existing_lycoris_before_injection(self):
+        """When decoder has a stale _lycoris_net, _load_lokr_adapter should restore it first."""
+        decoder = _DummyDecoder()
+        old_net = Mock()
+        old_net.restore = Mock()
+        decoder._lycoris_net = old_net
+
+        new_net = Mock()
+        create_lycoris = Mock(return_value=new_net)
+        fake_lycoris = SimpleNamespace(
+            LycorisNetwork=SimpleNamespace(apply_preset=Mock()),
+            create_lycoris=create_lycoris,
+        )
+        config = lifecycle.LoKRConfig()
+
+        with patch.dict("sys.modules", {"lycoris": fake_lycoris}):
+            with patch("acestep.core.generation.handler.lora.lifecycle._load_lokr_config", return_value=config):
+                result = lifecycle._load_lokr_adapter(decoder, "weights.safetensors")
+
+        old_net.restore.assert_called_once()
+        self.assertIs(result, new_net)
+        new_net.apply_to.assert_called_once()
+        new_net.load_weights.assert_called_once_with("weights.safetensors")
+        self.assertIs(decoder._lycoris_net, new_net)
+
+    def test_load_lokr_adapter_continues_when_prev_restore_fails(self):
+        """If restoring previous _lycoris_net fails, should warn and proceed."""
+        decoder = _DummyDecoder()
+        old_net = Mock()
+        old_net.restore = Mock(side_effect=RuntimeError("restore boom"))
+        decoder._lycoris_net = old_net
+
+        new_net = Mock()
+        create_lycoris = Mock(return_value=new_net)
+        fake_lycoris = SimpleNamespace(
+            LycorisNetwork=SimpleNamespace(apply_preset=Mock()),
+            create_lycoris=create_lycoris,
+        )
+        config = lifecycle.LoKRConfig()
+
+        with patch.dict("sys.modules", {"lycoris": fake_lycoris}):
+            with patch("acestep.core.generation.handler.lora.lifecycle._load_lokr_config", return_value=config):
+                result = lifecycle._load_lokr_adapter(decoder, "weights.safetensors")
+
+        old_net.restore.assert_called_once()
+        self.assertIs(result, new_net)
+        new_net.apply_to.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

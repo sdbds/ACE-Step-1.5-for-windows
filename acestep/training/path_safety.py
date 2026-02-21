@@ -76,10 +76,20 @@ def safe_path(user_path: str, *, base: Optional[str] = None) -> str:
         root = _SAFE_ROOT
 
     # Resolve the user path.  If relative, join against *root* first.
-    if os.path.isabs(user_path):
+    is_abs = os.path.isabs(user_path)
+    if is_abs:
         normalised = _resolve(user_path)
     else:
         normalised = _resolve(os.path.join(root, user_path))
+
+    # ── Windows absolute-path bypass ──
+    # On Windows, absolute paths may reference a different drive letter
+    # (e.g. ``D:\datasets`` when CWD is ``E:\Code\...``).  The root
+    # containment check would reject these valid cross-drive paths.
+    # When the caller supplied an explicit absolute path (or an explicit
+    # *base* was given), trust the resolved result on Windows.
+    if os.name == "nt" and (is_abs or base is not None):
+        return normalised
 
     # ── CodeQL-recognised sanitiser barrier ──
     # ``normpath(…).startswith(safe_prefix)`` is the pattern that
