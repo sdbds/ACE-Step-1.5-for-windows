@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 from typing import Any, Optional
 
+import torch
 from loguru import logger
 
 from acestep.handler import AceStepHandler
@@ -43,6 +45,8 @@ class RuntimeComponentManager:
         self._vae_prev_device: Optional[str] = None
         self._text_encoder_prev_device: Optional[str] = None
         self._model_encoder_prev_device: Optional[str] = None
+        self._model_tokenizer_prev_device: Optional[str] = None
+        self._model_detokenizer_prev_device: Optional[str] = None
 
     @staticmethod
     def _device_of(module: Any) -> Optional[str]:
@@ -120,6 +124,32 @@ class RuntimeComponentManager:
         if self._model_encoder_prev_device and not self._model_encoder_prev_device.startswith("cpu"):
             self._move_module(encoder, "cpu")
 
+    def offload_model_tokenizer_to_cpu(self) -> None:
+        """Move DiT tokenizer branch to CPU when present."""
+
+        model = getattr(self.handler, "model", None)
+        tokenizer = getattr(model, "tokenizer", None)
+        self._model_tokenizer_prev_device = self._device_of(tokenizer)
+        if self._model_tokenizer_prev_device and not self._model_tokenizer_prev_device.startswith("cpu"):
+            self._move_module(tokenizer, "cpu")
+
+    def offload_model_detokenizer_to_cpu(self) -> None:
+        """Move DiT detokenizer branch to CPU when present."""
+
+        model = getattr(self.handler, "model", None)
+        detokenizer = getattr(model, "detokenizer", None)
+        self._model_detokenizer_prev_device = self._device_of(detokenizer)
+        if self._model_detokenizer_prev_device and not self._model_detokenizer_prev_device.startswith("cpu"):
+            self._move_module(detokenizer, "cpu")
+
+    @staticmethod
+    def flush_gpu_cache() -> None:
+        """Force Python GC and release cached CUDA memory after offloading."""
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def unload_llm(self) -> None:
         """Unload LLM to release VRAM and mark state flags."""
 
@@ -147,10 +177,13 @@ class RuntimeComponentManager:
         except Exception:
             logger.exception("Failed to restore decoder")
 
+        model = getattr(self.handler, "model", None)
         for module, prev in (
             (getattr(self.handler, "vae", None), self._vae_prev_device),
             (getattr(self.handler, "text_encoder", None), self._text_encoder_prev_device),
-            (getattr(getattr(self.handler, "model", None), "encoder", None), self._model_encoder_prev_device),
+            (getattr(model, "encoder", None), self._model_encoder_prev_device),
+            (getattr(model, "tokenizer", None), self._model_tokenizer_prev_device),
+            (getattr(model, "detokenizer", None), self._model_detokenizer_prev_device),
         ):
             if module is None or not prev:
                 continue

@@ -794,10 +794,10 @@ class LoRATrainer:
                 else:
                     yield 0, 0.0, "⚠️ FP8 requested but unavailable, using bf16"
 
-        # Keep decoder weights in a stable dtype before optimizer/Fabric setup.
-        # MPS stays in fp32 weights for stability; computation still uses fp16
-        # autocast inside training_step.
-        if device_type == "mps" or precision.endswith("-mixed"):
+        # Keep frozen weights in compute dtype (bf16/fp16) for memory efficiency.
+        # Only trainable (LoRA) parameters are promoted to fp32 for optimizer stability.
+        # MPS uses fp32 weights throughout for numerical stability.
+        if device_type == "mps":
             self.module.model.decoder = self.module.model.decoder.to(dtype=torch.float32)
         else:
             self.module.model.decoder = self.module.model.decoder.to(dtype=self.module.dtype)
@@ -868,9 +868,6 @@ class LoRATrainer:
             schedulers=[warmup_scheduler, main_scheduler],
             milestones=[warmup_steps],
         )
-
-        if not getattr(self.module, "fp8_enabled", False):
-            self.module.model = self.module.model.to(self.module.dtype)
 
         # Setup with Fabric - only the decoder (which has LoRA)
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
@@ -1520,7 +1517,10 @@ class LoKRTrainer:
                 "relying on AMP/GradScaler handling."
             )
 
-        if device_type == "mps" or precision.endswith("-mixed"):
+        # Keep frozen weights in compute dtype (bf16/fp16) for memory efficiency.
+        # Only trainable (LoKr) parameters are promoted to fp32 for optimizer stability.
+        # MPS uses fp32 weights throughout for numerical stability.
+        if device_type == "mps":
             self.module.model.decoder = self.module.model.decoder.to(dtype=torch.float32)
         else:
             self.module.model.decoder = self.module.model.decoder.to(dtype=self.module.dtype)

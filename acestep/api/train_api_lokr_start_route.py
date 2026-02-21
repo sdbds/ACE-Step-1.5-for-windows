@@ -49,7 +49,10 @@ def register_lokr_training_start_route(
         mgr.offload_vae_to_cpu()
         mgr.offload_text_encoder_to_cpu()
         mgr.offload_model_encoder_to_cpu()
+        mgr.offload_model_tokenizer_to_cpu()
+        mgr.offload_model_detokenizer_to_cpu()
         mgr.unload_llm()
+        mgr.flush_gpu_cache()
 
         try:
             from acestep.training.configs import LoKRConfig as LoKRConfigClass, TrainingConfig
