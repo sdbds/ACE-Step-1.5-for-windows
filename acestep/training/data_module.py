@@ -117,9 +117,6 @@ class PreprocessedTensorDataset(Dataset):
         try:
             child = safe_path(raw)
             if os.path.exists(child):
-                logger.debug(
-                    f"Resolved legacy manifest path via safe root: {raw}"
-                )
                 return child
         except ValueError:
             pass
