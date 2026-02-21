@@ -94,6 +94,82 @@ class PreprocessedTensorDatasetPathSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PreprocessedTensorDataset("/tmp/nonexistent_xyz_12345")
 
+    def test_manifest_relative_to_tensor_dir(self):
+        """Manifest with paths relative to tensor_dir loads correctly."""
+        with tempfile.TemporaryDirectory() as d:
+            for name in ["a.pt", "b.pt"]:
+                open(os.path.join(d, name), "wb").close()
+
+            manifest = {"samples": ["a.pt", "b.pt"]}
+            with open(os.path.join(d, "manifest.json"), "w") as f:
+                json.dump(manifest, f)
+
+            ds = PreprocessedTensorDataset(d)
+            self.assertEqual(len(ds.valid_paths), 2)
+
+    def test_manifest_legacy_cwd_relative_paths(self):
+        """Legacy manifest with CWD-relative paths resolves via fallback."""
+        with tempfile.TemporaryDirectory() as root:
+            set_safe_root(root)
+            tensor_dir = os.path.join(root, "sub", "tensors")
+            os.makedirs(tensor_dir)
+            pt_file = os.path.join(tensor_dir, "sample.pt")
+            open(pt_file, "wb").close()
+
+            # Legacy manifest stored the full CWD-relative path
+            legacy_rel = os.path.relpath(pt_file, root)
+            manifest = {"samples": [legacy_rel]}
+            with open(os.path.join(tensor_dir, "manifest.json"), "w") as f:
+                json.dump(manifest, f)
+
+            ds = PreprocessedTensorDataset(tensor_dir)
+            self.assertEqual(len(ds.valid_paths), 1)
+            self.assertEqual(
+                os.path.realpath(ds.valid_paths[0]),
+                os.path.realpath(pt_file),
+            )
+
+
+class SaveManifestTests(unittest.TestCase):
+    """Tests for save_manifest path normalisation."""
+
+    def test_paths_stored_relative_to_output_dir(self):
+        """save_manifest converts absolute/CWD-relative paths to dir-relative."""
+        from acestep.training.dataset_builder_modules.preprocess_manifest import (
+            save_manifest,
+        )
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as d:
+            metadata = SimpleNamespace(to_dict=lambda: {"name": "test"})
+            # Simulate paths that preprocess_to_tensors produces
+            output_paths = [
+                os.path.join(d, "a.pt"),
+                os.path.join(d, "b.pt"),
+            ]
+            save_manifest(d, metadata, output_paths)
+            with open(os.path.join(d, "manifest.json")) as f:
+                manifest = json.load(f)
+            # Paths should be just filenames (relative to d)
+            self.assertEqual(manifest["samples"], ["a.pt", "b.pt"])
+            self.assertEqual(manifest["num_samples"], 2)
+
+    def test_cwd_relative_input_normalised(self):
+        """CWD-relative input paths are normalised to dir-relative."""
+        from acestep.training.dataset_builder_modules.preprocess_manifest import (
+            save_manifest,
+        )
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as d:
+            metadata = SimpleNamespace(to_dict=lambda: {"name": "test"})
+            # Paths like "./subdir/a.pt" relative to CWD
+            cwd_rel = os.path.relpath(os.path.join(d, "x.pt"))
+            save_manifest(d, metadata, [cwd_rel])
+            with open(os.path.join(d, "manifest.json")) as f:
+                manifest = json.load(f)
+            self.assertEqual(manifest["samples"], ["x.pt"])
+
 
 class LoadDatasetFromJsonTests(unittest.TestCase):
     """Tests for load_dataset_from_json path validation."""

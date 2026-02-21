@@ -65,16 +65,31 @@ def _md_to_html(md_text: str) -> str:
 
         # Headings
         if stripped.startswith("### "):
-            html_parts.append(f"<h4>{stripped[4:]}</h4>")
+            heading = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                r'<a href="\2" target="_blank" style="color:var(--color-accent,#4a9eff);">\1</a>',
+                stripped[4:],
+            )
+            html_parts.append(f"<h4>{heading}</h4>")
             continue
         if stripped.startswith("## "):
-            html_parts.append(f"<h3>{stripped[3:]}</h3>")
+            heading = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                r'<a href="\2" target="_blank" style="color:var(--color-accent,#4a9eff);">\1</a>',
+                stripped[3:],
+            )
+            html_parts.append(f"<h3>{heading}</h3>")
             continue
 
         # Blockquotes
         if stripped.startswith("> "):
             content = stripped[2:]
             content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
+            content = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                r'<a href="\2" target="_blank" style="color:var(--color-accent,#4a9eff);">\1</a>',
+                content,
+            )
             html_parts.append(
                 f'<blockquote style="border-left:3px solid #888;'
                 f'padding-left:10px;color:#aaa;">{content}</blockquote>'
@@ -90,6 +105,11 @@ def _md_to_html(md_text: str) -> str:
             content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
             content = re.sub(r"\*(.+?)\*", r"<em>\1</em>", content)
             content = re.sub(r"`([^`]+)`", r"<code>\1</code>", content)
+            content = re.sub(
+                r"\[([^\]]+)\]\(([^)]+)\)",
+                r'<a href="\2" target="_blank" style="color:var(--color-accent,#4a9eff);">\1</a>',
+                content,
+            )
             html_parts.append(f"<li>{content}</li>")
             continue
 
@@ -106,6 +126,11 @@ def _md_to_html(md_text: str) -> str:
         p = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", p)
         p = re.sub(r"\*(.+?)\*", r"<em>\1</em>", p)
         p = re.sub(r"`([^`]+)`", r"<code>\1</code>", p)
+        p = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            r'<a href="\2" target="_blank" style="color:var(--color-accent,#4a9eff);">\1</a>',
+            p,
+        )
         html_parts.append(f"<p style='margin:4px 0;'>{p}</p>")
 
     if in_list:

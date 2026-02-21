@@ -81,6 +81,7 @@ def register_lokr_training_start_route(
                 seed=request.training_seed,
                 output_dir=request.output_dir,
                 gradient_checkpointing=request.gradient_checkpointing,
+                network_weights=request.network_weights,
             )
             trainer = LoKRTrainer(dit_handler=handler, lokr_config=lokr_config, training_config=training_config)
         except Exception as exc:
@@ -122,6 +123,7 @@ def register_lokr_training_start_route(
                     "lokr_weight_decompose": request.lokr_weight_decompose,
                     "learning_rate": request.learning_rate,
                     "epochs": request.train_epochs,
+                    "network_weights": request.network_weights,
                 },
                 "_component_manager": mgr,
             }

@@ -27,6 +27,7 @@ class StartTrainingRequest(BaseModel):
     lora_output_dir: str = Field(default="./lora_output", description="Output directory")
     use_fp8: bool = Field(default=False, description="Use FP8 training when runtime supports it")
     gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
+    network_weights: Optional[str] = Field(default=None, description="Path to previously trained weights to resume from")
 
 
 class StartLoKRTrainingRequest(BaseModel):
@@ -49,6 +50,7 @@ class StartLoKRTrainingRequest(BaseModel):
     training_seed: int = Field(default=42, description="Random seed")
     output_dir: str = Field(default="./lokr_output", description="Output directory")
     gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
+    network_weights: Optional[str] = Field(default=None, description="Path to previously trained weights to resume from")
 
 
 class ExportLoRARequest(BaseModel):

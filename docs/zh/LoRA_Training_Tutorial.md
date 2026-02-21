@@ -271,6 +271,8 @@ Close your eyes and feel the sound
 
 > 以上数值仅供参考，请根据实际情况调整。
 
+> **💡 推荐使用 LoKr：** LoKR 大幅提升了训练效率，原本需要一小时的训练现在只需 5 分钟——速度提升超过 10 倍。这对于在消费级 GPU 上训练尤为关键。您可以在 **Train LoKr** 选项卡中尝试 LoKr 训练，或使用 [Side-Step](https://github.com/koda-dernet/Side-Step) 工具包进行命令行 LoKr 训练。详见 [Training Guide](../sidestep/Training%20Guide.md)。
+
 3. 点击 **Start Training**，等待训练完成。
 
 ![](../pics/07_train.jpg)
@@ -285,3 +287,24 @@ Close your eyes and feel the sound
 3. 开始合成音乐。
 
 恭喜！您已完成 LoRA 训练的全部流程。
+
+---
+
+## 高级训练：Side-Step
+
+如果你需要更精细地控制 LoRA 训练——包括修正的时间步采样、LoKR 适配器、命令行工作流、显存优化和梯度敏感度分析——社区开发的 **[Side-Step](https://github.com/koda-dernet/Side-Step)** 工具包提供了高级替代方案。其文档已收录在本仓库的 `docs/sidestep/` 目录下。
+
+| 主题 | 说明 |
+|------|------|
+| [Getting Started](../sidestep/Getting%20Started.md) | 安装、前置条件和首次运行设置 |
+| [End-to-End Tutorial](../sidestep/End-to-End%20Tutorial.md) | 从原始音频到生成的完整流程 |
+| [Dataset Preparation](../sidestep/Dataset%20Preparation.md) | JSON 格式、音频要求、元数据字段、自定义标签 |
+| [Training Guide](../sidestep/Training%20Guide.md) | LoRA vs LoKR、修正模式 vs 原始模式、超参数指南 |
+| [Using Your Adapter](../sidestep/Using%20Your%20Adapter.md) | 输出目录结构、在 Gradio 中加载、LoKR 限制 |
+| [VRAM Optimization Guide](../sidestep/VRAM%20Optimization%20Guide.md) | 显存优化策略和 GPU 分级配置 |
+| [Estimation Guide](../sidestep/Estimation%20Guide.md) | 梯度敏感度分析，用于针对性训练 |
+| [Shift and Timestep Sampling](../sidestep/Shift%20and%20Timestep%20Sampling.md) | 训练时间步的工作原理，Side-Step 与内置训练器的区别 |
+| [Preset Management](../sidestep/Preset%20Management.md) | 内置预设、保存/加载/导入/导出 |
+| [The Settings Wizard](../sidestep/The%20Settings%20Wizard.md) | 完整的向导设置参考 |
+| [Model Management](../sidestep/Model%20Management.md) | 检查点结构和微调模型支持 |
+| [Windows Notes](../sidestep/Windows%20Notes.md) | Windows 特定的设置和注意事项 |

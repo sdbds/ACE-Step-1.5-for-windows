@@ -330,7 +330,7 @@ def create_advanced_settings_section(dit_handler, llm_handler, init_params=None,
             with gr.Row():
                 use_lora_checkbox = gr.Checkbox(label="Use LoRA", value=False, info="Enable LoRA adapter for inference", scale=1)
                 lora_scale_slider = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="LoRA Scale", info="LoRA influence strength (0=disabled, 1=full)", scale=2)
-                lora_status = gr.Textbox(label="LoRA Status", value="No LoRA loaded", interactive=False, scale=2)
+            lora_status = gr.Textbox(label="LoRA Status", value="No LoRA loaded", interactive=False, lines=1, elem_classes=["no-tooltip"])
 
         # ═══════════════════════════════════════════
         # DiT Diffusion Parameters (with help button)

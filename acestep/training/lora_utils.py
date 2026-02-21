@@ -38,15 +38,15 @@ def check_peft_available() -> bool:
 
 def get_dit_target_modules(model) -> List[str]:
     """Get the list of module names in the DiT decoder that can have LoRA applied.
-    
+
     Args:
         model: The AceStepConditionGenerationModel
-        
+
     Returns:
         List of module names suitable for LoRA
     """
     target_modules = []
-    
+
     # Focus on the decoder (DiT) attention layers
     if hasattr(model, 'decoder'):
         for name, module in model.decoder.named_modules():
@@ -54,13 +54,13 @@ def get_dit_target_modules(model) -> List[str]:
             if any(proj in name for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']):
                 if isinstance(module, nn.Linear):
                     target_modules.append(name)
-    
+
     return target_modules
 
 
 def freeze_non_lora_parameters(model, freeze_encoder: bool = True) -> None:
     """Freeze all non-LoRA parameters in the model.
-    
+
     Args:
         model: The model to freeze parameters for
         freeze_encoder: Whether to freeze the encoder (condition encoder)
@@ -68,16 +68,16 @@ def freeze_non_lora_parameters(model, freeze_encoder: bool = True) -> None:
     # Freeze all parameters first
     for param in model.parameters():
         param.requires_grad = False
-    
+
     # Count frozen and trainable parameters
     total_params = 0
     trainable_params = 0
-    
+
     for name, param in model.named_parameters():
         total_params += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-    
+
     logger.info(f"Frozen parameters: {total_params - trainable_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
@@ -87,17 +87,17 @@ def inject_lora_into_dit(
     lora_config: LoRAConfig,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Inject LoRA adapters into the DiT decoder of the model.
-    
+
     Args:
         model: The AceStepConditionGenerationModel
         lora_config: LoRA configuration
-        
+
     Returns:
         Tuple of (peft_model, info_dict)
     """
     if not PEFT_AVAILABLE:
         raise ImportError("PEFT library is required for LoRA training. Install with: pip install peft")
-    
+
     # Get the decoder (DiT model). Previous failed training runs may leave
     # Fabric/PEFT wrappers attached; unwrap to a clean base module first.
     decoder = model.decoder
@@ -153,7 +153,7 @@ def inject_lora_into_dit(
             decoder.is_gradient_checkpointing = False
         except Exception:
             pass
-    
+
     # Create PEFT LoRA config
     peft_lora_config = LoraConfig(
         r=lora_config.r,
@@ -163,24 +163,24 @@ def inject_lora_into_dit(
         bias=lora_config.bias,
         task_type=TaskType.FEATURE_EXTRACTION,  # For diffusion models
     )
-    
+
     # Apply LoRA to the decoder
     peft_decoder = get_peft_model(decoder, peft_lora_config)
-    
+
     # Replace the decoder in the original model
     model.decoder = peft_decoder
-    
+
     # Freeze all non-LoRA parameters
     # Freeze encoder, tokenizer, detokenizer
     for name, param in model.named_parameters():
         # Only keep LoRA parameters trainable
         if 'lora_' not in name:
             param.requires_grad = False
-    
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
     info = {
         "total_params": total_params,
         "trainable_params": trainable_params,
@@ -189,13 +189,47 @@ def inject_lora_into_dit(
         "lora_alpha": lora_config.alpha,
         "target_modules": lora_config.target_modules,
     }
-    
+
     logger.info(f"LoRA injected into DiT decoder:")
     logger.info(f"  Total parameters: {total_params:,}")
     logger.info(f"  Trainable parameters: {trainable_params:,} ({info['trainable_ratio']:.2%})")
     logger.info(f"  LoRA rank: {lora_config.r}, alpha: {lora_config.alpha}")
-    
+
     return model, info
+
+
+def load_lora_training_weights(model, weights_path: str) -> str:
+    """Load previously trained LoRA weights into an already-injected PEFT decoder.
+
+    Supports safetensors and pt formats. The model.decoder must already be
+    a PeftModel (i.e. inject_lora_into_dit must have been called first).
+
+    Args:
+        model: Model whose decoder already has LoRA injected.
+        weights_path: Path to .safetensors or .pt weights file.
+
+    Returns:
+        Human-readable load info string.
+
+    Raises:
+        FileNotFoundError: If weights_path does not exist.
+        ValueError: If format is unsupported.
+    """
+    validated = safe_path(weights_path)
+    if not os.path.exists(validated):
+        raise FileNotFoundError(f"Network weights not found: {validated}")
+
+    ext = os.path.splitext(validated)[1].lower()
+    if ext == ".safetensors":
+        weights_sd = load_file(validated, device="cpu")
+    elif ext == ".pt":
+        weights_sd = torch.load(validated, map_location="cpu", weights_only=True)
+    else:
+        raise ValueError(f"Unsupported weight format '{ext}'. Expected .safetensors or .pt")
+
+    info = model.decoder.load_state_dict(weights_sd, strict=False)
+    logger.info(f"Loaded network weights from {validated}: {info}")
+    return str(info)
 
 
 def save_lora_weights(
@@ -204,18 +238,18 @@ def save_lora_weights(
     save_full_model: bool = False,
 ) -> str:
     """Save LoRA adapter weights.
-    
+
     Args:
         model: Model with LoRA adapters
         output_dir: Directory to save weights
         save_full_model: Whether to save the full model state dict
-        
+
     Returns:
         Path to saved weights
     """
     output_dir = safe_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
-    
+
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'save_pretrained'):
         # Save PEFT adapter
         adapter_path = os.path.join(output_dir, "adapter")
@@ -234,11 +268,11 @@ def save_lora_weights(
         for name, param in model.named_parameters():
             if 'lora_' in name:
                 lora_state_dict[name] = param.data.clone()
-        
+
         if not lora_state_dict:
             logger.warning("No LoRA parameters found to save!")
             return ""
-        
+
         lora_path = os.path.join(output_dir, "lora_weights.pt")
         torch.save(lora_state_dict, lora_path)
         logger.info(f"LoRA weights saved to {lora_path}")
@@ -251,37 +285,37 @@ def load_lora_weights(
     lora_config: Optional[LoRAConfig] = None,
 ) -> Any:
     """Load LoRA adapter weights into the model.
-    
+
     Args:
         model: The base model (without LoRA)
         lora_path: Path to saved LoRA adapter directory
         lora_config: Unused; retained for API compatibility
-        
+
     Returns:
         Model with LoRA weights loaded
     """
     validated = safe_path(lora_path)
     if not os.path.exists(validated):
         raise FileNotFoundError(f"LoRA weights not found: {validated}")
-    
+
     # Check if it's a PEFT adapter directory
     if os.path.isdir(validated):
         if not PEFT_AVAILABLE:
             raise ImportError("PEFT library is required to load adapter. Install with: pip install peft")
-        
+
         # Load PEFT adapter
         model.decoder = PeftModel.from_pretrained(model.decoder, validated)
         logger.info(f"LoRA adapter loaded from {validated}")
-    
+
     elif validated.endswith('.pt'):
         raise ValueError(
             "Loading LoRA weights from .pt files is disabled for security. "
             "Use a PEFT adapter directory instead."
         )
-    
+
     else:
         raise ValueError(f"Unsupported LoRA weight format: {validated}")
-    
+
     return model
 
 
@@ -408,10 +442,10 @@ def merge_lora_weights(model) -> Any:
 
     This permanently integrates the LoRA adaptations into the model weights.
     After merging, the model can be used without PEFT.
-    
+
     Args:
         model: Model with LoRA adapters
-        
+
     Returns:
         Model with merged weights
     """
@@ -421,16 +455,16 @@ def merge_lora_weights(model) -> Any:
         logger.info("LoRA weights merged into base model")
     else:
         logger.warning("Model does not support LoRA merging")
-    
+
     return model
 
 
 def get_lora_info(model) -> Dict[str, Any]:
     """Get information about LoRA adapters in the model.
-    
+
     Args:
         model: Model to inspect
-        
+
     Returns:
         Dictionary with LoRA information
     """
@@ -440,11 +474,11 @@ def get_lora_info(model) -> Dict[str, Any]:
         "total_params": 0,
         "modules_with_lora": [],
     }
-    
+
     total_params = 0
     lora_params = 0
     lora_modules = []
-    
+
     for name, param in model.named_parameters():
         total_params += param.numel()
         if 'lora_' in name:
@@ -453,13 +487,13 @@ def get_lora_info(model) -> Dict[str, Any]:
             module_name = name.rsplit('.lora_', 1)[0]
             if module_name not in lora_modules:
                 lora_modules.append(module_name)
-    
+
     info["total_params"] = total_params
     info["lora_params"] = lora_params
     info["has_lora"] = lora_params > 0
     info["modules_with_lora"] = lora_modules
-    
+
     if total_params > 0:
         info["lora_ratio"] = lora_params / total_params
-    
+
     return info

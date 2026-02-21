@@ -38,6 +38,7 @@ except ImportError:
 from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
 from acestep.training.lora_utils import (
     inject_lora_into_dit,
+    load_lora_training_weights,
     save_lora_weights,
     save_training_checkpoint,
     load_training_checkpoint,
@@ -422,12 +423,12 @@ class PreprocessedLoRAModule(nn.Module):
         # enable_input_require_grads(), force at least one forward input to require grad
         # so checkpointed segments keep a valid autograd graph.
         self.force_input_grads_for_checkpointing = False
-        
+
         # Inject LoRA into the decoder only
         if check_peft_available():
             # Fix: Force tensors out of inference mode before injection
             for param in model.parameters():
-                param.data = param.data.clone() 
+                param.data = param.data.clone()
                 if param.is_inference():
                     with torch.no_grad():
                         param.data = param.data.clone()
@@ -445,21 +446,32 @@ class PreprocessedLoRAModule(nn.Module):
             else:
                 logger.warning("Gradient checkpointing requested but could not be enabled for decoder")
 
-            
-        # Added Torch Compile Logic
-        if hasattr(torch, "compile") and self.device_type == "cuda":
-            logger.info("Compiling DiT decoder...")
-            self.model.decoder = torch.compile(self.model.decoder, mode="default") # 'default' is more stable for LoRA
-            logger.info("torch.compile successful")
+
+        # torch.compile: optional perf optimization.
+        # PEFT LoRA wraps the decoder in PeftModelForFeatureExtraction which is
+        # incompatible with torch.compile/inductor on PyTorch 2.7.x
+        # (AssertionError at first forward pass, not at compile time).
+        # Only compile when NOT using PEFT adapters.
+        has_peft = bool(self.lora_info)
+        if hasattr(torch, "compile") and self.device_type == "cuda" and not has_peft:
+            try:
+                logger.info("Compiling DiT decoder...")
+                self.model.decoder = torch.compile(self.model.decoder, mode="default")
+                logger.info("torch.compile successful")
+            except Exception as e:
+                logger.warning(f"torch.compile failed ({e}), continuing without compilation")
         else:
-            logger.warning("torch.compile is not available on this PyTorch version.")
-        
+            if has_peft:
+                logger.info("Skipping torch.compile (incompatible with PEFT LoRA adapters)")
+            else:
+                logger.info("torch.compile not available on this device/PyTorch version, skipping")
+
         # Model config for flow matching
         self.config = model.config
 
         # Store training losses
         self.training_losses = []
-    
+
     def training_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -477,7 +489,7 @@ class PreprocessedLoRAModule(nn.Module):
                 - encoder_attention_mask: [B, L] - Condition mask
                 - context_latents: [B, T, 128] - Source context
             record_loss: If True, append loss to training_losses (set False for validation).
-            
+
         Returns:
             Loss tensor (float32 for stable backward)
         """
@@ -553,7 +565,7 @@ class PreprocessedLoRAModule(nn.Module):
             xt = t_ * x1 + (1.0 - t_) * x0
             if self.force_input_grads_for_checkpointing:
                 xt = xt.requires_grad_(True)
-            
+
             # Forward through decoder (distilled turbo model, no CFG)
             decoder_outputs = self.model.decoder(
                 hidden_states=xt,
@@ -676,6 +688,15 @@ class LoRATrainer:
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
             )
+            # Load previously trained weights if specified
+            if self.training_config.network_weights:
+                try:
+                    info = load_lora_training_weights(self.module.model, self.training_config.network_weights)
+                    yield 0, 0.0, f"📥 Loaded network weights: {info}"
+                except Exception as exc:
+                    yield 0, 0.0, f"❌ Failed to load network weights: {exc}"
+                    return
+
             ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(
                 self.module.model.decoder,
                 enable_gradient_checkpointing=bool(self.training_config.gradient_checkpointing),
@@ -688,7 +709,7 @@ class LoRATrainer:
                 f"Training memory features: gradient_checkpointing={ckpt_enabled}, "
                 f"use_cache_disabled={cache_disabled}, input_grads_enabled={input_grads_enabled}"
             )
-            
+
             # Create data module
             data_module = PreprocessedDataModule(
                 tensor_dir=tensor_dir,
@@ -850,7 +871,7 @@ class LoRATrainer:
 
         if not getattr(self.module, "fp8_enabled", False):
             self.module.model = self.module.model.to(self.module.dtype)
-        
+
         # Setup with Fabric - only the decoder (which has LoRA)
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
         casted_opt_params, total_opt_params = _ensure_optimizer_params_fp32(optimizer)
@@ -1051,7 +1072,7 @@ class LoRATrainer:
                     num_updates += 1
                     accumulated_loss = 0.0
                     accumulation_step = 0
-            
+
             # End of epoch
             epoch_time = time.time() - epoch_start_time
             avg_epoch_loss = epoch_loss / max(num_updates, 1)
@@ -1098,7 +1119,7 @@ class LoRATrainer:
                         global_step,
                         best_dir,
                     )
-            
+
             # Save checkpoint
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
@@ -1136,7 +1157,7 @@ class LoRATrainer:
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
-        
+
         if HAS_BNB and self.module.device_type == "cuda":
             optimizer = bnb.optim.AdamW8bit(
                 trainable_params,
@@ -1150,7 +1171,7 @@ class LoRATrainer:
                 lr=self.training_config.learning_rate,
                 weight_decay=self.training_config.weight_decay,
             )
-        
+
         steps_per_epoch = max(1, math.ceil(len(train_loader) / self.training_config.gradient_accumulation_steps))
         total_steps = steps_per_epoch * self.training_config.max_epochs
         warmup_steps = min(self.training_config.warmup_steps, max(1, total_steps // 10))
@@ -1393,6 +1414,20 @@ class LoKRTrainer:
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
             )
+            # Load previously trained weights if specified (LyCORIS has built-in load_weights)
+            if self.training_config.network_weights:
+                try:
+                    lycoris_net = getattr(self.module, "lycoris_net", None)
+                    if lycoris_net is None:
+                        yield 0, 0.0, "❌ LoKr network not initialized, cannot load weights"
+                        return
+                    info = lycoris_net.load_weights(self.training_config.network_weights)
+                    logger.info(f"Loaded network weights from {self.training_config.network_weights}: {info}")
+                    yield 0, 0.0, f"📥 Loaded network weights: {info}"
+                except Exception as exc:
+                    yield 0, 0.0, f"❌ Failed to load network weights: {exc}"
+                    return
+
             ckpt_enabled, cache_disabled, input_grads_enabled = _configure_training_memory_features(
                 self.module.model.decoder,
                 enable_gradient_checkpointing=bool(self.training_config.gradient_checkpointing),

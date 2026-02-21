@@ -77,18 +77,23 @@ def init_service_wrapper(
             f"(VRAM too low for KV cache), falling back to {backend}"
         )
 
+    # Derive project_root from the checkpoint path (which is the checkpoints
+    # directory itself, e.g. "<project>/checkpoints").  Passing it directly as
+    # project_root would cause initialize_service to append "checkpoints" again,
+    # resulting in "<project>/checkpoints/checkpoints".
+    current_file = os.path.abspath(__file__)
+    # This file is in acestep/ui/gradio/events/generation/
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(current_file))))))
+
     status, enable = dit_handler.initialize_service(
-        checkpoint, config_path, device,
+        project_root, config_path, device,
         use_flash_attention=use_flash_attention, compile_model=compile_model,
         offload_to_cpu=offload_to_cpu, offload_dit_to_cpu=offload_dit_to_cpu,
         quantization=quant_value, use_mlx_dit=mlx_dit,
     )
 
     if init_llm:
-        current_file = os.path.abspath(__file__)
-        # This file is in acestep/ui/gradio/events/generation/
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(current_file))))))
         checkpoint_dir = os.path.join(project_root, "checkpoints")
 
         lm_status, lm_success = llm_handler.initialize(

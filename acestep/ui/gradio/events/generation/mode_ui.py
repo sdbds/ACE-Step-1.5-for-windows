@@ -26,7 +26,7 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
         previous_mode: The mode that was active before this switch.
 
     Returns:
-        Tuple of 42 gr.update objects matching the standard mode-change
+        Tuple of 44 gr.update objects matching the standard mode-change
         output list (see event wiring in events/__init__.py).
     """
     task_type = MODE_TO_TASK_TYPE.get(mode, "text2music")
@@ -126,6 +126,20 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
         auto_vocal_lang_update = gr.update()
         auto_duration_update = gr.update()
 
+    # Clear stale audio codes when leaving Custom mode to prevent
+    # them from leaking into Remix/other modes (state-leakage bug fix).
+    if is_custom:
+        audio_codes_update = gr.update(visible=True)
+    else:
+        audio_codes_update = gr.update(value="", visible=False)
+
+    # Clear src_audio when entering a mode that doesn't use it
+    # (Custom, Simple) to prevent stale audio from leaking.
+    if show_src_audio:
+        src_audio_update = gr.update()
+    else:
+        src_audio_update = gr.update(value=None)
+
     return (
         gr.update(visible=show_simple),                    # 0: simple_mode_group
         gr.update(visible=show_custom_group),              # 1: custom_mode_group
@@ -169,6 +183,8 @@ def compute_mode_ui_updates(mode: str, llm_handler=None, previous_mode: str = "C
         auto_timesig_update,                               # 39: timesig_auto
         auto_vocal_lang_update,                            # 40: vocal_lang_auto
         auto_duration_update,                              # 41: duration_auto
+        audio_codes_update,                                # 42: text2music_audio_code_string
+        src_audio_update,                                  # 43: src_audio
     )
 
 
@@ -301,7 +317,7 @@ def handle_generation_mode_change(mode: str, previous_mode: str, llm_handler=Non
         llm_handler: Optional LLM handler.
 
     Returns:
-        Tuple of 42 updates for UI components.
+        Tuple of 44 updates for UI components.
     """
     return compute_mode_ui_updates(mode, llm_handler, previous_mode=previous_mode)
 

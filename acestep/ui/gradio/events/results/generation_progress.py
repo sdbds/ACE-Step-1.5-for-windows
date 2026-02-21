@@ -93,6 +93,12 @@ def generate_with_progress(
     if task_type == "text2music":
         src_audio = None
 
+    # Defensive guard: cover/repaint/extract/lego tasks should never use
+    # stale audio codes from the text2music_audio_code_string textbox.
+    # Only text2music (Custom mode) with thinking disabled should pass codes.
+    if task_type != "text2music":
+        text2music_audio_code_string = ""
+
     gen_params = GenerationParams(
         task_type=task_type,
         instruction=instruction_display_gen,

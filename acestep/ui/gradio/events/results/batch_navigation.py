@@ -86,6 +86,11 @@ def navigate_to_next_batch(autogen_enabled, current_batch_index, total_batches, 
     Yields:
         Two tuples of 49 Gradio component updates each.
     """
+    # Derive actual total from batch_queue so we never rely on a stale
+    # total_batches state value (the background generator may have added
+    # batches after total_batches was last written to the Gradio state).
+    total_batches = max(total_batches, len(batch_queue))
+
     if current_batch_index >= total_batches - 1:
         gr.Warning(t("messages.at_last_batch"))
         yield tuple([gr.update()] * 49)

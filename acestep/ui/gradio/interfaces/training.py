@@ -531,6 +531,7 @@ def create_training_section(dit_handler, llm_handler, init_params=None) -> dict:
 
         # ==================== Train LoKr Tab ====================
         with gr.Tab("🚀 Train LoKr"):
+            create_help_button("training_lokr")
             with gr.Row():
                 with gr.Column(scale=2):
                     gr.HTML("<h3>📊 Preprocessed Tensors</h3>")

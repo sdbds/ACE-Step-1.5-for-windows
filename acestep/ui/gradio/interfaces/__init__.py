@@ -162,6 +162,32 @@ def create_gradio_interface(dit_handler, llm_handler, dataset_handler, init_para
             text-transform: none;
         }
 
+        /* Prevent tooltip CSS from hiding content inside .no-tooltip components */
+        .no-tooltip span[data-testid="block-info"] + div,
+        .no-tooltip span[data-testid="block-info"] + span {
+            display: block !important;
+            position: static !important;
+            background: none !important;
+            padding: 0 !important;
+            border: none !important;
+            box-shadow: none !important;
+            backdrop-filter: none !important;
+            max-width: none !important;
+            min-width: 0 !important;
+            z-index: auto !important;
+            pointer-events: auto !important;
+            margin-top: 0 !important;
+            color: inherit !important;
+            font-size: inherit !important;
+            line-height: inherit !important;
+            font-weight: inherit !important;
+            text-transform: inherit !important;
+            border-radius: 0 !important;
+        }
+        .no-tooltip span[data-testid="block-info"]::after {
+            display: none !important;
+        }
+
         /* Show tooltips on hover of the label area or the icon */
         .has-info-container span[data-testid="block-info"]:hover + div,
         .has-info-container span[data-testid="block-info"]:hover + span,

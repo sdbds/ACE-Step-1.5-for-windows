@@ -271,6 +271,8 @@ Enter the save path for tensor files, click to start preprocessing, and wait for
 
 > The above values are for reference only. Please adjust based on your actual situation.
 
+> **💡 LoKr Recommendation:** LoKR has greatly improved training efficiency. What used to take an hour now only takes 5 minutes—over 10 times faster. This is crucial for training on consumer-grade GPUs. You can try LoKr training in the **Train LoKr** tab, or use the [Side-Step](https://github.com/koda-dernet/Side-Step) toolkit for CLI-based LoKr workflows. See the [Training Guide](../sidestep/Training%20Guide.md) for details.
+
 3. Click **Start Training** and wait for training to complete.
 
 ![](../pics/07_train.jpg)
@@ -285,3 +287,24 @@ Enter the save path for tensor files, click to start preprocessing, and wait for
 3. Start generating music.
 
 Congratulations! You have completed the entire LoRA training workflow.
+
+---
+
+## Advanced Training with Side-Step
+
+For users who want more control over LoRA training — including corrected timestep sampling, LoKR adapters, CLI-based workflows, VRAM optimization, and gradient sensitivity analysis — the community-developed **[Side-Step](https://github.com/koda-dernet/Side-Step)** toolkit provides an advanced alternative. Its documentation is bundled in this repository under `docs/sidestep/`.
+
+| Topic | Description |
+|-------|-------------|
+| [Getting Started](../sidestep/Getting%20Started.md) | Installation, prerequisites, and first-run setup |
+| [End-to-End Tutorial](../sidestep/End-to-End%20Tutorial.md) | Complete walkthrough from raw audio to generation |
+| [Dataset Preparation](../sidestep/Dataset%20Preparation.md) | JSON schema, audio formats, metadata fields, custom tags |
+| [Training Guide](../sidestep/Training%20Guide.md) | LoRA vs LoKR, corrected vs vanilla mode, hyperparameter guide |
+| [Using Your Adapter](../sidestep/Using%20Your%20Adapter.md) | Output layout, loading in Gradio, LoKR limitations |
+| [VRAM Optimization Guide](../sidestep/VRAM%20Optimization%20Guide.md) | GPU memory profiles and optimization strategies |
+| [Estimation Guide](../sidestep/Estimation%20Guide.md) | Gradient sensitivity analysis for targeted training |
+| [Shift and Timestep Sampling](../sidestep/Shift%20and%20Timestep%20Sampling.md) | How training timesteps work and why Side-Step differs from the built-in trainer |
+| [Preset Management](../sidestep/Preset%20Management.md) | Built-in presets, save/load/import/export |
+| [The Settings Wizard](../sidestep/The%20Settings%20Wizard.md) | Complete wizard settings reference |
+| [Model Management](../sidestep/Model%20Management.md) | Checkpoint structure and fine-tune support |
+| [Windows Notes](../sidestep/Windows%20Notes.md) | Windows-specific setup and workarounds |

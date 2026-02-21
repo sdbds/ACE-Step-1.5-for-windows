@@ -104,6 +104,31 @@ class MdToHtmlTests(unittest.TestCase):
         para = result.index("Paragraph")
         self.assertLess(ul_close, para)
 
+    def test_link_in_paragraph(self):
+        """[text](url) in a paragraph becomes an <a> tag."""
+        result = _md_to_html("See [Tutorial](https://example.com) for details")
+        self.assertIn('<a href="https://example.com"', result)
+        self.assertIn(">Tutorial</a>", result)
+        self.assertIn('target="_blank"', result)
+
+    def test_link_in_list_item(self):
+        """[text](url) in a list item becomes an <a> tag."""
+        result = _md_to_html("- [Guide](https://example.com/guide) — Full guide")
+        self.assertIn('<a href="https://example.com/guide"', result)
+        self.assertIn(">Guide</a>", result)
+
+    def test_link_in_blockquote(self):
+        """[text](url) in a blockquote becomes an <a> tag."""
+        result = _md_to_html("> See [docs](https://example.com)")
+        self.assertIn('<a href="https://example.com"', result)
+        self.assertIn(">docs</a>", result)
+
+    def test_link_in_heading(self):
+        """[text](url) in a heading becomes an <a> tag."""
+        result = _md_to_html("### 📖 [Docs](https://example.com)")
+        self.assertIn('<a href="https://example.com"', result)
+        self.assertIn(">Docs</a>", result)
+
 
 # ---------------------------------------------------------------------------
 # Unique id counter

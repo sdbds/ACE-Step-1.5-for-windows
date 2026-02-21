@@ -67,6 +67,7 @@ def register_lora_training_start_route(
                 output_dir=request.lora_output_dir,
                 use_fp8=request.use_fp8,
                 gradient_checkpointing=request.gradient_checkpointing,
+                network_weights=request.network_weights,
             )
             trainer = LoRATrainer(dit_handler=handler, lora_config=lora_config, training_config=training_config)
         except Exception as exc:
@@ -102,6 +103,7 @@ def register_lora_training_start_route(
                     "lora_alpha": request.lora_alpha,
                     "learning_rate": request.learning_rate,
                     "epochs": request.train_epochs,
+                    "network_weights": request.network_weights,
                 },
                 "_component_manager": mgr,
             }

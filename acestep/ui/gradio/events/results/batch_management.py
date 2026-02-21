@@ -186,6 +186,7 @@ def generate_next_batch_background(
     next_batch_idx = current_batch_index + 1
 
     if next_batch_idx in batch_queue and batch_queue[next_batch_idx].get("status") == "completed":
+        total_batches = max(total_batches, next_batch_idx + 1)
         return (
             batch_queue, total_batches,
             t("messages.batch_ready", n=next_batch_idx + 1),
