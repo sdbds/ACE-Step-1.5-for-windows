@@ -171,7 +171,14 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertIs(result, base_net)
         self.assertEqual(create_lycoris.call_count, 2)
-        mock_warning.assert_called_once()
+        # The new primary path (create_lycoris_from_weights) emits a fallback
+        # warning before the config-based path runs.  Check that the DoRA
+        # failure warning is among the calls rather than requiring exactly one.
+        dora_warnings = [
+            c for c in mock_warning.call_args_list
+            if "DoRA" in str(c) or "dora" in str(c).lower()
+        ]
+        self.assertEqual(len(dora_warnings), 1)
         base_net.apply_to.assert_called_once_with()
         base_net.load_weights.assert_called_once_with("weights.safetensors")
         self.assertIs(decoder._lycoris_net, base_net)

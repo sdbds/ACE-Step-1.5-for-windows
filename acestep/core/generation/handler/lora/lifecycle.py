@@ -219,7 +219,9 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
             logger.warning(f"LoKr load_weights missing keys ({len(missing)}): {missing[:5]}")
         if unexpected:
             logger.warning(f"LoKr load_weights unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-    logger.info(f"LoKr adapter loaded via fallback config path ({len(lycoris_net.loras)} modules)")
+    _loras = getattr(lycoris_net, "loras", None)
+    n_fallback = len(_loras) if isinstance(_loras, (list, tuple)) else 0
+    logger.info(f"LoKr adapter loaded via fallback config path ({n_fallback} modules)")
     return lycoris_net
 
 
