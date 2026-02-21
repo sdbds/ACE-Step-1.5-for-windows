@@ -115,6 +115,7 @@ def register_lora_training_start_route(
 
         def _runner() -> None:
             local_run_id = run_id
+            log_lines: list = []
             try:
                 for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
                     if training_state.get("run_id") != local_run_id:
@@ -123,9 +124,26 @@ def register_lora_training_start_route(
                     training_state["current_loss"] = loss
                     training_state["status"] = status
                     text = str(status)
+                    log_lines.append(text)
+                    training_state["training_log"] = "\n".join(log_lines[-200:])
                     match = re.search(r"Epoch (\d+)/(\d+)", text)
                     if match:
                         training_state["current_epoch"] = int(match.group(1))
+                        total_epochs = int(match.group(2))
+                    else:
+                        total_epochs = training_state.get("config", {}).get("epochs", 0)
+                    now = time.time()
+                    prev_time = training_state.get("last_step_time", now)
+                    if step > 0 and now > prev_time:
+                        training_state["steps_per_second"] = 1.0 / max(now - prev_time, 0.001)
+                    training_state["last_step_time"] = now
+                    start = training_state.get("start_time", now)
+                    elapsed = now - start
+                    if step > 0 and elapsed > 0:
+                        current_epoch = training_state.get("current_epoch", 0)
+                        if total_epochs > 0 and current_epoch > 0:
+                            remaining = elapsed * (total_epochs - current_epoch) / current_epoch
+                            training_state["estimated_time_remaining"] = remaining
                     if loss is not None and loss == loss and step > 0:
                         history = training_state.get("loss_history", [])
                         history.append({"step": step, "loss": float(loss)})
