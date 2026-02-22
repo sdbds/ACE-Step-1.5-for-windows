@@ -1416,8 +1416,11 @@ class LoKRTrainer:
 
             # Enable TF32 for fp32 matmuls on Ampere+ GPUs (matches V2 CLI trainers).
             torch.set_float32_matmul_precision("high")
-            # Autotune cuDNN kernels for fixed-size inputs.
-            torch.backends.cudnn.benchmark = True
+            # Disable cuDNN benchmark: training uses variable-length inputs
+            # (collate pads to per-batch max), so benchmark would cache a
+            # workspace for every unique shape seen, inflating VRAM across
+            # epochs without bound.
+            torch.backends.cudnn.benchmark = False
 
             torch.manual_seed(self.training_config.seed)
             random.seed(self.training_config.seed)
@@ -1712,6 +1715,10 @@ class LoKRTrainer:
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
+                    # Cap training_losses to prevent unbounded CPU memory growth.
+                    if len(self.module.training_losses) > 2000:
+                        self.module.training_losses = self.module.training_losses[-1000:]
+
                 epoch_compute_time += time.perf_counter() - step_started
 
             if accumulation_step > 0:
@@ -1777,6 +1784,15 @@ class LoKRTrainer:
                 yield global_step, avg_epoch_loss, (
                     f"📊 Data wait ratio: {io_wait_ratio:.1%} "
                     f"(wait {epoch_data_wait_time:.1f}s / compute {epoch_compute_time:.1f}s)"
+                )
+
+            # Release allocator-reserved memory to reduce peak VRAM between epochs.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+                yield global_step, avg_epoch_loss, (
+                    f"🧠 VRAM: {alloc_mb:.0f} MB allocated / {reserved_mb:.0f} MB reserved"
                 )
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
@@ -1905,6 +1921,10 @@ class LoKRTrainer:
                     accumulated_loss = 0.0
                     accumulation_step = 0
 
+                    # Cap training_losses to prevent unbounded CPU memory growth.
+                    if len(self.module.training_losses) > 2000:
+                        self.module.training_losses = self.module.training_losses[-1000:]
+
                 epoch_compute_time += time.perf_counter() - step_started
 
             if accumulation_step > 0:
@@ -1934,6 +1954,15 @@ class LoKRTrainer:
                 yield global_step, avg_epoch_loss, (
                     f"📊 Data wait ratio: {io_wait_ratio:.1%} "
                     f"(wait {epoch_data_wait_time:.1f}s / compute {epoch_compute_time:.1f}s)"
+                )
+
+            # Release allocator-reserved memory to reduce peak VRAM between epochs.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+                reserved_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+                yield global_step, avg_epoch_loss, (
+                    f"🧠 VRAM: {alloc_mb:.0f} MB allocated / {reserved_mb:.0f} MB reserved"
                 )
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
