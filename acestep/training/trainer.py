@@ -1414,6 +1414,11 @@ class LoKRTrainer:
                 yield 0, 0.0, "❌ LyCORIS not installed. Install lycoris-lora to train LoKr."
                 return
 
+            # Enable TF32 for fp32 matmuls on Ampere+ GPUs (matches V2 CLI trainers).
+            torch.set_float32_matmul_precision("high")
+            # Autotune cuDNN kernels for fixed-size inputs.
+            torch.backends.cudnn.benchmark = True
+
             torch.manual_seed(self.training_config.seed)
             random.seed(self.training_config.seed)
             if torch.cuda.is_available():
@@ -1559,21 +1564,12 @@ class LoKRTrainer:
                 "relying on AMP/GradScaler handling."
             )
 
-        # Keep frozen weights in compute dtype (bf16/fp16) for memory efficiency.
-        # Only trainable (LoKr) parameters are promoted to fp32 for optimizer stability.
-        # MPS uses fp32 weights throughout for numerical stability.
-        if device_type == "mps":
-            self.module.model.decoder = self.module.model.decoder.to(dtype=torch.float32)
-        else:
-            self.module.model.decoder = self.module.model.decoder.to(dtype=self.module.dtype)
-        casted_trainable, total_trainable_tensors = _ensure_trainable_params_fp32(self.module.model.decoder)
-        if total_trainable_tensors == 0 and getattr(self.module, "lycoris_net", None) is not None:
-            casted_fallback, total_fallback = _ensure_trainable_params_fp32(self.module.lycoris_net)
-            casted_trainable += casted_fallback
-            total_trainable_tensors += total_fallback
-        logger.info(
-            f"Trainable tensor dtype fixup: casted {casted_trainable}/{total_trainable_tensors} to fp32"
-        )
+        # LyCORIS LoKr: uniform dtype for all parameters.
+        # Unlike PEFT LoRA, LyCORIS hooks compute diff_weight.to(base_weight.dtype)
+        # internally.  Mixed-dtype (trainable fp32, frozen bf16) causes wasteful
+        # round-trip casts on every forward/backward.  Keep everything in compute
+        # dtype and let Fabric bf16-mixed autocast handle precision.
+        self.module.model = self.module.model.to(self.module.dtype)
 
         train_loader = data_module.train_dataloader()
         trainable_params = _collect_lokr_trainable_params(
@@ -1588,11 +1584,6 @@ class LoKRTrainer:
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
-        if total_trainable_tensors == 0:
-            logger.warning(
-                "LoKr trainable params discovered via LyCORIS fallback traversal; "
-                "decoder parameter traversal returned 0 trainables."
-            )
 
         yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
 
@@ -1627,10 +1618,6 @@ class LoKRTrainer:
         )
 
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
-        casted_opt_params, total_opt_params = _ensure_optimizer_params_fp32(optimizer)
-        logger.info(
-            f"Optimizer param dtype fixup: casted {casted_opt_params}/{total_opt_params} to fp32"
-        )
         try:
             train_loader = self.fabric.setup_dataloaders(train_loader, move_to_device=False)
         except TypeError:

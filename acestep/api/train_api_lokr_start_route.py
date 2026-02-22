@@ -17,12 +17,11 @@ from acestep.api.train_api_runtime import RuntimeComponentManager, unwrap_module
 from acestep.handler import AceStepHandler
 
 
-def _resolve_lokr_dataloader_config(device: Any, is_windows: bool) -> Dict[str, Any]:
+def _resolve_lokr_dataloader_config(device: Any) -> Dict[str, Any]:
     """Resolve DataLoader tuning defaults for LoKR training.
 
     Args:
         device: Handler device object or string.
-        is_windows: Whether current OS is Windows.
 
     Returns:
         Mapping with num_workers/pin_memory/prefetch_factor/persistent_workers/pin_memory_device.
@@ -105,12 +104,7 @@ def register_lokr_training_start_route(
 
             dataloader_cfg = _resolve_lokr_dataloader_config(
                 device=getattr(handler, "device", ""),
-                is_windows=(os.name == "nt"),
             )
-            if os.name == "nt":
-                logger.info(
-                    f"[LoKR start] Windows detected -- using num_workers={dataloader_cfg['num_workers']}"
-                )
 
             shard_result: Dict[str, Any] = {
                 "created": False,
