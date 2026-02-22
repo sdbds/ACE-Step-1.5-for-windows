@@ -17,6 +17,49 @@ from acestep.api.train_api_runtime import RuntimeComponentManager, unwrap_module
 from acestep.handler import AceStepHandler
 
 
+def _resolve_lokr_dataloader_config(device: Any, is_windows: bool) -> Dict[str, Any]:
+    """Resolve DataLoader tuning defaults for LoKR training.
+
+    Args:
+        device: Handler device object or string.
+        is_windows: Whether current OS is Windows.
+
+    Returns:
+        Mapping with num_workers/pin_memory/prefetch_factor/persistent_workers/pin_memory_device.
+    """
+    if hasattr(device, "type"):
+        device_type = str(device.type).lower()
+    else:
+        device_type = str(device).split(":", 1)[0].lower()
+
+    if device_type == "cuda":
+        cfg = {
+            "num_workers": 4,
+            "pin_memory": True,
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+            "pin_memory_device": "cuda",
+        }
+    elif device_type == "xpu":
+        cfg = {
+            "num_workers": 4,
+            "pin_memory": True,
+            "prefetch_factor": 2,
+            "persistent_workers": True,
+            "pin_memory_device": "",
+        }
+    else:
+        cfg = {
+            "num_workers": 0,
+            "pin_memory": False,
+            "prefetch_factor": 2,
+            "persistent_workers": False,
+            "pin_memory_device": "",
+        }
+
+    return cfg
+
+
 def register_lokr_training_start_route(
     app: FastAPI,
     verify_api_key: Callable[..., Any],
@@ -57,7 +100,38 @@ def register_lokr_training_start_route(
 
         try:
             from acestep.training.configs import LoKRConfig as LoKRConfigClass, TrainingConfig
+            from acestep.training.data_module import build_tensor_shards
             from acestep.training.trainer import LoKRTrainer
+
+            dataloader_cfg = _resolve_lokr_dataloader_config(
+                device=getattr(handler, "device", ""),
+                is_windows=(os.name == "nt"),
+            )
+            if os.name == "nt":
+                logger.info(
+                    f"[LoKR start] Windows detected -- using num_workers={dataloader_cfg['num_workers']}"
+                )
+
+            shard_result: Dict[str, Any] = {
+                "created": False,
+                "already_sharded": False,
+                "num_samples": 0,
+                "num_shards": 0,
+                "reason": "disabled",
+            }
+            if request.auto_shard and request.shard_size > 0:
+                try:
+                    shard_result = build_tensor_shards(
+                        request.tensor_dir,
+                        shard_size=request.shard_size,
+                    )
+                    logger.info(
+                        f"[LoKR start] shard status: created={shard_result.get('created')} "
+                        f"already_sharded={shard_result.get('already_sharded')} "
+                        f"samples={shard_result.get('num_samples')} shards={shard_result.get('num_shards')}"
+                    )
+                except Exception as exc:
+                    logger.warning(f"[LoKR start] auto_shard failed, continuing with original tensors: {exc}")
 
             factor = request.lokr_factor
             if factor != -1:
@@ -86,6 +160,12 @@ def register_lokr_training_start_route(
                 output_dir=request.output_dir,
                 gradient_checkpointing=request.gradient_checkpointing,
                 network_weights=request.network_weights,
+                num_workers=dataloader_cfg["num_workers"],
+                pin_memory=dataloader_cfg["pin_memory"],
+                prefetch_factor=dataloader_cfg["prefetch_factor"],
+                persistent_workers=dataloader_cfg["persistent_workers"],
+                pin_memory_device=dataloader_cfg["pin_memory_device"],
+                sample_cache_size=request.sample_cache_size,
             )
             trainer = LoKRTrainer(dit_handler=handler, lokr_config=lokr_config, training_config=training_config)
         except Exception as exc:
@@ -127,6 +207,10 @@ def register_lokr_training_start_route(
                     "lokr_weight_decompose": request.lokr_weight_decompose,
                     "learning_rate": request.learning_rate,
                     "epochs": request.train_epochs,
+                    "sample_cache_size": request.sample_cache_size,
+                    "auto_shard": request.auto_shard,
+                    "shard_size": request.shard_size,
+                    "shard_result": shard_result,
                     "network_weights": request.network_weights,
                 },
                 "_component_manager": mgr,

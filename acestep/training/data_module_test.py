@@ -9,10 +9,14 @@ import os
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import torch
 
 from acestep.training.path_safety import safe_path, set_safe_root
 from acestep.training.data_module import (
     PreprocessedTensorDataset,
+    build_tensor_shards,
     load_dataset_from_json,
 )
 
@@ -128,6 +132,136 @@ class PreprocessedTensorDatasetPathSafetyTests(unittest.TestCase):
                 os.path.realpath(ds.valid_paths[0]),
                 os.path.realpath(pt_file),
             )
+
+
+class PreprocessedTensorDatasetCacheTests(unittest.TestCase):
+    """Tests for optional preprocessed tensor sample caching."""
+
+    def setUp(self):
+        set_safe_root(tempfile.gettempdir())
+
+    @staticmethod
+    def _fake_sample() -> dict:
+        """Build a minimal tensor sample payload expected by dataset loader."""
+        return {
+            "target_latents": torch.zeros(4, 64),
+            "attention_mask": torch.ones(4),
+            "encoder_hidden_states": torch.zeros(2, 8),
+            "encoder_attention_mask": torch.ones(2),
+            "context_latents": torch.zeros(4, 65),
+            "metadata": {},
+        }
+
+    def test_cache_hit_skips_second_torch_load(self):
+        """Repeated access to same index should hit in-memory cache."""
+        with tempfile.TemporaryDirectory() as d:
+            pt = os.path.join(d, "a.pt")
+            open(pt, "wb").close()
+
+            ds = PreprocessedTensorDataset(d, cache_size=4)
+            with patch("acestep.training.data_module.torch.load", return_value=self._fake_sample()) as mock_load:
+                _ = ds[0]
+                _ = ds[0]
+
+        self.assertEqual(mock_load.call_count, 1)
+
+    def test_cache_eviction_reloads_sample(self):
+        """LRU eviction should reload a sample when cache capacity is exceeded."""
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a.pt", "b.pt"):
+                open(os.path.join(d, name), "wb").close()
+
+            ds = PreprocessedTensorDataset(d, cache_size=1)
+            with patch("acestep.training.data_module.torch.load", return_value=self._fake_sample()) as mock_load:
+                _ = ds[0]
+                _ = ds[1]
+                _ = ds[0]
+
+        self.assertEqual(mock_load.call_count, 3)
+
+
+class PreprocessedTensorDatasetShardTests(unittest.TestCase):
+    """Tests for sharded manifest/sample loading."""
+
+    def setUp(self):
+        set_safe_root(tempfile.gettempdir())
+
+    @staticmethod
+    def _fake_sample() -> dict:
+        """Build a minimal tensor sample payload expected by dataset loader."""
+        return {
+            "target_latents": torch.zeros(4, 64),
+            "attention_mask": torch.ones(4),
+            "encoder_hidden_states": torch.zeros(2, 8),
+            "encoder_attention_mask": torch.ones(2),
+            "context_latents": torch.zeros(4, 65),
+            "metadata": {"id": "x"},
+        }
+
+    def test_dataset_reads_sharded_manifest_entries(self):
+        """Dataset should load samples addressed by {shard,index} entries."""
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "shards"), exist_ok=True)
+            shard_path = os.path.join(d, "shards", "shard_00000.pt")
+            torch.save({"samples": [self._fake_sample(), self._fake_sample()]}, shard_path)
+
+            manifest = {
+                "samples": [
+                    {"shard": "shards/shard_00000.pt", "index": 0},
+                    {"shard": "shards/shard_00000.pt", "index": 1},
+                ],
+            }
+            with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+
+            ds = PreprocessedTensorDataset(d, cache_size=2)
+            self.assertEqual(len(ds), 2)
+            s0 = ds[0]
+            s1 = ds[1]
+
+        self.assertIn("target_latents", s0)
+        self.assertIn("encoder_hidden_states", s1)
+
+
+class BuildTensorShardsTests(unittest.TestCase):
+    """Tests for tensor shard builder utility."""
+
+    def setUp(self):
+        set_safe_root(tempfile.gettempdir())
+
+    @staticmethod
+    def _sample(seed: int) -> dict:
+        """Create deterministic tensor sample with required training keys."""
+        return {
+            "target_latents": torch.full((2, 64), float(seed)),
+            "attention_mask": torch.ones(2),
+            "encoder_hidden_states": torch.full((2, 8), float(seed)),
+            "encoder_attention_mask": torch.ones(2),
+            "context_latents": torch.full((2, 65), float(seed)),
+            "metadata": {"seed": seed},
+        }
+
+    def test_build_tensor_shards_rewrites_manifest_to_sharded_entries(self):
+        """Sharder should produce shard files and sharded manifest entries."""
+        with tempfile.TemporaryDirectory() as d:
+            torch.save(self._sample(1), os.path.join(d, "a.pt"))
+            torch.save(self._sample(2), os.path.join(d, "b.pt"))
+            manifest = {"samples": ["a.pt", "b.pt"]}
+            with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(manifest, f)
+
+            result = build_tensor_shards(d, shard_size=1)
+
+            self.assertTrue(result["created"])
+            self.assertEqual(result["num_samples"], 2)
+            self.assertEqual(result["num_shards"], 2)
+
+            with open(os.path.join(d, "manifest.json"), "r", encoding="utf-8") as f:
+                rewritten = json.load(f)
+            self.assertEqual(rewritten.get("format"), "sharded_v1")
+            self.assertIsInstance(rewritten["samples"][0], dict)
+            self.assertIn("shard", rewritten["samples"][0])
+            self.assertIn("index", rewritten["samples"][0])
 
 
 class SaveManifestTests(unittest.TestCase):

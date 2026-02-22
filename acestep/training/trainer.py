@@ -137,6 +137,26 @@ def _count_nonfinite_grads(params: List[torch.nn.Parameter]) -> Tuple[int, int]:
     return nonfinite, total_with_grad
 
 
+def _accumulate_loss_without_sync(
+    accumulated_loss: Any,
+    loss: torch.Tensor,
+) -> torch.Tensor:
+    """Accumulate detached loss tensors without forcing host-device sync.
+
+    Args:
+        accumulated_loss: Running accumulator (float sentinel or tensor).
+        loss: Current micro-batch loss tensor.
+
+    Returns:
+        Updated detached tensor accumulator.
+    """
+    loss_detached = loss.detach()
+    if isinstance(accumulated_loss, torch.Tensor):
+        accumulated_loss.add_(loss_detached)
+        return accumulated_loss
+    return loss_detached
+
+
 def _ensure_optimizer_params_fp32(optimizer: torch.optim.Optimizer) -> Tuple[int, int]:
     """Force optimizer parameter tensors to fp32 when trainable."""
     casted = 0
@@ -719,6 +739,7 @@ class LoRATrainer:
                 prefetch_factor=self.training_config.prefetch_factor,
                 persistent_workers=self.training_config.persistent_workers,
                 pin_memory_device=self.training_config.pin_memory_device,
+                sample_cache_size=getattr(self.training_config, "sample_cache_size", 0),
                 val_split=getattr(self.training_config, "val_split", 0.0),
             )
 
@@ -1442,6 +1463,7 @@ class LoKRTrainer:
                 prefetch_factor=self.training_config.prefetch_factor,
                 persistent_workers=self.training_config.persistent_workers,
                 pin_memory_device=self.training_config.pin_memory_device,
+                sample_cache_size=getattr(self.training_config, "sample_cache_size", 0),
                 val_split=self.training_config.val_split,
             )
             data_module.setup('fit')
@@ -1625,16 +1647,32 @@ class LoKRTrainer:
             num_updates = 0
             epoch_start_time = time.time()
 
-            for _, batch in enumerate(train_loader):
+            epoch_data_wait_time = 0.0
+            epoch_compute_time = 0.0
+            train_iter = iter(train_loader)
+            while True:
+                fetch_started = time.perf_counter()
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    break
+                epoch_data_wait_time += time.perf_counter() - fetch_started
+
+                step_started = time.perf_counter()
                 if training_state and training_state.get("should_stop", False):
-                    yield global_step, accumulated_loss / max(accumulation_step, 1), "Training stopped by user"
+                    stop_loss = (
+                        accumulated_loss.item() / max(accumulation_step, 1)
+                        if isinstance(accumulated_loss, torch.Tensor)
+                        else accumulated_loss / max(accumulation_step, 1)
+                    )
+                    yield global_step, stop_loss, "Training stopped by user"
                     return
 
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
 
                 self.fabric.backward(loss)
-                accumulated_loss += loss.item()
+                accumulated_loss = _accumulate_loss_without_sync(accumulated_loss, loss)
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
@@ -1672,19 +1710,22 @@ class LoKRTrainer:
                     global_step += 1
 
                     avg_loss = accumulated_loss / accumulation_step
-                    self.module.training_losses.append(float(avg_loss))
+                    avg_loss_value = float(avg_loss.item()) if isinstance(avg_loss, torch.Tensor) else float(avg_loss)
+                    self.module.training_losses.append(avg_loss_value)
                     if global_step % self.training_config.log_every_n_steps == 0:
-                        self.fabric.log("train/loss", avg_loss, step=global_step)
+                        self.fabric.log("train/loss", avg_loss_value, step=global_step)
                         self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
-                        yield global_step, avg_loss, (
+                        yield global_step, avg_loss_value, (
                             f"Epoch {epoch+1}/{self.training_config.max_epochs}, "
-                            f"Step {global_step}, Loss: {avg_loss:.4f}"
+                            f"Step {global_step}, Loss: {avg_loss_value:.4f}"
                         )
 
-                    epoch_loss += avg_loss
+                    epoch_loss += avg_loss_value
                     num_updates += 1
                     accumulated_loss = 0.0
                     accumulation_step = 0
+
+                epoch_compute_time += time.perf_counter() - step_started
 
             if accumulation_step > 0:
                 if manual_nonfinite_check:
@@ -1721,15 +1762,16 @@ class LoKRTrainer:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 avg_loss = accumulated_loss / accumulation_step
+                avg_loss_value = float(avg_loss.item()) if isinstance(avg_loss, torch.Tensor) else float(avg_loss)
                 if global_step % self.training_config.log_every_n_steps == 0:
-                    self.fabric.log("train/loss", avg_loss, step=global_step)
+                    self.fabric.log("train/loss", avg_loss_value, step=global_step)
                     self.fabric.log("train/lr", scheduler.get_last_lr()[0], step=global_step)
-                    yield global_step, avg_loss, (
+                    yield global_step, avg_loss_value, (
                         f"Epoch {epoch+1}/{self.training_config.max_epochs}, "
-                        f"Step {global_step}, Loss: {avg_loss:.4f}"
+                        f"Step {global_step}, Loss: {avg_loss_value:.4f}"
                     )
 
-                epoch_loss += avg_loss
+                epoch_loss += avg_loss_value
                 num_updates += 1
                 accumulated_loss = 0.0
                 accumulation_step = 0
@@ -1741,6 +1783,14 @@ class LoKRTrainer:
                 f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} "
                 f"in {epoch_time:.1f}s, Loss: {avg_epoch_loss:.4f}"
             )
+
+            epoch_total_busy = epoch_data_wait_time + epoch_compute_time
+            if epoch_total_busy > 0:
+                io_wait_ratio = epoch_data_wait_time / epoch_total_busy
+                yield global_step, avg_epoch_loss, (
+                    f"📊 Data wait ratio: {io_wait_ratio:.1%} "
+                    f"(wait {epoch_data_wait_time:.1f}s / compute {epoch_compute_time:.1f}s)"
+                )
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(
@@ -1823,15 +1873,31 @@ class LoKRTrainer:
             num_updates = 0
             epoch_start_time = time.time()
 
-            for batch in train_loader:
+            epoch_data_wait_time = 0.0
+            epoch_compute_time = 0.0
+            train_iter = iter(train_loader)
+            while True:
+                fetch_started = time.perf_counter()
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    break
+                epoch_data_wait_time += time.perf_counter() - fetch_started
+
+                step_started = time.perf_counter()
                 if training_state and training_state.get("should_stop", False):
-                    yield global_step, accumulated_loss / max(accumulation_step, 1), "⏹️ Training stopped"
+                    stop_loss = (
+                        accumulated_loss.item() / max(accumulation_step, 1)
+                        if isinstance(accumulated_loss, torch.Tensor)
+                        else accumulated_loss / max(accumulation_step, 1)
+                    )
+                    yield global_step, stop_loss, "⏹️ Training stopped"
                     return
 
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
-                accumulated_loss += loss.item()
+                accumulated_loss = _accumulate_loss_without_sync(accumulated_loss, loss)
                 accumulation_step += 1
 
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
@@ -1842,14 +1908,17 @@ class LoKRTrainer:
                     global_step += 1
 
                     avg_loss = accumulated_loss / accumulation_step
-                    self.module.training_losses.append(float(avg_loss))
+                    avg_loss_value = float(avg_loss.item()) if isinstance(avg_loss, torch.Tensor) else float(avg_loss)
+                    self.module.training_losses.append(avg_loss_value)
                     if global_step % self.training_config.log_every_n_steps == 0:
-                        yield global_step, avg_loss, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss:.4f}"
+                        yield global_step, avg_loss_value, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss_value:.4f}"
 
-                    epoch_loss += avg_loss
+                    epoch_loss += avg_loss_value
                     num_updates += 1
                     accumulated_loss = 0.0
                     accumulation_step = 0
+
+                epoch_compute_time += time.perf_counter() - step_started
 
             if accumulation_step > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, self.training_config.max_grad_norm)
@@ -1859,10 +1928,11 @@ class LoKRTrainer:
                 global_step += 1
 
                 avg_loss = accumulated_loss / accumulation_step
+                avg_loss_value = float(avg_loss.item()) if isinstance(avg_loss, torch.Tensor) else float(avg_loss)
                 if global_step % self.training_config.log_every_n_steps == 0:
-                    yield global_step, avg_loss, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss:.4f}"
+                    yield global_step, avg_loss_value, f"Epoch {epoch+1}, Step {global_step}, Loss: {avg_loss_value:.4f}"
 
-                epoch_loss += avg_loss
+                epoch_loss += avg_loss_value
                 num_updates += 1
                 accumulated_loss = 0.0
                 accumulation_step = 0
@@ -1870,6 +1940,14 @@ class LoKRTrainer:
             epoch_time = time.time() - epoch_start_time
             avg_epoch_loss = epoch_loss / max(num_updates, 1)
             yield global_step, avg_epoch_loss, f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s"
+
+            epoch_total_busy = epoch_data_wait_time + epoch_compute_time
+            if epoch_total_busy > 0:
+                io_wait_ratio = epoch_data_wait_time / epoch_total_busy
+                yield global_step, avg_epoch_loss, (
+                    f"📊 Data wait ratio: {io_wait_ratio:.1%} "
+                    f"(wait {epoch_data_wait_time:.1f}s / compute {epoch_compute_time:.1f}s)"
+                )
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")

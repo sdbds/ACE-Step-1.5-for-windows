@@ -50,6 +50,9 @@ class StartLoKRTrainingRequest(BaseModel):
     training_seed: int = Field(default=42, description="Random seed")
     output_dir: str = Field(default="./lokr_output", description="Output directory")
     gradient_checkpointing: bool = Field(default=False, description="Trade compute speed for lower VRAM usage")
+    sample_cache_size: int = Field(default=32, ge=0, le=4096, description="Per-worker preprocessed sample cache size")
+    auto_shard: bool = Field(default=True, description="Automatically shard per-sample tensor files for faster IO")
+    shard_size: int = Field(default=256, ge=0, le=4096, description="Samples per shard when auto_shard is enabled (0=disable)")
     network_weights: Optional[str] = Field(default=None, description="Path to previously trained weights to resume from")
 
 

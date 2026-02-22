@@ -125,6 +125,7 @@ class TrainingConfig:
     prefetch_factor: int = 2
     persistent_workers: bool = True
     pin_memory_device: str = ""
+    sample_cache_size: int = 32
 
     # Logging
     log_every_n_steps: int = 10
@@ -164,6 +165,7 @@ class TrainingConfig:
             "prefetch_factor": self.prefetch_factor,
             "persistent_workers": self.persistent_workers,
             "pin_memory_device": self.pin_memory_device,
+            "sample_cache_size": self.sample_cache_size,
             "log_every_n_steps": self.log_every_n_steps,
             "val_split": self.val_split,
             "network_weights": self.network_weights,

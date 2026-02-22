@@ -8,6 +8,7 @@ Supports both raw audio loading and preprocessed tensor loading.
 import os
 import json
 import random
+from collections import OrderedDict
 from typing import Optional, List, Dict, Any, Tuple
 from loguru import logger
 
@@ -32,6 +33,150 @@ except ImportError:
 # Preprocessed Tensor Dataset (Recommended for Training)
 # ============================================================================
 
+
+def _load_tensor_file(tensor_path: str) -> Dict[str, Any]:
+    """Load a tensor ``.pt`` file robustly across torch versions.
+
+    Args:
+        tensor_path: Absolute path to a tensor ``.pt`` file.
+
+    Returns:
+        Deserialized sample dictionary.
+    """
+    try:
+        return torch.load(tensor_path, map_location='cpu', weights_only=True)
+    except TypeError:
+        return torch.load(tensor_path, map_location='cpu')
+    except Exception:
+        return torch.load(tensor_path, map_location='cpu', weights_only=False)
+
+
+def build_tensor_shards(
+    tensor_dir: str,
+    shard_size: int = 256,
+) -> Dict[str, Any]:
+    """Build shard files from per-sample ``.pt`` tensors and rewrite manifest.
+
+    The function is backward-compatible and no-op when the manifest is already
+    in sharded form.
+
+    Args:
+        tensor_dir: Directory containing preprocessed tensor ``.pt`` files.
+        shard_size: Number of samples per shard. ``<=0`` disables sharding.
+
+    Returns:
+        Summary dictionary with sharding status and counts.
+    """
+    validated_dir = safe_path(tensor_dir)
+    if not os.path.isdir(validated_dir):
+        raise ValueError(f"Not an existing directory: {tensor_dir}")
+
+    shard_size = int(shard_size)
+    if shard_size <= 0:
+        return {
+            "created": False,
+            "already_sharded": False,
+            "num_samples": 0,
+            "num_shards": 0,
+            "reason": "disabled",
+        }
+
+    manifest_path = safe_path("manifest.json", base=validated_dir)
+    manifest: Dict[str, Any] = {}
+    sample_entries: List[Any] = []
+
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        sample_entries = manifest.get("samples", [])
+
+    if sample_entries and isinstance(sample_entries[0], dict) and "shard" in sample_entries[0]:
+        return {
+            "created": False,
+            "already_sharded": True,
+            "num_samples": len(sample_entries),
+            "num_shards": len({s.get("shard") for s in sample_entries if isinstance(s, dict)}),
+            "reason": "already_sharded",
+        }
+
+    sample_paths: List[str] = []
+    if sample_entries:
+        for raw in sample_entries:
+            if not isinstance(raw, str):
+                continue
+            try:
+                resolved = safe_path(raw, base=validated_dir)
+            except ValueError:
+                continue
+            if os.path.isfile(resolved):
+                sample_paths.append(resolved)
+    else:
+        for filename in os.listdir(validated_dir):
+            if filename.endswith('.pt') and filename != "manifest.json":
+                resolved = safe_path(filename, base=validated_dir)
+                if os.path.isfile(resolved):
+                    sample_paths.append(resolved)
+
+    if not sample_paths:
+        return {
+            "created": False,
+            "already_sharded": False,
+            "num_samples": 0,
+            "num_shards": 0,
+            "reason": "no_samples",
+        }
+
+    os.makedirs(safe_path("shards", base=validated_dir), exist_ok=True)
+    sharded_entries: List[Dict[str, Any]] = []
+    shard_idx = 0
+
+    for start in range(0, len(sample_paths), shard_size):
+        chunk_paths = sample_paths[start:start + shard_size]
+        shard_samples: List[Dict[str, Any]] = []
+        for sample_path in chunk_paths:
+            data = _load_tensor_file(sample_path)
+            shard_samples.append(
+                {
+                    "target_latents": data["target_latents"],
+                    "attention_mask": data["attention_mask"],
+                    "encoder_hidden_states": data["encoder_hidden_states"],
+                    "encoder_attention_mask": data["encoder_attention_mask"],
+                    "context_latents": data["context_latents"],
+                    "metadata": data.get("metadata", {}),
+                }
+            )
+
+        shard_rel = f"shards/shard_{shard_idx:05d}.pt"
+        shard_abs = safe_path(shard_rel, base=validated_dir)
+        torch.save({"samples": shard_samples}, shard_abs)
+
+        for local_idx in range(len(shard_samples)):
+            sharded_entries.append({"shard": shard_rel, "index": local_idx})
+
+        shard_idx += 1
+
+    manifest["samples"] = sharded_entries
+    manifest["num_samples"] = len(sharded_entries)
+    manifest["format"] = "sharded_v1"
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    logger.info(
+        "Built tensor shards: %d samples -> %d shards (size=%d)",
+        len(sharded_entries),
+        shard_idx,
+        shard_size,
+    )
+    return {
+        "created": True,
+        "already_sharded": False,
+        "num_samples": len(sharded_entries),
+        "num_shards": shard_idx,
+        "shard_size": shard_size,
+        "manifest_path": manifest_path,
+    }
+
 class PreprocessedTensorDataset(Dataset):
     """Dataset that loads preprocessed tensor files.
 
@@ -45,11 +190,12 @@ class PreprocessedTensorDataset(Dataset):
     No VAE/text encoder needed during training - just load tensors directly!
     """
 
-    def __init__(self, tensor_dir: str):
+    def __init__(self, tensor_dir: str, cache_size: int = 0):
         """Initialize from a directory of preprocessed .pt files.
 
         Args:
             tensor_dir: Directory containing preprocessed .pt files and manifest.json
+            cache_size: Maximum number of decoded samples to cache per worker process
             
         Raises:
             ValueError: If tensor_dir is not an existing directory or escapes safe root.
@@ -59,24 +205,30 @@ class PreprocessedTensorDataset(Dataset):
             raise ValueError(f"Not an existing directory: {tensor_dir}")
         self.tensor_dir = validated_dir
         self.sample_paths: List[str] = []
+        self.sample_refs: List[Dict[str, Any]] = []
+        self.cache_size = max(0, int(cache_size))
+        self._sample_cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        self._shard_cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+        self._shard_cache_size = 2
         
         # Load manifest if exists
         manifest_path = safe_path("manifest.json", base=self.tensor_dir)
         if os.path.exists(manifest_path):
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
-            raw_paths = manifest.get("samples", [])
-            for raw in raw_paths:
-                resolved = self._resolve_manifest_path(raw)
+            raw_entries = manifest.get("samples", [])
+            for raw in raw_entries:
+                resolved = self._resolve_manifest_entry(raw)
                 if resolved is not None:
-                    self.sample_paths.append(resolved)
+                    self.sample_refs.append(resolved)
+                    self.sample_paths.append(resolved["path"])
         else:
             # Fallback: scan directory for .pt files (already inside tensor_dir)
             for f in os.listdir(self.tensor_dir):
                 if f.endswith('.pt') and f != "manifest.json":
-                    self.sample_paths.append(
-                        safe_path(f, base=self.tensor_dir)
-                    )
+                    resolved = safe_path(f, base=self.tensor_dir)
+                    self.sample_paths.append(resolved)
+                    self.sample_refs.append({"type": "file", "path": resolved})
         
         # Validate paths exist on disk
         self.valid_paths = [p for p in self.sample_paths if os.path.exists(p)]
@@ -124,8 +276,48 @@ class PreprocessedTensorDataset(Dataset):
         logger.warning(f"Skipping unresolvable manifest path: {raw}")
         return None
 
+    def _resolve_manifest_entry(self, raw: Any) -> Optional[Dict[str, Any]]:
+        """Resolve a manifest entry from either legacy or sharded format."""
+        if isinstance(raw, str):
+            resolved = self._resolve_manifest_path(raw)
+            if resolved is None:
+                return None
+            return {"type": "file", "path": resolved}
+
+        if isinstance(raw, dict) and "shard" in raw and "index" in raw:
+            shard_rel = raw.get("shard")
+            shard_index = raw.get("index")
+            if not isinstance(shard_rel, str) or not isinstance(shard_index, int) or shard_index < 0:
+                logger.warning(f"Skipping invalid shard entry: {raw}")
+                return None
+            resolved = self._resolve_manifest_path(shard_rel)
+            if resolved is None:
+                return None
+            return {"type": "shard", "path": resolved, "index": shard_index}
+
+        logger.warning(f"Skipping unsupported manifest entry: {raw}")
+        return None
+
+    def _load_shard_samples(self, shard_path: str) -> List[Dict[str, Any]]:
+        """Load a shard file and return its sample list with small LRU caching."""
+        cached = self._shard_cache.get(shard_path)
+        if cached is not None:
+            self._shard_cache.move_to_end(shard_path)
+            return cached
+
+        data = _load_tensor_file(shard_path)
+        samples = data.get("samples", []) if isinstance(data, dict) else []
+        if not isinstance(samples, list):
+            raise ValueError(f"Invalid shard format: {shard_path}")
+
+        self._shard_cache[shard_path] = samples
+        self._shard_cache.move_to_end(shard_path)
+        while len(self._shard_cache) > self._shard_cache_size:
+            self._shard_cache.popitem(last=False)
+        return samples
+
     def __len__(self) -> int:
-        return len(self.valid_paths)
+        return len(self.sample_refs)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Load a preprocessed tensor file.
@@ -133,16 +325,25 @@ class PreprocessedTensorDataset(Dataset):
         Returns:
             Dictionary containing all pre-computed tensors for training
         """
-        tensor_path = self.valid_paths[idx]
+        if self.cache_size > 0:
+            cached = self._sample_cache.get(idx)
+            if cached is not None:
+                self._sample_cache.move_to_end(idx)
+                return cached
 
-        try:
-            data = torch.load(tensor_path, map_location='cpu', weights_only=True)
-        except TypeError:
-            data = torch.load(tensor_path, map_location='cpu')
-        except Exception:
-            data = torch.load(tensor_path, map_location='cpu', weights_only=False)
+        ref = self.sample_refs[idx]
+        if ref["type"] == "file":
+            data = _load_tensor_file(ref["path"])
+        else:
+            shard_samples = self._load_shard_samples(ref["path"])
+            shard_index = int(ref["index"])
+            if shard_index >= len(shard_samples):
+                raise IndexError(
+                    f"Shard index out of range: {shard_index} >= {len(shard_samples)} for {ref['path']}"
+                )
+            data = shard_samples[shard_index]
 
-        return {
+        sample = {
             "target_latents": data["target_latents"],  # [T, 64]
             "attention_mask": data["attention_mask"],  # [T]
             "encoder_hidden_states": data["encoder_hidden_states"],  # [L, D]
@@ -150,6 +351,14 @@ class PreprocessedTensorDataset(Dataset):
             "context_latents": data["context_latents"],  # [T, 65]
             "metadata": data.get("metadata", {}),
         }
+
+        if self.cache_size > 0:
+            self._sample_cache[idx] = sample
+            self._sample_cache.move_to_end(idx)
+            if len(self._sample_cache) > self.cache_size:
+                self._sample_cache.popitem(last=False)
+
+        return sample
 
 
 def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -229,6 +438,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         prefetch_factor: int = 2,
         persistent_workers: bool = True,
         pin_memory_device: str = "",
+        sample_cache_size: int = 0,
         val_split: float = 0.0,
     ):
         """Initialize the data module.
@@ -238,6 +448,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
             batch_size: Training batch size
             num_workers: Number of data loading workers
             pin_memory: Whether to pin memory for faster GPU transfer
+            sample_cache_size: Number of decoded samples to cache per worker
             val_split: Fraction of data for validation (0 = no validation)
         """
         if LIGHTNING_AVAILABLE:
@@ -250,6 +461,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         self.prefetch_factor = prefetch_factor
         self.persistent_workers = persistent_workers
         self.pin_memory_device = pin_memory_device
+        self.sample_cache_size = sample_cache_size
         self.val_split = val_split
 
         self.train_dataset = None
@@ -259,7 +471,10 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         """Setup datasets."""
         if stage == 'fit' or stage is None:
             # Create full dataset
-            full_dataset = PreprocessedTensorDataset(self.tensor_dir)
+            full_dataset = PreprocessedTensorDataset(
+                self.tensor_dir,
+                cache_size=self.sample_cache_size,
+            )
 
             # Split if validation requested
             if self.val_split > 0 and len(full_dataset) > 1:
