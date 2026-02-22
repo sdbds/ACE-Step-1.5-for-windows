@@ -28,20 +28,6 @@ def check_lycoris_available() -> bool:
     return LYCORIS_AVAILABLE
 
 
-def _matches_target_module_name(module_name: str, target_modules) -> bool:
-    """Return True if a LyCORIS module name maps to one of target module suffixes."""
-    if not module_name:
-        return False
-    name = module_name.lower()
-    for target in target_modules or []:
-        t = str(target).strip().lower()
-        if not t:
-            continue
-        if name.endswith(t) or f"_{t}" in name or f".{t}" in name:
-            return True
-    return False
-
-
 def inject_lokr_into_dit(
     model,
     lokr_config: LoKRConfig,
@@ -127,29 +113,15 @@ def inject_lokr_into_dit(
     lycoris_net.apply_to()
     decoder._lycoris_net = lycoris_net
 
+    # IMPORTANT: LyCORIS preset/create_lycoris already handles target-module
+    # selection. Re-filtering by fragile name matching here can accidentally
+    # freeze valid LoKr tensors (e.g. lokr_w2_b), causing silent quality
+    # regression with many all-zero saved tensors.
     lokr_param_list = []
-    enabled_module_count = 0
-    disabled_module_count = 0
-    disabled_examples = []
-
-    for idx, module in enumerate(getattr(lycoris_net, "loras", []) or []):
-        module_name = (
-            getattr(module, "lora_name", None)
-            or getattr(module, "name", None)
-            or f"{module.__class__.__name__}#{idx}"
-        )
-        enabled = _matches_target_module_name(module_name, lokr_config.target_modules)
-        if enabled:
-            enabled_module_count += 1
-        else:
-            disabled_module_count += 1
-            if len(disabled_examples) < 8:
-                disabled_examples.append(module_name)
-
+    for module in getattr(lycoris_net, "loras", []) or []:
         for param in module.parameters():
-            param.requires_grad = enabled
-            if enabled:
-                lokr_param_list.append(param)
+            param.requires_grad = True
+            lokr_param_list.append(param)
 
     if not lokr_param_list:
         for param in lycoris_net.parameters():

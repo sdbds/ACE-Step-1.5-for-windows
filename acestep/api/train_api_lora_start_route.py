@@ -28,6 +28,7 @@ def register_lora_training_start_route(
     @app.post("/v1/training/start")
     async def start_training(request: StartTrainingRequest, _: None = Depends(verify_api_key)):
         """Start LoRA training from preprocessed tensors."""
+        logger.info(f"[LoRA start] tensor_dir={request.tensor_dir!r}, output_dir={request.lora_output_dir!r}")
 
         initialize_training_state(app)
         training_state = app.state.training_state

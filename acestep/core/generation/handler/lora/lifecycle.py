@@ -151,6 +151,19 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
             )
         else:
             logger.info(f"LoKr adapter: {n_modules} modules reconstructed from weights")
+            # Diagnostic: verify weights are actually non-zero
+            total_params = 0
+            nonzero_params = 0
+            for lora_mod in lycoris_net.loras[:3]:  # sample first 3
+                for pname, p in lora_mod.named_parameters():
+                    total_params += 1
+                    if p.abs().sum().item() > 0:
+                        nonzero_params += 1
+                    else:
+                        logger.warning(f"LoKr param all-zero: {pname} shape={tuple(p.shape)}")
+            logger.info(
+                f"LoKr weight check: {nonzero_params}/{total_params} sampled params are non-zero"
+            )
         lycoris_net.apply_to()
         decoder._lycoris_net = lycoris_net
         return lycoris_net
@@ -301,7 +314,10 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
 
             if lokr_weights_path is not None:
                 logger.info(f"Loading LoKr adapter from {lokr_weights_path} as '{effective_name}'")
-                _load_lokr_adapter(decoder, lokr_weights_path)
+                lokr_net = _load_lokr_adapter(decoder, lokr_weights_path)
+                n_loaded = len(getattr(lokr_net, 'loras', []) or [])
+                if n_loaded == 0:
+                    logger.error(f"LoKr adapter loaded 0 modules from {lokr_weights_path}")
                 self.model.decoder = decoder
                 self._adapter_type = "lokr"
             else:

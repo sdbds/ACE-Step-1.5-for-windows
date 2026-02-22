@@ -28,6 +28,7 @@ def register_lokr_training_start_route(
     @app.post("/v1/training/start_lokr")
     async def start_lokr_training(request: StartLoKRTrainingRequest, _: None = Depends(verify_api_key)):
         """Start LoKr training from preprocessed tensors."""
+        logger.info(f"[LoKR start] tensor_dir={request.tensor_dir!r}, output_dir={request.output_dir!r}")
 
         initialize_training_state(app)
         training_state = app.state.training_state
