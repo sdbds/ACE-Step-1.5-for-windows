@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import math
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
@@ -15,6 +16,43 @@ from loguru import logger
 from acestep.api.train_api_models import StartLoKRTrainingRequest, initialize_training_state
 from acestep.api.train_api_runtime import RuntimeComponentManager, unwrap_module
 from acestep.handler import AceStepHandler
+
+
+def _format_duration(seconds: Optional[float]) -> str:
+    """Format seconds into H:MM:SS for status messages."""
+    if seconds is None:
+        return "--:--"
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _estimate_total_steps(
+    num_samples: int,
+    batch_size: int,
+    gradient_accumulation: int,
+    max_epochs: int,
+) -> int:
+    """Estimate optimizer steps using the same rounding rules as trainer loops."""
+    micro_batches_per_epoch = max(1, math.ceil(max(1, num_samples) / max(1, batch_size)))
+    steps_per_epoch = max(1, math.ceil(micro_batches_per_epoch / max(1, gradient_accumulation)))
+    return steps_per_epoch * max(1, max_epochs)
+
+
+def _decorate_status_line(
+    base_status: str,
+    elapsed_seconds: float,
+    steps_per_second: float,
+    eta_seconds: Optional[float],
+) -> str:
+    """Append elapsed time, speed, and ETA to a status line."""
+    elapsed_text = _format_duration(elapsed_seconds)
+    speed_text = f"{steps_per_second:.2f} step/s" if steps_per_second > 0 else "-- step/s"
+    eta_text = _format_duration(eta_seconds)
+    return f"{base_status} | elapsed {elapsed_text} | {speed_text} | ETA {eta_text}"
 
 
 def _resolve_lokr_dataloader_config(device: Any) -> Dict[str, Any]:
@@ -180,6 +218,7 @@ def register_lokr_training_start_route(
                 "tensor_dir": request.tensor_dir,
                 "tensorboard_logdir": tensorboard_logdir,
                 "current_step": 0,
+                "total_steps": 0,
                 "current_loss": None,
                 "status": "Starting...",
                 "loss_history": [],
@@ -201,6 +240,8 @@ def register_lokr_training_start_route(
                     "lokr_weight_decompose": request.lokr_weight_decompose,
                     "learning_rate": request.learning_rate,
                     "epochs": request.train_epochs,
+                    "batch_size": request.train_batch_size,
+                    "gradient_accumulation": request.gradient_accumulation,
                     "sample_cache_size": request.sample_cache_size,
                     "auto_shard": request.auto_shard,
                     "shard_size": request.shard_size,
@@ -215,16 +256,16 @@ def register_lokr_training_start_route(
         def _runner() -> None:
             local_run_id = run_id
             log_lines: list = []
+            total_steps_estimate: Optional[int] = None
+            training_state["last_counted_step"] = 0
+            last_step_timestamp: Optional[float] = None
             try:
                 for step, loss, status in trainer.train_from_preprocessed(request.tensor_dir, training_state):
                     if training_state.get("run_id") != local_run_id:
                         break
                     training_state["current_step"] = step
                     training_state["current_loss"] = loss
-                    training_state["status"] = status
                     text = str(status)
-                    log_lines.append(text)
-                    training_state["training_log"] = "\n".join(log_lines[-200:])
                     match = re.search(r"Epoch (\d+)/(\d+)", text)
                     if match:
                         training_state["current_epoch"] = int(match.group(1))
@@ -232,17 +273,63 @@ def register_lokr_training_start_route(
                     else:
                         total_epochs = training_state.get("config", {}).get("epochs", 0)
                     now = time.time()
-                    prev_time = training_state.get("last_step_time", now)
-                    if step > 0 and now > prev_time:
-                        training_state["steps_per_second"] = 1.0 / max(now - prev_time, 0.001)
-                    training_state["last_step_time"] = now
                     start = training_state.get("start_time", now)
                     elapsed = now - start
-                    if step > 0 and elapsed > 0:
+
+                    # Update speed only when global step advances.
+                    last_counted_step = int(training_state.get("last_counted_step", 0))
+                    if step > last_counted_step:
+                        step_delta = step - last_counted_step
+                        if last_step_timestamp is None:
+                            inst_sps = (step / elapsed) if (step > 0 and elapsed > 0) else 0.0
+                        else:
+                            inst_sps = step_delta / max(now - last_step_timestamp, 0.001)
+                        prev_sps = float(training_state.get("steps_per_second", 0.0))
+                        training_state["steps_per_second"] = inst_sps if prev_sps <= 0 else (prev_sps * 0.8 + inst_sps * 0.2)
+                        training_state["last_counted_step"] = step
+                        last_step_timestamp = now
+                        training_state["last_step_time"] = now
+
+                    # Prefer step-based ETA once dataset size is known.
+                    if total_steps_estimate is None:
+                        run_meta = getattr(trainer, "run_metadata", {}) or {}
+                        num_samples = int(run_meta.get("num_samples", 0) or 0)
+                        if num_samples > 0:
+                            total_steps_estimate = _estimate_total_steps(
+                                num_samples=num_samples,
+                                batch_size=int(request.train_batch_size),
+                                gradient_accumulation=int(request.gradient_accumulation),
+                                max_epochs=int(request.train_epochs),
+                            )
+                            training_state["total_steps"] = total_steps_estimate
+                            config = training_state.get("config")
+                            if isinstance(config, dict):
+                                config["total_steps"] = total_steps_estimate
+
+                    sps = float(training_state.get("steps_per_second", 0.0))
+                    eta_seconds: Optional[float] = None
+                    if total_steps_estimate is not None and sps > 0 and step >= 0:
+                        remaining_steps = max(0, total_steps_estimate - step)
+                        eta_seconds = remaining_steps / sps
+                        training_state["estimated_time_remaining"] = eta_seconds
+                    elif step > 0 and elapsed > 0:
+                        # Conservative fallback before total steps are known.
                         current_epoch = training_state.get("current_epoch", 0)
                         if total_epochs > 0 and current_epoch > 0:
                             remaining = elapsed * (total_epochs - current_epoch) / current_epoch
+                            eta_seconds = remaining
                             training_state["estimated_time_remaining"] = remaining
+
+                    decorated = _decorate_status_line(
+                        base_status=text,
+                        elapsed_seconds=elapsed,
+                        steps_per_second=sps,
+                        eta_seconds=eta_seconds,
+                    )
+                    training_state["status"] = decorated
+                    log_lines.append(decorated)
+                    training_state["training_log"] = "\n".join(log_lines[-200:])
+
                     if loss is not None and loss == loss and step > 0:
                         history = training_state.get("loss_history", [])
                         history.append({"step": step, "loss": float(loss)})

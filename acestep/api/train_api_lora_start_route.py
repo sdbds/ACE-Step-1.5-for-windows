@@ -92,6 +92,7 @@ def register_lora_training_start_route(
                 "tensor_dir": request.tensor_dir,
                 "tensorboard_logdir": tensorboard_logdir,
                 "current_step": 0,
+                "total_steps": 0,
                 "current_loss": None,
                 "status": "Starting...",
                 "loss_history": [],

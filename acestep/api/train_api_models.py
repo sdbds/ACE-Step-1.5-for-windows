@@ -121,6 +121,7 @@ def initialize_training_state(app: FastAPI) -> None:
         "tensorboard_logdir": None,
         "tensorboard_url": None,
         "current_step": 0,
+        "total_steps": 0,
         "current_loss": None,
         "status": "Idle",
         "loss_history": [],

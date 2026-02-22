@@ -65,6 +65,7 @@ def register_training_api_routes(
         training_state.update(
             {
                 "current_step": 0,
+                "total_steps": 0,
                 "current_loss": None,
                 "status": "Stopping...",
                 "loss_history": [],
@@ -90,6 +91,7 @@ def register_training_api_routes(
             "is_training": ts.get("is_training", False),
             "should_stop": ts.get("should_stop", False),
             "current_step": ts.get("current_step", 0),
+            "total_steps": ts.get("total_steps", 0),
             "current_loss": ts.get("current_loss"),
             "status": ts.get("status", "Idle"),
             "config": ts.get("config", {}),
