@@ -19,9 +19,9 @@ foreach ($Path in $VenvPaths) {
 
 # Run setup script (installs all dependencies)
 # 运行安装脚本（安装所有依赖）
-if (Test-Path "start.bat") {
-    Write-Output "Running start.bat..."
-    & .\start.bat
+if (Test-Path "start.sh") {
+    Write-Output "Running start.sh..."
+    & .\start.sh
 }
 else {
     Write-Warning "Setup script not found"

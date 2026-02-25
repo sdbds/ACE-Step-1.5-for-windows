@@ -17,7 +17,7 @@ dependencies = [
     "triton>=3.0.0; sys_platform == 'linux' and python_version == '3.11'",
     "transformers>=4.51.0",
     "flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu130torch2.9.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'",
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'",
+    # "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.12/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.11' and platform_machine == 'x86_64'",
     "xxhash",
 ]
 

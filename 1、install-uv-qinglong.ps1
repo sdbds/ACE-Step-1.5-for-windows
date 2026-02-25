@@ -227,9 +227,9 @@ Set-Location ace-step-ui
 
 # Run setup script (installs all dependencies)
 # 运行安装脚本（安装所有依赖）
-if (Test-Path "setup.bat") {
-    Write-Output "Running setup.bat..."
-    & .\setup.bat
+if (Test-Path "setup.sh") {
+    Write-Output "Running setup.sh..."
+    & .\setup.sh
 }
 else {
     Write-Warning "Setup script not found"
