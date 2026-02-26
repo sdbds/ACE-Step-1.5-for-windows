@@ -1,16 +1,20 @@
-# PyTorch with CUDA 12.8 / 13.0
+# PyTorch with CUDA 12.4
 safetensors==0.7.0
---extra-index-url https://download.pytorch.org/whl/cu130
-torch==2.9.1; sys_platform == 'win32'
-torchaudio==2.9.1; sys_platform == 'win32'
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0; sys_platform == 'win32'
+torchaudio==2.6.0; sys_platform == 'win32'
 torchvision; sys_platform == 'win32'
-torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'
-torchaudio>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'
+torch>=2.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+torchaudio>=2.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'
 torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'
-# Other non-Windows platforms (Linux)
-torch==2.10.0+cu130; sys_platform != 'win32' and sys_platform != 'darwin'
-torchvision==0.25.0+cu130; sys_platform != 'win32' and sys_platform != 'darwin'
-torchaudio==2.10.0+cu130; sys_platform != 'win32' and sys_platform != 'darwin'
+# Other non-Windows platforms (Linux x86_64)
+torch==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'x86_64'
+torchvision==0.21.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'x86_64'
+torchaudio==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'x86_64'
+# Other non-Windows platforms (Linux aarch64)
+torch==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
+torchvision==0.21.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
+torchaudio==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
 
 # Core dependencies
 transformers>=4.51.0,<4.58.0
@@ -47,7 +51,7 @@ mlx-lm>=0.20.0; sys_platform == 'darwin' and platform_machine == 'arm64'
 # nano-vllm dependencies
 triton-windows>=3.0.0,<3.5; sys_platform == 'win32'
 triton>=3.0.0; sys_platform != 'win32'
-flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu130torch2.9.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'
+# flash-attn @ https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.3/flash_attn-2.8.3+cu130torch2.9.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == '3.11' and platform_machine == 'AMD64'
 # flash-attn; sys_platform == 'linux' and platform_machine == 'x86_64'
 xxhash
 

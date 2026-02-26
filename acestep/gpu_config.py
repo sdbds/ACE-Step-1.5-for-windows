@@ -33,7 +33,7 @@ VRAM_16GB_MIN_GB = 16.0 - VRAM_16GB_TOLERANCE_GB  # treat as 16GB class if >= th
 VRAM_AUTO_OFFLOAD_THRESHOLD_GB = 20.0
 
 # PyTorch installation URLs for diagnostics
-PYTORCH_CUDA_INSTALL_URL = "https://download.pytorch.org/whl/cu121"
+PYTORCH_CUDA_INSTALL_URL = "https://download.pytorch.org/whl/cu124"
 PYTORCH_ROCM_INSTALL_URL = "https://download.pytorch.org/whl/rocm6.0"
 
 

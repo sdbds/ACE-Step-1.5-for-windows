@@ -6,15 +6,19 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
 dependencies = [
-    # PyTorch for Windows with CUDA 13.0
+    # PyTorch for Windows with CUDA 12.4
     "safetensors==0.7.0",
-    "torch==2.9.1; sys_platform == 'win32'",
+    "torch==2.6.0; sys_platform == 'win32'",
     "torchvision; sys_platform == 'win32'",
-    "torchaudio==2.9.1; sys_platform == 'win32'",
-    # PyTorch for Linux with CUDA 13.0
-    "torch==2.10.0; sys_platform == 'linux'",
-    "torchvision; sys_platform == 'linux'",
-    "torchaudio==2.10.0; sys_platform == 'linux'",
+    "torchaudio==2.6.0; sys_platform == 'win32'",
+    # PyTorch for Linux x86_64 with CUDA 12.4
+    "torch==2.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio==2.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # PyTorch for Linux aarch64
+    "torch==2.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torchvision; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torchaudio==2.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
     # PyTorch for macOS (CPU / MPS)
     "torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -62,8 +66,8 @@ url = "https://pypi.org/simple"
 explicit = false
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv]
@@ -79,16 +83,16 @@ environments = ["sys_platform == 'win32'", "sys_platform == 'linux'", "sys_platf
 [tool.uv.sources]
 nano-vllm = { path = "acestep/third_parts/nano-vllm" }
 torch = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchvision = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchaudio = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 torchao = [
     { index = "pypi" },
