@@ -16,9 +16,9 @@ dependencies = [
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio==2.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # PyTorch for Linux aarch64
-    "torch==2.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torch>=2.5.1,<2.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'aarch64'",
-    "torchaudio==2.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "torchaudio; sys_platform == 'linux' and platform_machine == 'aarch64'",
     # PyTorch for macOS (CPU / MPS)
     "torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'",

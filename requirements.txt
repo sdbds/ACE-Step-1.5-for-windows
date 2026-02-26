@@ -12,9 +12,9 @@ torch==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and pla
 torchvision==0.21.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'x86_64'
 torchaudio==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'x86_64'
 # Other non-Windows platforms (Linux aarch64)
-torch==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
-torchvision==0.21.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
-torchaudio==2.6.0+cu124; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
+torch>=2.5.1,<2.6.0; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
+torchvision; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
+torchaudio; sys_platform != 'win32' and sys_platform != 'darwin' and platform_machine == 'aarch64'
 
 # Core dependencies
 transformers>=4.51.0,<4.58.0
