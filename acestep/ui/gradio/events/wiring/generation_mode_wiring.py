@@ -10,6 +10,7 @@ import gradio as gr
 
 from .. import generation_handlers as gen_h
 from .context import GenerationWiringContext
+from acestep.constants import MODE_TO_TASK_TYPE
 
 
 def _on_repaint_mode_change(mode, current_strength, memory):
@@ -44,6 +45,7 @@ def register_generation_mode_handlers(
 
     generation_section = context.generation_section
     results_section = context.results_section
+    dit_handler = context.dit_handler
     llm_handler = context.llm_handler
 
     # Shared handler for mode-change and initial page load — extracted to
@@ -55,6 +57,11 @@ def register_generation_mode_handlers(
     mode_change_inputs = [
         generation_section["generation_mode"],
         generation_section["previous_generation_mode"],
+    ]
+    dcw_default_outputs = [
+        generation_section["dcw_mode"],
+        generation_section["dcw_scaler"],
+        generation_section["dcw_high_scaler"],
     ]
 
     # ========== Generation Mode Change ==========
@@ -73,10 +80,21 @@ def register_generation_mode_handlers(
     # potentially other components) to be missing on page load.
     # This .load() event fires once on page load to initialize all
     # mode-dependent UI state using the same handler.
-    context.demo.load(
+    load_event = context.demo.load(
         fn=_handle_mode_change,
         inputs=mode_change_inputs,
         outputs=mode_ui_outputs,
+    )
+    load_event.then(
+        fn=gen_h.update_dcw_defaults_for_think,
+        inputs=[generation_section["think_checkbox"]],
+        outputs=dcw_default_outputs,
+    )
+
+    generation_section["think_checkbox"].change(
+        fn=gen_h.update_dcw_defaults_for_think,
+        inputs=[generation_section["think_checkbox"]],
+        outputs=dcw_default_outputs,
     )
 
     # ========== Extract Mode: Auto-fill caption from track_name ==========
@@ -113,7 +131,6 @@ def register_generation_mode_handlers(
         outputs=[generation_section["simple_vocal_language"]],
     )
 
-    # ========== Random Description Button ==========
     generation_section["random_desc_btn"].click(
         fn=gen_h.load_random_simple_description,
         inputs=[],
@@ -124,7 +141,6 @@ def register_generation_mode_handlers(
         ],
     )
 
-    # ========== Create Sample Button (Simple Mode) ==========
     generation_section["create_sample_btn"].click(
         fn=lambda query, instrumental, vocal_lang, temp, top_k, top_p, debug: gen_h.handle_create_sample(
             llm_handler, query, instrumental, vocal_lang, temp, top_k, top_p, debug
@@ -159,9 +175,19 @@ def register_generation_mode_handlers(
         fn=gen_h.uncheck_auto_for_populated_fields,
         inputs=list(auto_checkbox_inputs),
         outputs=list(auto_checkbox_outputs),
+    ).then(
+        # After creating a sample the generation_mode is set to "Custom"
+        # (task_type="text2music"). If task_type was already "text2music" the
+        # task_type.change event does not fire, leaving instruction_display_gen
+        # stale (e.g. the LM instruction from a previous Remix session). Force
+        # it to the correct DiT text2music instruction unconditionally.
+        fn=lambda: gen_h.update_instruction_ui(
+            dit_handler, MODE_TO_TASK_TYPE["Custom"], None, [], False, None
+        ),
+        inputs=[],
+        outputs=[generation_section["instruction_display_gen"]],
     )
 
-    # ========== Repaint Mode <-> Strength Bidirectional Sync ==========
     generation_section["repaint_mode"].change(
         fn=_on_repaint_mode_change,
         inputs=[
